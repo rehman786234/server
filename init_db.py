@@ -1,7 +1,6 @@
 import logging
 import secrets
-from database import get_connection, get_cursor, execute_query
-from config import Config
+from database import get_connection, get_cursor
 
 logger = logging.getLogger(__name__)
 
@@ -98,40 +97,6 @@ def init_database():
                 connection.commit()
                 logger.info("Database migration completed successfully!")
                 
-                # Optional: Insert sample data if tables are empty
-                _insert_sample_data_if_empty(connection)
-                
     except Exception as e:
         logger.error(f"Error initializing database: {e}")
         raise
-
-
-def _insert_sample_data_if_empty(connection):
-    """Insert sample data if tables are empty"""
-    try:
-        with get_cursor(connection) as cursor:
-            # Check if mydata is empty
-            cursor.execute("SELECT COUNT(*) as count FROM mydata")
-            count = cursor.fetchone()['count']
-            
-            if count == 0:
-                logger.info("Inserting sample user data...")
-                cursor.execute("""
-                    INSERT INTO mydata (name, email, password) 
-                    VALUES (%s, %s, %s)
-                """, ("Admin", "admin@example.com", "secure_password_here"))
-                
-                cursor.execute("SELECT id FROM mydata WHERE email = 'admin@example.com'")
-                user = cursor.fetchone()
-                
-                if user:
-                    cursor.execute("""
-                        INSERT INTO apikeys (user_id, api_key) 
-                        VALUES (%s, %s)
-                    """, (user['id'], secrets.token_hex(16)))
-                
-                connection.commit()
-                logger.info("Sample data inserted")
-                
-    except Exception as e:
-        logger.warning(f"Could not insert sample data: {e}")
