@@ -24,7 +24,7 @@ def init_connection_pool():
         
         # Log connection info (without password)
         db_url = Config.DATABASE_URL
-        logger.info(f"Initializing database connection to: {db_url.split('@')[1] if '@' in db_url else 'database'}")
+        logger.info(f"Initializing database connection")
         
         # Create connection pool
         _connection_pool = pool.SimpleConnectionPool(
@@ -90,7 +90,6 @@ def execute_query(query: str, params: tuple = (), fetch: bool = False) -> Option
                     
     except psycopg2.Error as e:
         logger.error(f"Database error: {e}")
-        connection.rollback() if 'connection' in locals() else None
         raise
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
