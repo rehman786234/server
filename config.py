@@ -3,12 +3,12 @@ import os
 class Config:
     DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
     
-    # CORS origins
+    # CORS origins - Update with your frontend URLs
     ORIGINS = [
         "http://127.0.0.1:5500",
         "http://localhost:5500",
         "http://localhost:5173",
-        "https://your-frontend-domain.onrender.com",  # Update with your frontend URL
+        "*",  # Update with your frontend URL
     ]
     
     # Connection pool settings
