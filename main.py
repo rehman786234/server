@@ -1,219 +1,123 @@
 import os
-import secrets
-import sqlite3
-from contextlib import contextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from contextlib import asynccontextmanager
+import logging
+import sys
 
-# ==========================
-# Models
-# ==========================
+from config import Config
+from database import init_connection_pool, close_all_connections, health_check
+from routes import router
+from init_db import init_database
 
-class User(BaseModel):
-    id: int
-    name: str
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
 
-class Video(BaseModel):
-    title: str
-    stream_link: str
-    thumbnail: str
 
-# ==========================
-# Database Connection
-# ==========================
-
-DB_PATH = os.getenv("SQLITE_DB_PATH", "database.db")
-
-@contextmanager
-def get_connection():
-    """Context manager for database connections"""
-    connection = None
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan manager"""
+    # Startup
     try:
-        connection = sqlite3.connect(DB_PATH)
-        connection.row_factory = sqlite3.Row
-        yield connection
-    except sqlite3.Error as e:
-        raise Exception(f"Database connection error: {e}")
-    finally:
-        if connection:
-            connection.close()
-
-@contextmanager
-def get_cursor(connection):
-    """Context manager for database cursors"""
-    cursor = connection.cursor()
-    try:
-        yield cursor
-    finally:
-        cursor.close()
-
-# ==========================
-# Database Functions
-# ==========================
-
-def get_data():
-    try:
-        with get_connection() as connection:
-            with get_cursor(connection) as cursor:
-                cursor.execute("SELECT * FROM mydata")
-                results = cursor.fetchall()
-                
-                if not results:
-                    return {"message": "No Users Found"}
-                
-                return [dict(row) for row in results]
-    
+        logger.info("Starting up FastAPI application...")
+        logger.info(f"Environment: {os.getenv('ENV', 'production')}")
+        
+        # Validate configuration
+        Config.validate()
+        
+        # Initialize database connection pool
+        init_connection_pool()
+        logger.info("Database connection pool initialized")
+        
+        # Initialize database tables (safe migration)
+        init_database()
+        logger.info("Database initialization completed")
+        
+        # Health check
+        if health_check():
+            logger.info("Database health check passed")
+        else:
+            logger.warning("Database health check failed")
+        
+        yield
+        
     except Exception as e:
-        return {"error": str(e)}
+        logger.error(f"Failed to initialize application: {e}")
+        raise
+    finally:
+        # Shutdown
+        logger.info("Shutting down FastAPI application...")
+        close_all_connections()
+        logger.info("Database connections closed")
 
-def insert_data(name: str, email: str, password: str):
-    try:
-        with get_connection() as connection:
-            with get_cursor(connection) as cursor:
-                cursor.execute(
-                    "INSERT INTO mydata (name, email, Password) VALUES (?, ?, ?)",
-                    (name, email, password),
-                )
-                connection.commit()
-                return {"message": "User Added Successfully"}
-    
-    except sqlite3.IntegrityError as e:
-        return {"error": f"Integrity error: {str(e)}"}
-    except Exception as e:
-        return {"error": str(e)}
 
-# ==========================
-# FastAPI App
-# ==========================
+# Create FastAPI app
+app = FastAPI(
+    title="FastAPI Backend",
+    description="FastAPI backend with PostgreSQL on Render",
+    version="2.0.0",
+    lifespan=lifespan
+)
 
-app = FastAPI()
-
-origins = [
-    "http://127.0.0.1:5500",
-    "http://localhost:5500",
-    "http://localhost:5173",
-]
-
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=Config.ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ==========================
-# Routes
-# ==========================
+# Include routes
+app.include_router(router)
 
+
+# Global exception handlers
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    logger.error(f"HTTP Exception: {exc.detail}")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.detail, "status_code": exc.status_code}
+    )
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unexpected error: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Internal server error", "status_code": 500}
+    )
+
+
+# Root endpoint
 @app.get("/")
-def home():
-    return {"message": "FastAPI Server Running Successfully"}
+async def root():
+    return {
+        "message": "FastAPI Server Running Successfully",
+        "database": "PostgreSQL",
+        "environment": os.getenv("ENV", "production")
+    }
 
-@app.get("/get_users")
-def get_users():
-    return get_data()
 
-@app.get("/apikey")
-def api_key():
-    return {"ApiKey": secrets.token_hex(16)}
-
-@app.post("/user_apikeys")
-def user_apikeys(user: User):
-    try:
-        with get_connection() as connection:
-            with get_cursor(connection) as cursor:
-                query = "SELECT * FROM apikeys WHERE USER_ID = ?"
-                cursor.execute(query, (user.id,))
-                apikeys = cursor.fetchall()
-                return [dict(row) for row in apikeys]
+# Main entry point
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=port,
+        reload=False,
+        workers=2
+    )
     
-    except Exception as e:
-        return {"Error": str(e)}
-
-@app.get("/videos")
-def getvideos():
-    try:
-        with get_connection() as connection:
-            with get_cursor(connection) as cursor:
-                query = 'SELECT * FROM videos'
-                cursor.execute(query)
-                videos = cursor.fetchall()
-                return [dict(row) for row in videos]
-    
-    except Exception as e:
-        return {"message": str(e)}
-
-@app.post("/upload_videos")
-def upload_video(video: Video):
-    viewkey = secrets.token_hex(6)
-    
-    try:
-        with get_connection() as connection:
-            with get_cursor(connection) as cursor:
-                query = 'INSERT INTO videos (title, stream_link, viewkey, thumbnail) VALUES (?, ?, ?, ?)'
-                cursor.execute(query, (video.title, video.stream_link, viewkey, video.thumbnail))
-                connection.commit()
-                return {
-                    "message": "Video Upload Success",
-                    "viewkey": viewkey
-                }
-    
-    except sqlite3.IntegrityError as e:
-        raise HTTPException(status_code=400, detail=f"Database integrity error: {str(e)}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
-
-# ==========================
-# Database Initialization
-# ==========================
-
-def init_database():
-    """Initialize database tables if they don't exist"""
-    try:
-        with get_connection() as connection:
-            with get_cursor(connection) as cursor:
-                # Create mydata table
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS mydata (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name TEXT NOT NULL,
-                        email TEXT UNIQUE NOT NULL,
-                        Password TEXT NOT NULL
-                    )
-                ''')
-                
-                # Create apikeys table
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS apikeys (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        USER_ID INTEGER NOT NULL,
-                        api_key TEXT UNIQUE NOT NULL,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        FOREIGN KEY (USER_ID) REFERENCES mydata(id)
-                    )
-                ''')
-                
-                # Create videos table
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS videos (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        title TEXT NOT NULL,
-                        stream_link TEXT NOT NULL,
-                        viewkey TEXT UNIQUE NOT NULL,
-                        thumbnail TEXT,
-                        uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                ''')
-                
-                connection.commit()
-                print("Database initialized successfully!")
-    
-    except Exception as e:
-        print(f"Error initializing database: {e}")
-
-# Initialize database on startup
-@app.on_event("startup")
-def startup_event():
-    init_database()
