@@ -3,8 +3,8 @@ from fastapi import APIRouter, HTTPException, status
 from typing import List, Dict, Any
 import logging
 
-from database import execute_query, get_one, get_connection, get_cursor
-from models import User, Video, UserCreate, VideoResponse, APIKeyResponse, ErrorResponse
+from database import execute_query, get_one
+from models import User, Video, UserCreate
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
