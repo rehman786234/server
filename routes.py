@@ -1,31 +1,13 @@
 import secrets
-from fastapi import APIRouter, HTTPException, status, Header
+from fastapi import APIRouter, HTTPException, status
 from typing import List, Dict, Any
 import logging
-from datetime import datetime
 
 from database import execute_query, get_one
-from models import User, Video, UserCreate, APIKeyRequest
+from models import User, Video, UserCreate
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-# Helper function to validate API key
-def validate_api_key(api_key: str):
-    """Validate API key and return user data if valid"""
-    try:
-        query = """
-            SELECT a.*, u.id as user_id, u.name, u.email 
-            FROM apikeys a
-            JOIN mydata u ON a.user_id = u.id
-            WHERE a.api_key = %s 
-            AND (a.expiry_date IS NULL OR a.expiry_date >= CURRENT_DATE)
-        """
-        result = get_one(query, (api_key,))
-        return result
-    except Exception as e:
-        logger.error(f"API key validation error: {e}")
-        return None
 
 
 @router.get("/")
@@ -86,49 +68,10 @@ async def create_user(user: UserCreate):
         )
 
 
-@router.post("/apikey")
-async def generate_api_key(user: APIKeyRequest):
-    """Generate a new API key for a user"""
-    try:
-        # Check if user exists
-        user_query = "SELECT * FROM mydata WHERE id = %s"
-        user_exists = get_one(user_query, (user.user_id,))
-        
-        if not user_exists:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User not found"
-            )
-        
-        api_key = secrets.token_hex(16)
-        
-        # Store API key in database
-        query = """
-            INSERT INTO apikeys (user_id, api_key) 
-            VALUES (%s, %s) 
-            RETURNING id, user_id, api_key, created_at, expiry_date
-        """
-        result = get_one(query, (user.user_id, api_key))
-        
-        if result:
-            return {
-                "message": "API Key generated successfully",
-                "api_key": result
-            }
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to create API key"
-            )
-            
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error in generate_api_key: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error: {str(e)}"
-        )
+@router.get("/apikey")
+async def generate_api_key():
+    """Generate a new API key"""
+    return {"ApiKey": secrets.token_hex(16)}
 
 
 @router.post("/user_apikeys")
@@ -147,25 +90,28 @@ async def get_user_apikeys(user: User):
         )
 
 
-@router.delete("/apikey")
-async def delete_apikey(api_key: str):
-    """Delete an API key"""
+@router.post("/user_apikeys/create")
+async def create_user_apikey(user: User):
+    """Create a new API key for a user"""
     try:
-        query = "DELETE FROM apikeys WHERE api_key = %s RETURNING id"
-        result = get_one(query, (api_key,))
+        api_key = secrets.token_hex(16)
+        query = """
+            INSERT INTO apikeys (user_id, api_key) 
+            VALUES (%s, %s) 
+            RETURNING id, user_id, api_key, created_at
+        """
+        result = get_one(query, (user.id, api_key))
         
         if result:
-            return {"message": "API key deleted successfully"}
+            return {"message": "API Key created", "apikey": result}
         else:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="API key not found"
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to create API key"
             )
             
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"Error in delete_apikey: {e}")
+        logger.error(f"Error in create_user_apikey: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database error: {str(e)}"
@@ -174,9 +120,9 @@ async def delete_apikey(api_key: str):
 
 @router.get("/videos")
 async def get_videos():
-    """Get all non-premium videos"""
+    """Get all videos"""
     try:
-        query = "SELECT * FROM videos WHERE is_premium = false ORDER BY uploaded_at DESC"
+        query = "SELECT * FROM videos ORDER BY uploaded_at DESC"
         results = execute_query(query, fetch=True)
         return results if results else []
         
@@ -188,58 +134,18 @@ async def get_videos():
         )
 
 
-@router.get("/premium_videos")
-async def get_premium_videos():
-    """Get all premium videos"""
-    try:
-        query = "SELECT * FROM videos WHERE is_premium = true ORDER BY uploaded_at DESC"
-        results = execute_query(query, fetch=True)
-        return results if results else []
-        
-    except Exception as e:
-        logger.error(f"Error in get_premium_videos: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error: {str(e)}"
-        )
-
-
-@router.get("/all_videos")
-async def get_all_videos():
-    """Get all videos (both premium and non-premium)"""
-    try:
-        query = "SELECT * FROM videos ORDER BY uploaded_at DESC"
-        results = execute_query(query, fetch=True)
-        return results if results else []
-        
-    except Exception as e:
-        logger.error(f"Error in get_all_videos: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error: {str(e)}"
-        )
-
-
 @router.post("/upload_videos")
-async def upload_video(video: Video, api_key: str = Header(...)):
-    """Upload a new video (requires API key)"""
-    # Validate API key
-    user_data = validate_api_key(api_key)
-    if not user_data:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired API key"
-        )
-    
+async def upload_video(video: Video):
+    """Upload a new video"""
     viewkey = secrets.token_hex(6)
     
     try:
         query = """
-            INSERT INTO videos (title, stream_link, viewkey, thumbnail, category, is_premium) 
-            VALUES (%s, %s, %s, %s, %s, %s) 
-            RETURNING id, title, stream_link, viewkey, thumbnail, category, is_premium, uploaded_at
+            INSERT INTO videos (title, stream_link, viewkey, thumbnail) 
+            VALUES (%s, %s, %s, %s) 
+            RETURNING id, title, stream_link, viewkey, thumbnail, uploaded_at
         """
-        result = get_one(query, (video.title, video.stream_link, viewkey, video.thumbnail, video.category, video.is_premium))
+        result = get_one(query, (video.title, video.stream_link, viewkey, video.thumbnail))
         
         if result:
             return {
@@ -299,5 +205,5 @@ async def health_check():
     return {
         "status": "healthy" if is_healthy else "unhealthy",
         "database": "connected" if is_healthy else "disconnected",
-        "timestamp": datetime.now().isoformat()
+        "timestamp": __import__('datetime').datetime.now().isoformat()
     }
