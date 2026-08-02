@@ -62,7 +62,7 @@ async def login(user: UserLogin):
     """
     Login endpoint for frontend
     - Checks if credentials are valid
-    - Returns user data and generates API key for session
+    - Returns user data
     """
     try:
         # Get user by email
@@ -83,21 +83,6 @@ async def login(user: UserLogin):
                 "message": "Invalid email or password"
             }
         
-        # Generate session API key
-        session_key = secrets.token_hex(16)
-        expiry_date = datetime.now() + timedelta(days=30)
-        
-        # Store session API key
-        insert_key_query = """
-            INSERT INTO apikeys (user_id, api_key, created_at, expiry_date) 
-            VALUES (%s, %s, %s, %s) 
-            RETURNING id, api_key, created_at, expiry_date
-        """
-        api_key_result = get_one(
-            insert_key_query, 
-            (db_user['id'], session_key, datetime.now(), expiry_date)
-        )
-        
         # Remove password from user data
         db_user.pop('password', None)
         
@@ -110,9 +95,7 @@ async def login(user: UserLogin):
                 "email": db_user['email'],
                 "is_premium": db_user['is_premium'],
                 "created_at": db_user['created_at']
-            },
-            "api_key": session_key,
-            "expires_in": "30 days"
+            }
         }
         
     except Exception as e:
@@ -353,7 +336,7 @@ async def get_premium_videos(api_key: str = Header(...)):
             "user": {
                 "id": user_data['user_id'],
                 "name": user_data['name'],
-                "email": user_data['email'],
+                "email': user_data['email'],
                 "is_premium": user_data['is_premium']
             }
         }
