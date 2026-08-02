@@ -19,6 +19,7 @@ def init_database():
                         name TEXT NOT NULL,
                         email TEXT UNIQUE NOT NULL,
                         password TEXT NOT NULL,
+                        is_premium BOOLEAN DEFAULT FALSE,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
@@ -36,6 +37,7 @@ def init_database():
                         user_id INTEGER NOT NULL,
                         api_key TEXT UNIQUE NOT NULL,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        expiry_date DATE DEFAULT (CURRENT_DATE + INTERVAL '1 month'),
                         FOREIGN KEY (user_id) REFERENCES mydata(id) ON DELETE CASCADE
                     )
                 """)
@@ -54,6 +56,8 @@ def init_database():
                         stream_link TEXT NOT NULL,
                         viewkey TEXT UNIQUE NOT NULL,
                         thumbnail TEXT,
+                        category VARCHAR(100),
+                        is_premium BOOLEAN DEFAULT FALSE,
                         uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
@@ -92,6 +96,11 @@ def init_database():
                 cursor.execute("""
                     CREATE INDEX IF NOT EXISTS idx_videos_uploaded_at 
                     ON videos(uploaded_at DESC)
+                """)
+                
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_videos_is_premium 
+                    ON videos(is_premium)
                 """)
                 
                 connection.commit()
