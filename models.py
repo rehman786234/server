@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
 
@@ -6,27 +6,27 @@ from datetime import datetime
 class User(BaseModel):
     id: int
     name: str
-    email: str
+    email: str  # Changed from EmailStr
     is_premium: bool
     created_at: Optional[datetime] = None
 
 
 class UserCreate(BaseModel):
     name: str
-    email: EmailStr
+    email: str  # Changed from EmailStr
     password: str
     is_premium: Optional[bool] = False
 
 
 class UserLogin(BaseModel):
-    email: EmailStr
+    email: str  # Changed from EmailStr
     password: str
 
 
 class UserResponse(BaseModel):
     id: int
     name: str
-    email: str
+    email: str  # Changed from EmailStr
     is_premium: bool
     created_at: Optional[datetime] = None
 
