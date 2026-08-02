@@ -336,7 +336,7 @@ async def get_premium_videos(api_key: str = Header(...)):
             "user": {
                 "id": user_data['user_id'],
                 "name": user_data['name'],
-                "email': user_data['email'],
+                "email": user_data['email'],
                 "is_premium": user_data['is_premium']
             }
         }
