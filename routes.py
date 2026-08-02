@@ -302,6 +302,7 @@ async def get_videos():
     """
     Get all free videos (is_premium = false)
     - No API key required
+    - Returns direct array (old format)
     """
     try:
         query = """
@@ -310,18 +311,16 @@ async def get_videos():
             ORDER BY uploaded_at DESC
         """
         results = execute_query(query, fetch=True)
-        return {
-            "success": True,
-            "total": len(results) if results else 0,
-            "videos": results if results else []
-        }
+        
+        # Return direct array (old format)
+        return results if results else []
         
     except Exception as e:
         logger.error(f"Error in get_videos: {e}")
-        return {
-            "success": False,
-            "message": f"Database error: {str(e)}"
-        }
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database error: {str(e)}"
+        )
 
 
 @router.get("/premium_videos")
@@ -372,6 +371,7 @@ async def upload_video(video: Video, api_key: str = Header(...)):
     """
     Upload a new video
     - Requires API key
+    - Returns the uploaded video object
     """
     # Validate API key
     user_data = validate_api_key(api_key)
