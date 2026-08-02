@@ -21,10 +21,16 @@ class UserResponse(BaseModel):
     created_at: Optional[datetime] = None
 
 
+class APIKeyRequest(BaseModel):
+    user_id: int
+
+
 class Video(BaseModel):
     title: str
     stream_link: str
-    thumbnail: str
+    thumbnail: Optional[str] = None
+    category: Optional[str] = None
+    is_premium: Optional[bool] = False
 
 
 class VideoResponse(BaseModel):
@@ -32,7 +38,9 @@ class VideoResponse(BaseModel):
     title: str
     stream_link: str
     viewkey: str
-    thumbnail: str
+    thumbnail: Optional[str] = None
+    category: Optional[str] = None
+    is_premium: Optional[bool] = False
     uploaded_at: Optional[datetime] = None
 
 
