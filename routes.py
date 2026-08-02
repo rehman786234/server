@@ -36,7 +36,7 @@ async def home():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Video Server 2.0 - API Documentation</title>
+    <title>FastAPI Server - API Documentation</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
@@ -1178,7 +1178,7 @@ async def upload_video(video: Video, api_key: str = Header(...)):
             detail="Invalid or expired API key"
         )
     
-    viewkey = secrets.token_hex(10)
+    viewkey = secrets.token_hex(6)
     
     try:
         query = """
