@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FastAPI Server - API Documentation</title>
+    <title>Video Server 2.0- API Documentation</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
@@ -15,9 +15,10 @@
 
         body {
             font-family: 'Inter', sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: #0a0a0a;
             min-height: 100vh;
             padding: 40px 20px;
+            color: #e5e7eb;
         }
 
         .container {
@@ -27,7 +28,6 @@
 
         .header {
             text-align: center;
-            color: white;
             margin-bottom: 50px;
         }
 
@@ -35,24 +35,27 @@
             font-size: 4rem;
             font-weight: 800;
             margin-bottom: 10px;
-            text-shadow: 0 4px 20px rgba(0,0,0,0.2);
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
             animation: fadeInDown 0.8s ease;
         }
 
         .header p {
             font-size: 1.2rem;
-            opacity: 0.9;
+            color: #9ca3af;
             animation: fadeInUp 0.8s ease;
         }
 
         .badge {
             display: inline-block;
-            background: rgba(255,255,255,0.2);
+            background: rgba(102, 126, 234, 0.2);
             padding: 8px 20px;
             border-radius: 50px;
             font-size: 0.9rem;
             margin-top: 15px;
-            backdrop-filter: blur(10px);
+            border: 1px solid rgba(102, 126, 234, 0.3);
+            color: #a5b4fc;
         }
 
         .badge i {
@@ -67,71 +70,99 @@
         }
 
         .status-card {
-            background: rgba(255,255,255,0.15);
-            backdrop-filter: blur(10px);
+            background: #1a1a2e;
             padding: 20px;
             border-radius: 16px;
             text-align: center;
-            color: white;
-            border: 1px solid rgba(255,255,255,0.2);
-            transition: transform 0.3s ease;
+            border: 1px solid #2d2d44;
+            transition: transform 0.3s ease, border-color 0.3s ease;
         }
 
         .status-card:hover {
             transform: translateY(-5px);
+            border-color: #667eea;
         }
 
         .status-card .number {
             font-size: 2.5rem;
             font-weight: 700;
+            color: #a5b4fc;
         }
 
         .status-card .label {
             font-size: 0.9rem;
-            opacity: 0.8;
+            color: #9ca3af;
             margin-top: 5px;
+        }
+
+        .section-title {
+            color: #e5e7eb;
+            margin-bottom: 25px;
+            font-weight: 700;
+            font-size: 1.8rem;
+            border-bottom: 2px solid #2d2d44;
+            padding-bottom: 15px;
+        }
+
+        .section-title i {
+            color: #667eea;
+            margin-right: 12px;
         }
 
         .endpoints-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
-            gap: 25px;
+            grid-template-columns: 1fr;
+            gap: 30px;
             margin-bottom: 40px;
         }
 
         .endpoint-card {
-            background: white;
+            background: #141424;
             border-radius: 16px;
             padding: 25px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.15);
-            transition: transform 0.3s ease, box-shadow 0.3s ease;
+            border: 1px solid #2d2d44;
+            transition: transform 0.3s ease, border-color 0.3s ease;
             animation: fadeInUp 0.6s ease;
             animation-fill-mode: both;
         }
 
         .endpoint-card:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 30px 80px rgba(0,0,0,0.2);
+            transform: translateY(-3px);
+            border-color: #667eea;
         }
 
         .endpoint-card:nth-child(1) { animation-delay: 0.1s; }
-        .endpoint-card:nth-child(2) { animation-delay: 0.2s; }
-        .endpoint-card:nth-child(3) { animation-delay: 0.3s; }
-        .endpoint-card:nth-child(4) { animation-delay: 0.4s; }
-        .endpoint-card:nth-child(5) { animation-delay: 0.5s; }
-        .endpoint-card:nth-child(6) { animation-delay: 0.6s; }
+        .endpoint-card:nth-child(2) { animation-delay: 0.15s; }
+        .endpoint-card:nth-child(3) { animation-delay: 0.2s; }
+        .endpoint-card:nth-child(4) { animation-delay: 0.25s; }
+        .endpoint-card:nth-child(5) { animation-delay: 0.3s; }
+        .endpoint-card:nth-child(6) { animation-delay: 0.35s; }
+        .endpoint-card:nth-child(7) { animation-delay: 0.4s; }
+        .endpoint-card:nth-child(8) { animation-delay: 0.45s; }
+        .endpoint-card:nth-child(9) { animation-delay: 0.5s; }
+        .endpoint-card:nth-child(10) { animation-delay: 0.55s; }
+        .endpoint-card:nth-child(11) { animation-delay: 0.6s; }
 
         .endpoint-header {
             display: flex;
             align-items: center;
             justify-content: space-between;
-            margin-bottom: 15px;
+            margin-bottom: 12px;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        .endpoint-left {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
         }
 
         .method-badge {
-            padding: 4px 12px;
+            padding: 4px 14px;
             border-radius: 50px;
-            font-size: 0.75rem;
+            font-size: 0.7rem;
             font-weight: 700;
             text-transform: uppercase;
             letter-spacing: 0.5px;
@@ -145,102 +176,98 @@
         .endpoint-path {
             font-size: 1.1rem;
             font-weight: 600;
-            color: #1f2937;
+            color: #e5e7eb;
             font-family: 'Courier New', monospace;
         }
 
         .endpoint-description {
-            color: #6b7280;
+            color: #9ca3af;
             font-size: 0.95rem;
             margin: 10px 0;
             line-height: 1.6;
-        }
-
-        .endpoint-details {
-            background: #f9fafb;
-            border-radius: 8px;
-            padding: 15px;
-            margin-top: 15px;
-        }
-
-        .endpoint-details code {
-            font-family: 'Courier New', monospace;
-            font-size: 0.85rem;
-            color: #374151;
-            display: block;
-            white-space: pre-wrap;
-            word-break: break-all;
         }
 
         .auth-badge {
             display: inline-flex;
             align-items: center;
             gap: 5px;
-            background: #fef3c7;
-            color: #92400e;
+            background: #1e293b;
+            color: #fbbf24;
             padding: 4px 12px;
             border-radius: 50px;
-            font-size: 0.75rem;
+            font-size: 0.7rem;
             font-weight: 600;
-            margin-top: 10px;
         }
 
         .auth-badge i {
             font-size: 0.7rem;
         }
 
-        .code-section {
-            background: #1f2937;
-            border-radius: 12px;
-            padding: 25px;
-            margin-top: 40px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        .endpoint-details {
+            background: #0d0d1a;
+            border-radius: 8px;
+            padding: 15px;
+            margin-top: 15px;
+            border: 1px solid #1a1a2e;
         }
 
-        .code-section h3 {
-            color: white;
-            margin-bottom: 20px;
-            font-size: 1.3rem;
-            display: flex;
-            align-items: center;
-            gap: 10px;
+        .endpoint-details code {
+            font-family: 'Courier New', monospace;
+            font-size: 0.85rem;
+            color: #e5e7eb;
+            display: block;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        .endpoint-details .label {
+            color: #6b7280;
+            font-size: 0.8rem;
+            margin-top: 8px;
+        }
+
+        .code-example-section {
+            margin-top: 20px;
         }
 
         .code-tabs {
             display: flex;
-            gap: 10px;
-            margin-bottom: 15px;
+            gap: 8px;
+            margin-bottom: 12px;
             flex-wrap: wrap;
         }
 
         .code-tab {
-            padding: 8px 20px;
-            background: rgba(255,255,255,0.1);
+            padding: 6px 16px;
+            background: #1a1a2e;
             color: #9ca3af;
-            border: none;
-            border-radius: 8px;
+            border: 1px solid #2d2d44;
+            border-radius: 6px;
             cursor: pointer;
             font-family: 'Inter', sans-serif;
             font-weight: 500;
+            font-size: 0.8rem;
             transition: all 0.3s ease;
         }
 
         .code-tab:hover {
-            background: rgba(255,255,255,0.2);
-            color: white;
+            background: #2d2d44;
+            color: #e5e7eb;
         }
 
         .code-tab.active {
-            background: #3b82f6;
+            background: #667eea;
             color: white;
+            border-color: #667eea;
         }
 
         .code-content {
             display: none;
-            background: #111827;
+            background: #0d0d1a;
             border-radius: 8px;
             padding: 20px;
             overflow-x: auto;
+            border: 1px solid #1a1a2e;
         }
 
         .code-content.active {
@@ -250,7 +277,7 @@
         .code-content pre {
             color: #e5e7eb;
             font-family: 'Courier New', monospace;
-            font-size: 0.85rem;
+            font-size: 0.82rem;
             line-height: 1.8;
             margin: 0;
             white-space: pre-wrap;
@@ -261,17 +288,18 @@
         .code-content .comment { color: #6b7280; }
         .code-content .function { color: #f472b6; }
         .code-content .number { color: #fbbf24; }
+        .code-content .operator { color: #a78bfa; }
 
         .footer {
             text-align: center;
-            color: rgba(255,255,255,0.7);
+            color: #6b7280;
             margin-top: 50px;
             padding-top: 30px;
-            border-top: 1px solid rgba(255,255,255,0.1);
+            border-top: 1px solid #1a1a2e;
         }
 
         .footer a {
-            color: white;
+            color: #a5b4fc;
             text-decoration: none;
         }
 
@@ -311,6 +339,10 @@
             .status-grid {
                 grid-template-columns: repeat(2, 1fr);
             }
+            .endpoint-header {
+                flex-direction: column;
+                align-items: flex-start;
+            }
         }
     </style>
 </head>
@@ -329,7 +361,7 @@
         <!-- Status Cards -->
         <div class="status-grid">
             <div class="status-card">
-                <div class="number" id="totalEndpoints">12</div>
+                <div class="number" id="totalEndpoints">11</div>
                 <div class="label"><i class="fas fa-code"></i> Endpoints</div>
             </div>
             <div class="status-card">
@@ -347,319 +379,419 @@
         </div>
 
         <!-- Endpoints -->
-        <h2 style="color: white; margin-bottom: 25px; font-weight: 700;">
+        <h2 class="section-title">
             <i class="fas fa-plug"></i> Available Endpoints
         </h2>
 
         <div class="endpoints-grid">
-            <!-- User Endpoints -->
+            <!-- 1. Root Endpoint -->
             <div class="endpoint-card">
                 <div class="endpoint-header">
-                    <span class="method-badge method-get">GET</span>
-                    <span class="endpoint-path">/</span>
+                    <div class="endpoint-left">
+                        <span class="method-badge method-get">GET</span>
+                        <span class="endpoint-path">/</span>
+                    </div>
+                    <span class="auth-badge"><i class="fas fa-globe"></i> Public</span>
                 </div>
-                <div class="endpoint-description">Root endpoint - Server status</div>
-                <div class="endpoint-details">
-                    <code>GET /</code>
-                </div>
-            </div>
-
-            <div class="endpoint-card">
-                <div class="endpoint-header">
-                    <span class="method-badge method-get">GET</span>
-                    <span class="endpoint-path">/get_users</span>
-                </div>
-                <div class="endpoint-description">Get all registered users</div>
-                <div class="endpoint-details">
-                    <code>GET /get_users</code>
-                </div>
-            </div>
-
-            <div class="endpoint-card">
-                <div class="endpoint-header">
-                    <span class="method-badge method-post">POST</span>
-                    <span class="endpoint-path">/users</span>
-                </div>
-                <div class="endpoint-description">Create a new user</div>
-                <div class="endpoint-details">
-                    <code>POST /users</code>
-                    <code style="margin-top: 8px; color: #6b7280;">
-                        Body: { "name": "John", "email": "john@email.com", "password": "pass123" }
-                    </code>
-                </div>
-            </div>
-
-            <!-- API Key Endpoints -->
-            <div class="endpoint-card">
-                <div class="endpoint-header">
-                    <span class="method-badge method-post">POST</span>
-                    <span class="endpoint-path">/apikey</span>
-                </div>
-                <div class="endpoint-description">Generate API key for user</div>
-                <div class="endpoint-details">
-                    <code>POST /apikey</code>
-                    <code style="margin-top: 8px; color: #6b7280;">
-                        Body: { "user_id": 1 }
-                    </code>
-                </div>
-            </div>
-
-            <div class="endpoint-card">
-                <div class="endpoint-header">
-                    <span class="method-badge method-post">POST</span>
-                    <span class="endpoint-path">/user_apikeys</span>
-                </div>
-                <div class="endpoint-description">Get all API keys for a user</div>
-                <div class="endpoint-details">
-                    <code>POST /user_apikeys</code>
-                    <code style="margin-top: 8px; color: #6b7280;">
-                        Body: { "id": 1, "name": "John" }
-                    </code>
-                </div>
-            </div>
-
-            <div class="endpoint-card">
-                <div class="endpoint-header">
-                    <span class="method-badge method-delete">DELETE</span>
-                    <span class="endpoint-path">/apikey</span>
-                </div>
-                <div class="endpoint-description">Delete an API key</div>
-                <div class="endpoint-details">
-                    <code>DELETE /apikey?api_key=YOUR_API_KEY</code>
-                </div>
-            </div>
-
-            <!-- Video Endpoints -->
-            <div class="endpoint-card">
-                <div class="endpoint-header">
-                    <span class="method-badge method-get">GET</span>
-                    <span class="endpoint-path">/videos</span>
-                </div>
-                <div class="endpoint-description">Get all non-premium videos</div>
-                <div class="endpoint-details">
-                    <code>GET /videos</code>
-                </div>
-            </div>
-
-            <div class="endpoint-card">
-                <div class="endpoint-header">
-                    <span class="method-badge method-get">GET</span>
-                    <span class="endpoint-path">/premium_videos</span>
-                </div>
-                <div class="endpoint-description">Get all premium videos</div>
-                <div class="auth-badge">
-                    <i class="fas fa-key"></i> Requires API Key
-                </div>
-                <div class="endpoint-details">
-                    <code>GET /premium_videos</code>
-                    <code style="margin-top: 8px; color: #6b7280;">
-                        Header: api-key: YOUR_API_KEY
-                    </code>
-                </div>
-            </div>
-
-            <div class="endpoint-card">
-                <div class="endpoint-header">
-                    <span class="method-badge method-post">POST</span>
-                    <span class="endpoint-path">/upload_videos</span>
-                </div>
-                <div class="endpoint-description">Upload a new video</div>
-                <div class="auth-badge">
-                    <i class="fas fa-key"></i> Requires API Key
-                </div>
-                <div class="endpoint-details">
-                    <code>POST /upload_videos</code>
-                    <code style="margin-top: 8px; color: #6b7280;">
-                        Header: api-key: YOUR_API_KEY
-                        Body: { "title": "Video", "stream_link": "url", "thumbnail": "url", "category": "Education", "is_premium": false }
-                    </code>
-                </div>
-            </div>
-
-            <div class="endpoint-card">
-                <div class="endpoint-header">
-                    <span class="method-badge method-get">GET</span>
-                    <span class="endpoint-path">/videos/{viewkey}</span>
-                </div>
-                <div class="endpoint-description">Get video by viewkey</div>
-                <div class="endpoint-details">
-                    <code>GET /videos/abc123</code>
-                </div>
-            </div>
-
-            <div class="endpoint-card">
-                <div class="endpoint-header">
-                    <span class="method-badge method-get">GET</span>
-                    <span class="endpoint-path">/health</span>
-                </div>
-                <div class="endpoint-description">Health check endpoint</div>
-                <div class="endpoint-details">
-                    <code>GET /health</code>
-                </div>
-            </div>
-        </div>
-
-        <!-- Code Examples -->
-        <div class="code-section">
-            <h3><i class="fas fa-code"></i> Code Examples</h3>
-            
-            <div class="code-tabs">
-                <button class="code-tab active" onclick="showCode('javascript')">JavaScript</button>
-                <button class="code-tab" onclick="showCode('python')">Python</button>
-                <button class="code-tab" onclick="showCode('curl')">cURL</button>
-                <button class="code-tab" onclick="showCode('java')">Java</button>
-            </div>
-
-            <!-- JavaScript -->
-            <div id="javascript" class="code-content active">
-                <pre>
-<span class="comment">// API Configuration</span>
-<span class="keyword">const</span> API_URL = <span class="string">'http://localhost:8000'</span>;
-
-<span class="comment">// 1. Create User</span>
-<span class="keyword">async function</span> <span class="function">createUser</span>() {
-    <span class="keyword">const</span> response = <span class="keyword">await</span> fetch(<span class="string">`${API_URL}/users`</span>, {
-        method: <span class="string">'POST'</span>,
-        headers: { <span class="string">'Content-Type'</span>: <span class="string">'application/json'</span> },
-        body: JSON.stringify({
-            name: <span class="string">'John Doe'</span>,
-            email: <span class="string">'john@example.com'</span>,
-            password: <span class="string">'securepass123'</span>
-        })
-    });
-    <span class="keyword">const</span> data = <span class="keyword">await</span> response.json();
-    console.log(data);
-}
-
-<span class="comment">// 2. Generate API Key</span>
-<span class="keyword">async function</span> <span class="function">generateApiKey</span>(userId) {
-    <span class="keyword">const</span> response = <span class="keyword">await</span> fetch(<span class="string">`${API_URL}/apikey`</span>, {
-        method: <span class="string">'POST'</span>,
-        headers: { <span class="string">'Content-Type'</span>: <span class="string">'application/json'</span> },
-        body: JSON.stringify({ user_id: userId })
-    });
-    <span class="keyword">const</span> data = <span class="keyword">await</span> response.json();
-    <span class="keyword">return</span> data.api_key;
-}
-
-<span class="comment">// 3. Upload Video</span>
-<span class="keyword">async function</span> <span class="function">uploadVideo</span>(apiKey) {
-    <span class="keyword">const</span> response = <span class="keyword">await</span> fetch(<span class="string">`${API_URL}/upload_videos`</span>, {
-        method: <span class="string">'POST'</span>,
-        headers: {
-            <span class="string">'Content-Type'</span>: <span class="string">'application/json'</span>,
-            <span class="string">'api-key'</span>: apiKey
-        },
-        body: JSON.stringify({
-            title: <span class="string">'My Video'</span>,
-            stream_link: <span class="string">'https://example.com/video.mp4'</span>,
-            thumbnail: <span class="string">'https://example.com/thumb.jpg'</span>,
-            category: <span class="string">'Education'</span>,
-            is_premium: <span class="keyword">false</span>
-        })
-    });
-    <span class="keyword">const</span> data = <span class="keyword">await</span> response.json();
-    console.log(data);
-}
-
-<span class="comment">// 4. Get Premium Videos</span>
-<span class="keyword">async function</span> <span class="function">getPremiumVideos</span>(apiKey) {
-    <span class="keyword">const</span> response = <span class="keyword">await</span> fetch(<span class="string">`${API_URL}/premium_videos`</span>, {
-        headers: { <span class="string">'api-key'</span>: apiKey }
-    });
-    <span class="keyword">const</span> data = <span class="keyword">await</span> response.json();
-    console.log(data);
-}
-
-<span class="comment">// 5. Delete API Key</span>
-<span class="keyword">async function</span> <span class="function">deleteApiKey</span>(apiKey) {
-    <span class="keyword">const</span> response = <span class="keyword">await</span> fetch(<span class="string">`${API_URL}/apikey?api_key=${apiKey}`</span>, {
-        method: <span class="string">'DELETE'</span>
-    });
-    <span class="keyword">const</span> data = <span class="keyword">await</span> response.json();
-    console.log(data);
-}</pre>
-            </div>
-
-            <!-- Python -->
-            <div id="python" class="code-content">
-                <pre>
-<span class="comment"># Python Example</span>
+                <div class="endpoint-description">Root endpoint - Server status and HTML page</div>
+                
+                <div class="code-example-section">
+                    <div class="code-tabs">
+                        <button class="code-tab active" onclick="showCode('root-js')">JavaScript</button>
+                        <button class="code-tab" onclick="showCode('root-py')">Python</button>
+                        <button class="code-tab" onclick="showCode('root-curl')">cURL</button>
+                    </div>
+                    <div id="root-js" class="code-content active">
+                        <pre>
+<span class="keyword">const</span> response = <span class="keyword">await</span> fetch(<span class="string">'http://localhost:8000/'</span>);
+<span class="keyword">const</span> html = <span class="keyword">await</span> response.text();
+console.log(html);</pre>
+                    </div>
+                    <div id="root-py" class="code-content">
+                        <pre>
 <span class="keyword">import</span> requests
-<span class="keyword">import</span> json
-
-<span class="comment"># Configuration</span>
-API_URL = <span class="string">"http://localhost:8000"</span>
-
-<span class="comment"># 1. Create User</span>
-<span class="keyword">def</span> <span class="function">create_user</span>():
-    payload = {
-        <span class="string">"name"</span>: <span class="string">"John Doe"</span>,
-        <span class="string">"email"</span>: <span class="string">"john@example.com"</span>,
-        <span class="string">"password"</span>: <span class="string">"securepass123"</span>
-    }
-    response = requests.post(<span class="string">f"{API_URL}/users"</span>, json=payload)
-    print(response.json())
-
-<span class="comment"># 2. Generate API Key</span>
-<span class="keyword">def</span> <span class="function">generate_api_key</span>(user_id):
-    payload = {<span class="string">"user_id"</span>: user_id}
-    response = requests.post(<span class="string">f"{API_URL}/apikey"</span>, json=payload)
-    data = response.json()
-    <span class="keyword">return</span> data[<span class="string">'api_key'</span>]
-
-<span class="comment"># 3. Upload Video</span>
-<span class="keyword">def</span> <span class="function">upload_video</span>(api_key):
-    headers = {<span class="string">"api-key"</span>: api_key}
-    payload = {
-        <span class="string">"title"</span>: <span class="string">"My Video"</span>,
-        <span class="string">"stream_link"</span>: <span class="string">"https://example.com/video.mp4"</span>,
-        <span class="string">"thumbnail"</span>: <span class="string">"https://example.com/thumb.jpg"</span>,
-        <span class="string">"category"</span>: <span class="string">"Education"</span>,
-        <span class="string">"is_premium"</span>: False
-    }
-    response = requests.post(<span class="string">f"{API_URL}/upload_videos"</span>, 
-                           json=payload, headers=headers)
-    print(response.json())
-
-<span class="comment"># 4. Get Premium Videos</span>
-<span class="keyword">def</span> <span class="function">get_premium_videos</span>(api_key):
-    headers = {<span class="string">"api-key"</span>: api_key}
-    response = requests.get(<span class="string">f"{API_URL}/premium_videos"</span>, headers=headers)
-    print(response.json())
-
-<span class="comment"># 5. Delete API Key</span>
-<span class="keyword">def</span> <span class="function">delete_api_key</span>(api_key):
-    response = requests.delete(<span class="string">f"{API_URL}/apikey?api_key={api_key}"</span>)
-    print(response.json())
-
-<span class="comment"># Usage</span>
-<span class="keyword">if</span> __name__ == <span class="string">"__main__"</span>:
-    create_user()
-    api_key = generate_api_key(1)
-    upload_video(api_key)
-    get_premium_videos(api_key)</pre>
+response = requests.get(<span class="string">'http://localhost:8000/'</span>)
+print(response.text)</pre>
+                    </div>
+                    <div id="root-curl" class="code-content">
+                        <pre>curl -X GET http://localhost:8000/</pre>
+                    </div>
+                </div>
             </div>
 
-            <!-- cURL -->
-            <div id="curl" class="code-content">
-                <pre>
-<span class="comment"># 1. Create User</span>
-curl -X POST http://localhost:8000/users \
+            <!-- 2. Login Endpoint -->
+            <div class="endpoint-card">
+                <div class="endpoint-header">
+                    <div class="endpoint-left">
+                        <span class="method-badge method-post">POST</span>
+                        <span class="endpoint-path">/login</span>
+                    </div>
+                    <span class="auth-badge"><i class="fas fa-globe"></i> Public</span>
+                </div>
+                <div class="endpoint-description">Login user - Returns user data and API key</div>
+                
+                <div class="code-example-section">
+                    <div class="code-tabs">
+                        <button class="code-tab active" onclick="showCode('login-js')">JavaScript</button>
+                        <button class="code-tab" onclick="showCode('login-py')">Python</button>
+                        <button class="code-tab" onclick="showCode('login-curl')">cURL</button>
+                    </div>
+                    <div id="login-js" class="code-content active">
+                        <pre>
+<span class="keyword">const</span> response = <span class="keyword">await</span> fetch(<span class="string">'http://localhost:8000/login'</span>, {
+    method: <span class="string">'POST'</span>,
+    headers: { <span class="string">'Content-Type'</span>: <span class="string">'application/json'</span> },
+    body: JSON.stringify({
+        email: <span class="string">'john@example.com'</span>,
+        password: <span class="string">'securepass123'</span>
+    })
+});
+<span class="keyword">const</span> data = <span class="keyword">await</span> response.json();
+<span class="keyword">if</span> (data.success) {
+    localStorage.setItem(<span class="string">'api_key'</span>, data.api_key);
+    console.log(<span class="string">'Welcome'</span>, data.user.name);
+}</pre>
+                    </div>
+                    <div id="login-py" class="code-content">
+                        <pre>
+<span class="keyword">import</span> requests
+response = requests.post(<span class="string">'http://localhost:8000/login'</span>, json={
+    <span class="string">'email'</span>: <span class="string">'john@example.com'</span>,
+    <span class="string">'password'</span>: <span class="string">'securepass123'</span>
+})
+data = response.json()
+<span class="keyword">if</span> data[<span class="string">'success'</span>]:
+    api_key = data[<span class="string">'api_key'</span>]
+    print(<span class="string">f"Welcome {data['user']['name']}"</span>)</pre>
+                    </div>
+                    <div id="login-curl" class="code-content">
+                        <pre>curl -X POST http://localhost:8000/login \
+  -H <span class="string">"Content-Type: application/json"</span> \
+  -d <span class="string">'{
+    "email": "john@example.com",
+    "password": "securepass123"
+  }'</span></pre>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 3. Register Endpoint -->
+            <div class="endpoint-card">
+                <div class="endpoint-header">
+                    <div class="endpoint-left">
+                        <span class="method-badge method-post">POST</span>
+                        <span class="endpoint-path">/register</span>
+                    </div>
+                    <span class="auth-badge"><i class="fas fa-globe"></i> Public</span>
+                </div>
+                <div class="endpoint-description">Register a new user</div>
+                
+                <div class="code-example-section">
+                    <div class="code-tabs">
+                        <button class="code-tab active" onclick="showCode('register-js')">JavaScript</button>
+                        <button class="code-tab" onclick="showCode('register-py')">Python</button>
+                        <button class="code-tab" onclick="showCode('register-curl')">cURL</button>
+                    </div>
+                    <div id="register-js" class="code-content active">
+                        <pre>
+<span class="keyword">const</span> response = <span class="keyword">await</span> fetch(<span class="string">'http://localhost:8000/register'</span>, {
+    method: <span class="string">'POST'</span>,
+    headers: { <span class="string">'Content-Type'</span>: <span class="string">'application/json'</span> },
+    body: JSON.stringify({
+        name: <span class="string">'John Doe'</span>,
+        email: <span class="string">'john@example.com'</span>,
+        password: <span class="string">'securepass123'</span>
+    })
+});
+<span class="keyword">const</span> data = <span class="keyword">await</span> response.json();
+<span class="keyword">if</span> (data.success) {
+    console.log(<span class="string">'User registered successfully!'</span>);
+}</pre>
+                    </div>
+                    <div id="register-py" class="code-content">
+                        <pre>
+<span class="keyword">import</span> requests
+response = requests.post(<span class="string">'http://localhost:8000/register'</span>, json={
+    <span class="string">'name'</span>: <span class="string">'John Doe'</span>,
+    <span class="string">'email'</span>: <span class="string">'john@example.com'</span>,
+    <span class="string">'password'</span>: <span class="string">'securepass123'</span>
+})
+data = response.json()
+<span class="keyword">if</span> data[<span class="string">'success'</span>]:
+    print(<span class="string">'User registered successfully!'</span>)</pre>
+                    </div>
+                    <div id="register-curl" class="code-content">
+                        <pre>curl -X POST http://localhost:8000/register \
   -H <span class="string">"Content-Type: application/json"</span> \
   -d <span class="string">'{
     "name": "John Doe",
     "email": "john@example.com",
     "password": "securepass123"
-  }'</span>
+  }'</span></pre>
+                    </div>
+                </div>
+            </div>
 
-<span class="comment"># 2. Generate API Key</span>
-curl -X POST http://localhost:8000/apikey \
+            <!-- 4. Generate API Key -->
+            <div class="endpoint-card">
+                <div class="endpoint-header">
+                    <div class="endpoint-left">
+                        <span class="method-badge method-post">POST</span>
+                        <span class="endpoint-path">/apikey/gen</span>
+                    </div>
+                    <span class="auth-badge"><i class="fas fa-globe"></i> Public</span>
+                </div>
+                <div class="endpoint-description">Generate a new API key for a user (requires user_id)</div>
+                
+                <div class="code-example-section">
+                    <div class="code-tabs">
+                        <button class="code-tab active" onclick="showCode('apikey-js')">JavaScript</button>
+                        <button class="code-tab" onclick="showCode('apikey-py')">Python</button>
+                        <button class="code-tab" onclick="showCode('apikey-curl')">cURL</button>
+                    </div>
+                    <div id="apikey-js" class="code-content active">
+                        <pre>
+<span class="keyword">const</span> response = <span class="keyword">await</span> fetch(<span class="string">'http://localhost:8000/apikey/gen'</span>, {
+    method: <span class="string">'POST'</span>,
+    headers: { <span class="string">'Content-Type'</span>: <span class="string">'application/json'</span> },
+    body: JSON.stringify({ user_id: <span class="number">1</span> })
+});
+<span class="keyword">const</span> data = <span class="keyword">await</span> response.json();
+console.log(<span class="string">'API Key:'</span>, data.api_key);</pre>
+                    </div>
+                    <div id="apikey-py" class="code-content">
+                        <pre>
+<span class="keyword">import</span> requests
+response = requests.post(<span class="string">'http://localhost:8000/apikey/gen'</span>, json={
+    <span class="string">'user_id'</span>: <span class="number">1</span>
+})
+data = response.json()
+print(<span class="string">'API Key:'</span>, data[<span class="string">'api_key'</span>])</pre>
+                    </div>
+                    <div id="apikey-curl" class="code-content">
+                        <pre>curl -X POST http://localhost:8000/apikey/gen \
   -H <span class="string">"Content-Type: application/json"</span> \
-  -d <span class="string">'{"user_id": 1}'</span>
+  -d <span class="string">'{"user_id": 1}'</span></pre>
+                    </div>
+                </div>
+            </div>
 
-<span class="comment"># 3. Upload Video (Requires API Key)</span>
-curl -X POST http://localhost:8000/upload_videos \
+            <!-- 5. List API Keys -->
+            <div class="endpoint-card">
+                <div class="endpoint-header">
+                    <div class="endpoint-left">
+                        <span class="method-badge method-get">GET</span>
+                        <span class="endpoint-path">/apikey/list</span>
+                    </div>
+                    <span class="auth-badge"><i class="fas fa-globe"></i> Public</span>
+                </div>
+                <div class="endpoint-description">Get all API keys for a specific user (requires user_id as query param)</div>
+                
+                <div class="code-example-section">
+                    <div class="code-tabs">
+                        <button class="code-tab active" onclick="showCode('list-js')">JavaScript</button>
+                        <button class="code-tab" onclick="showCode('list-py')">Python</button>
+                        <button class="code-tab" onclick="showCode('list-curl')">cURL</button>
+                    </div>
+                    <div id="list-js" class="code-content active">
+                        <pre>
+<span class="keyword">const</span> response = <span class="keyword">await</span> fetch(<span class="string">'http://localhost:8000/apikey/list?user_id=1'</span>);
+<span class="keyword">const</span> data = <span class="keyword">await</span> response.json();
+console.log(<span class="string">'Total API Keys:'</span>, data.total);
+console.log(data.api_keys);</pre>
+                    </div>
+                    <div id="list-py" class="code-content">
+                        <pre>
+<span class="keyword">import</span> requests
+response = requests.get(<span class="string">'http://localhost:8000/apikey/list?user_id=1'</span>)
+data = response.json()
+print(<span class="string">'Total API Keys:'</span>, data[<span class="string">'total'</span>])
+print(data[<span class="string">'api_keys'</span>])</pre>
+                    </div>
+                    <div id="list-curl" class="code-content">
+                        <pre>curl -X GET <span class="string">"http://localhost:8000/apikey/list?user_id=1"</span></pre>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 6. Delete API Key -->
+            <div class="endpoint-card">
+                <div class="endpoint-header">
+                    <div class="endpoint-left">
+                        <span class="method-badge method-delete">DELETE</span>
+                        <span class="endpoint-path">/apikey/del</span>
+                    </div>
+                    <span class="auth-badge"><i class="fas fa-globe"></i> Public</span>
+                </div>
+                <div class="endpoint-description">Delete/Revoke an API key (requires api_key as query param)</div>
+                
+                <div class="code-example-section">
+                    <div class="code-tabs">
+                        <button class="code-tab active" onclick="showCode('del-js')">JavaScript</button>
+                        <button class="code-tab" onclick="showCode('del-py')">Python</button>
+                        <button class="code-tab" onclick="showCode('del-curl')">cURL</button>
+                    </div>
+                    <div id="del-js" class="code-content active">
+                        <pre>
+<span class="keyword">const</span> apiKey = <span class="string">'YOUR_API_KEY_HERE'</span>;
+<span class="keyword">const</span> response = <span class="keyword">await</span> fetch(<span class="string">`http://localhost:8000/apikey/del?api_key=${apiKey}`</span>, {
+    method: <span class="string">'DELETE'</span>
+});
+<span class="keyword">const</span> data = <span class="keyword">await</span> response.json();
+console.log(data.message);</pre>
+                    </div>
+                    <div id="del-py" class="code-content">
+                        <pre>
+<span class="keyword">import</span> requests
+api_key = <span class="string">'YOUR_API_KEY_HERE'</span>
+response = requests.delete(<span class="string">f'http://localhost:8000/apikey/del?api_key={api_key}'</span>)
+data = response.json()
+print(data[<span class="string">'message'</span>])</pre>
+                    </div>
+                    <div id="del-curl" class="code-content">
+                        <pre>curl -X DELETE <span class="string">"http://localhost:8000/apikey/del?api_key=YOUR_API_KEY_HERE"</span></pre>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 7. Get Free Videos -->
+            <div class="endpoint-card">
+                <div class="endpoint-header">
+                    <div class="endpoint-left">
+                        <span class="method-badge method-get">GET</span>
+                        <span class="endpoint-path">/videos</span>
+                    </div>
+                    <span class="auth-badge"><i class="fas fa-globe"></i> Public</span>
+                </div>
+                <div class="endpoint-description">Get all non-premium (free) videos</div>
+                
+                <div class="code-example-section">
+                    <div class="code-tabs">
+                        <button class="code-tab active" onclick="showCode('videos-js')">JavaScript</button>
+                        <button class="code-tab" onclick="showCode('videos-py')">Python</button>
+                        <button class="code-tab" onclick="showCode('videos-curl')">cURL</button>
+                    </div>
+                    <div id="videos-js" class="code-content active">
+                        <pre>
+<span class="keyword">const</span> response = <span class="keyword">await</span> fetch(<span class="string">'http://localhost:8000/videos'</span>);
+<span class="keyword">const</span> data = <span class="keyword">await</span> response.json();
+console.log(<span class="string">'Total Videos:'</span>, data.total);
+data.videos.forEach(video => {
+    console.log(video.title);
+});</pre>
+                    </div>
+                    <div id="videos-py" class="code-content">
+                        <pre>
+<span class="keyword">import</span> requests
+response = requests.get(<span class="string">'http://localhost:8000/videos'</span>)
+data = response.json()
+print(<span class="string">'Total Videos:'</span>, data[<span class="string">'total'</span>])
+<span class="keyword">for</span> video <span class="keyword">in</span> data[<span class="string">'videos'</span>]:
+    print(video[<span class="string">'title'</span>])</pre>
+                    </div>
+                    <div id="videos-curl" class="code-content">
+                        <pre>curl -X GET http://localhost:8000/videos</pre>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 8. Get Premium Videos -->
+            <div class="endpoint-card">
+                <div class="endpoint-header">
+                    <div class="endpoint-left">
+                        <span class="method-badge method-get">GET</span>
+                        <span class="endpoint-path">/premium_videos</span>
+                    </div>
+                    <span class="auth-badge"><i class="fas fa-key"></i> Requires API Key</span>
+                </div>
+                <div class="endpoint-description">Get all premium videos (requires API key in header)</div>
+                
+                <div class="code-example-section">
+                    <div class="code-tabs">
+                        <button class="code-tab active" onclick="showCode('premium-js')">JavaScript</button>
+                        <button class="code-tab" onclick="showCode('premium-py')">Python</button>
+                        <button class="code-tab" onclick="showCode('premium-curl')">cURL</button>
+                    </div>
+                    <div id="premium-js" class="code-content active">
+                        <pre>
+<span class="keyword">const</span> apiKey = localStorage.getItem(<span class="string">'api_key'</span>);
+<span class="keyword">const</span> response = <span class="keyword">await</span> fetch(<span class="string">'http://localhost:8000/premium_videos'</span>, {
+    headers: { <span class="string">'api-key'</span>: apiKey }
+});
+<span class="keyword">const</span> data = <span class="keyword">await</span> response.json();
+console.log(<span class="string">'Premium Videos:'</span>, data.videos);</pre>
+                    </div>
+                    <div id="premium-py" class="code-content">
+                        <pre>
+<span class="keyword">import</span> requests
+api_key = <span class="string">'YOUR_API_KEY_HERE'</span>
+response = requests.get(<span class="string">'http://localhost:8000/premium_videos'</span>, 
+                       headers={<span class="string">'api-key'</span>: api_key})
+data = response.json()
+print(<span class="string">'Premium Videos:'</span>, data[<span class="string">'videos'</span>])</pre>
+                    </div>
+                    <div id="premium-curl" class="code-content">
+                        <pre>curl -X GET http://localhost:8000/premium_videos \
+  -H <span class="string">"api-key: YOUR_API_KEY_HERE"</span></pre>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 9. Upload Video -->
+            <div class="endpoint-card">
+                <div class="endpoint-header">
+                    <div class="endpoint-left">
+                        <span class="method-badge method-post">POST</span>
+                        <span class="endpoint-path">/upload_videos</span>
+                    </div>
+                    <span class="auth-badge"><i class="fas fa-key"></i> Requires API Key</span>
+                </div>
+                <div class="endpoint-description">Upload a new video (requires API key in header)</div>
+                
+                <div class="code-example-section">
+                    <div class="code-tabs">
+                        <button class="code-tab active" onclick="showCode('upload-js')">JavaScript</button>
+                        <button class="code-tab" onclick="showCode('upload-py')">Python</button>
+                        <button class="code-tab" onclick="showCode('upload-curl')">cURL</button>
+                    </div>
+                    <div id="upload-js" class="code-content active">
+                        <pre>
+<span class="keyword">const</span> apiKey = localStorage.getItem(<span class="string">'api_key'</span>);
+<span class="keyword">const</span> response = <span class="keyword">await</span> fetch(<span class="string">'http://localhost:8000/upload_videos'</span>, {
+    method: <span class="string">'POST'</span>,
+    headers: {
+        <span class="string">'Content-Type'</span>: <span class="string">'application/json'</span>,
+        <span class="string">'api-key'</span>: apiKey
+    },
+    body: JSON.stringify({
+        title: <span class="string">'My Video'</span>,
+        stream_link: <span class="string">'https://example.com/video.mp4'</span>,
+        thumbnail: <span class="string">'https://example.com/thumb.jpg'</span>,
+        category: <span class="string">'Education'</span>,
+        is_premium: <span class="keyword">false</span>
+    })
+});
+<span class="keyword">const</span> data = <span class="keyword">await</span> response.json();
+console.log(<span class="string">'Uploaded:'</span>, data.message);</pre>
+                    </div>
+                    <div id="upload-py" class="code-content">
+                        <pre>
+<span class="keyword">import</span> requests
+api_key = <span class="string">'YOUR_API_KEY_HERE'</span>
+response = requests.post(<span class="string">'http://localhost:8000/upload_videos'</span>,
+    headers={<span class="string">'api-key'</span>: api_key},
+    json={
+        <span class="string">'title'</span>: <span class="string">'My Video'</span>,
+        <span class="string">'stream_link'</span>: <span class="string">'https://example.com/video.mp4'</span>,
+        <span class="string">'thumbnail'</span>: <span class="string">'https://example.com/thumb.jpg'</span>,
+        <span class="string">'category'</span>: <span class="string">'Education'</span>,
+        <span class="string">'is_premium'</span>: False
+    })
+data = response.json()
+print(<span class="string">'Uploaded:'</span>, data[<span class="string">'message'</span>])</pre>
+                    </div>
+                    <div id="upload-curl" class="code-content">
+                        <pre>curl -X POST http://localhost:8000/upload_videos \
   -H <span class="string">"Content-Type: application/json"</span> \
   -H <span class="string">"api-key: YOUR_API_KEY_HERE"</span> \
   -d <span class="string">'{
@@ -668,134 +800,85 @@ curl -X POST http://localhost:8000/upload_videos \
     "thumbnail": "https://example.com/thumb.jpg",
     "category": "Education",
     "is_premium": false
-  }'</span>
-
-<span class="comment"># 4. Get Premium Videos (Requires API Key)</span>
-curl -X GET http://localhost:8000/premium_videos \
-  -H <span class="string">"api-key: YOUR_API_KEY_HERE"</span>
-
-<span class="comment"># 5. Delete API Key</span>
-curl -X DELETE <span class="string">"http://localhost:8000/apikey?api_key=YOUR_API_KEY_HERE"</span>
-
-<span class="comment"># 6. Get All Users</span>
-curl -X GET http://localhost:8000/get_users
-
-<span class="comment"># 7. Get Non-Premium Videos</span>
-curl -X GET http://localhost:8000/videos
-
-<span class="comment"># 8. Get Video by Viewkey</span>
-curl -X GET http://localhost:8000/videos/abc123
-
-<span class="comment"># 9. Health Check</span>
-curl -X GET http://localhost:8000/health</pre>
+  }'</span></pre>
+                    </div>
+                </div>
             </div>
 
-            <!-- Java -->
-            <div id="java" class="code-content">
-                <pre>
-<span class="comment">// Java Example using HttpClient (Java 11+)</span>
-<span class="keyword">import</span> java.net.http.HttpClient;
-<span class="keyword">import</span> java.net.http.HttpRequest;
-<span class="keyword">import</span> java.net.http.HttpResponse;
-<span class="keyword">import</span> java.net.URI;
+            <!-- 10. Get Video by Viewkey -->
+            <div class="endpoint-card">
+                <div class="endpoint-header">
+                    <div class="endpoint-left">
+                        <span class="method-badge method-get">GET</span>
+                        <span class="endpoint-path">/videos/{viewkey}</span>
+                    </div>
+                    <span class="auth-badge"><i class="fas fa-globe"></i> Public</span>
+                </div>
+                <div class="endpoint-description">Get a video by its viewkey</div>
+                
+                <div class="code-example-section">
+                    <div class="code-tabs">
+                        <button class="code-tab active" onclick="showCode('viewkey-js')">JavaScript</button>
+                        <button class="code-tab" onclick="showCode('viewkey-py')">Python</button>
+                        <button class="code-tab" onclick="showCode('viewkey-curl')">cURL</button>
+                    </div>
+                    <div id="viewkey-js" class="code-content active">
+                        <pre>
+<span class="keyword">const</span> viewkey = <span class="string">'abc123'</span>;
+<span class="keyword">const</span> response = <span class="keyword">await</span> fetch(<span class="string">`http://localhost:8000/videos/${viewkey}`</span>);
+<span class="keyword">const</span> data = <span class="keyword">await</span> response.json();
+console.log(<span class="string">'Video:'</span>, data.video);</pre>
+                    </div>
+                    <div id="viewkey-py" class="code-content">
+                        <pre>
+<span class="keyword">import</span> requests
+viewkey = <span class="string">'abc123'</span>
+response = requests.get(<span class="string">f'http://localhost:8000/videos/{viewkey}'</span>)
+data = response.json()
+print(<span class="string">'Video:'</span>, data[<span class="string">'video'</span>])</pre>
+                    </div>
+                    <div id="viewkey-curl" class="code-content">
+                        <pre>curl -X GET http://localhost:8000/videos/abc123</pre>
+                    </div>
+                </div>
+            </div>
 
-<span class="keyword">public class</span> <span class="function">ApiClient</span> {
-    <span class="keyword">private static final</span> String API_URL = <span class="string">"http://localhost:8000"</span>;
-    <span class="keyword">private static final</span> HttpClient client = HttpClient.newHttpClient();
-
-    <span class="comment">// 1. Create User</span>
-    <span class="keyword">public static void</span> <span class="function">createUser</span>() <span class="keyword">throws</span> Exception {
-        String json = <span class="string">"""
-            {
-                "name": "John Doe",
-                "email": "john@example.com",
-                "password": "securepass123"
-            }
-            """</span>;
-        
-        HttpRequest request = HttpRequest.newBuilder()
-            .uri(URI.create(API_URL + <span class="string">"/users"</span>))
-            .header(<span class="string">"Content-Type"</span>, <span class="string">"application/json"</span>)
-            .POST(HttpRequest.BodyPublishers.ofString(json))
-            .build();
-
-        HttpResponse<String> response = client.send(request, 
-            HttpResponse.BodyHandlers.ofString());
-        System.out.println(response.body());
-    }
-
-    <span class="comment">// 2. Generate API Key</span>
-    <span class="keyword">public static void</span> <span class="function">generateApiKey</span>(<span class="keyword">int</span> userId) <span class="keyword">throws</span> Exception {
-        String json = <span class="string">"{"user_id": "</span> + userId + <span class="string">"}"</span>;
-        
-        HttpRequest request = HttpRequest.newBuilder()
-            .uri(URI.create(API_URL + <span class="string">"/apikey"</span>))
-            .header(<span class="string">"Content-Type"</span>, <span class="string">"application/json"</span>)
-            .POST(HttpRequest.BodyPublishers.ofString(json))
-            .build();
-
-        HttpResponse<String> response = client.send(request, 
-            HttpResponse.BodyHandlers.ofString());
-        System.out.println(response.body());
-    }
-
-    <span class="comment">// 3. Upload Video</span>
-    <span class="keyword">public static void</span> <span class="function">uploadVideo</span>(String apiKey) <span class="keyword">throws</span> Exception {
-        String json = <span class="string">"""
-            {
-                "title": "My Video",
-                "stream_link": "https://example.com/video.mp4",
-                "thumbnail": "https://example.com/thumb.jpg",
-                "category": "Education",
-                "is_premium": false
-            }
-            """</span>;
-        
-        HttpRequest request = HttpRequest.newBuilder()
-            .uri(URI.create(API_URL + <span class="string">"/upload_videos"</span>))
-            .header(<span class="string">"Content-Type"</span>, <span class="string">"application/json"</span>)
-            .header(<span class="string">"api-key"</span>, apiKey)
-            .POST(HttpRequest.BodyPublishers.ofString(json))
-            .build();
-
-        HttpResponse<String> response = client.send(request, 
-            HttpResponse.BodyHandlers.ofString());
-        System.out.println(response.body());
-    }
-
-    <span class="comment">// 4. Get Premium Videos</span>
-    <span class="keyword">public static void</span> <span class="function">getPremiumVideos</span>(String apiKey) <span class="keyword">throws</span> Exception {
-        HttpRequest request = HttpRequest.newBuilder()
-            .uri(URI.create(API_URL + <span class="string">"/premium_videos"</span>))
-            .header(<span class="string">"api-key"</span>, apiKey)
-            .GET()
-            .build();
-
-        HttpResponse<String> response = client.send(request, 
-            HttpResponse.BodyHandlers.ofString());
-        System.out.println(response.body());
-    }
-
-    <span class="comment">// 5. Delete API Key</span>
-    <span class="keyword">public static void</span> <span class="function">deleteApiKey</span>(String apiKey) <span class="keyword">throws</span> Exception {
-        HttpRequest request = HttpRequest.newBuilder()
-            .uri(URI.create(API_URL + <span class="string">"/apikey?api_key="</span> + apiKey))
-            .DELETE()
-            .build();
-
-        HttpResponse<String> response = client.send(request, 
-            HttpResponse.BodyHandlers.ofString());
-        System.out.println(response.body());
-    }
-
-    <span class="keyword">public static void</span> <span class="function">main</span>(String[] args) <span class="keyword">throws</span> Exception {
-        createUser();
-        generateApiKey(1);
-        <span class="comment">// Use the returned API key from above</span>
-        uploadVideo(<span class="string">"YOUR_API_KEY_HERE"</span>);
-        getPremiumVideos(<span class="string">"YOUR_API_KEY_HERE"</span>);
-    }
-}</pre>
+            <!-- 11. Health Check -->
+            <div class="endpoint-card">
+                <div class="endpoint-header">
+                    <div class="endpoint-left">
+                        <span class="method-badge method-get">GET</span>
+                        <span class="endpoint-path">/health</span>
+                    </div>
+                    <span class="auth-badge"><i class="fas fa-globe"></i> Public</span>
+                </div>
+                <div class="endpoint-description">Health check endpoint - Server status and database connection</div>
+                
+                <div class="code-example-section">
+                    <div class="code-tabs">
+                        <button class="code-tab active" onclick="showCode('health-js')">JavaScript</button>
+                        <button class="code-tab" onclick="showCode('health-py')">Python</button>
+                        <button class="code-tab" onclick="showCode('health-curl')">cURL</button>
+                    </div>
+                    <div id="health-js" class="code-content active">
+                        <pre>
+<span class="keyword">const</span> response = <span class="keyword">await</span> fetch(<span class="string">'http://localhost:8000/health'</span>);
+<span class="keyword">const</span> data = <span class="keyword">await</span> response.json();
+console.log(<span class="string">'Status:'</span>, data.status);
+console.log(<span class="string">'Database:'</span>, data.database);</pre>
+                    </div>
+                    <div id="health-py" class="code-content">
+                        <pre>
+<span class="keyword">import</span> requests
+response = requests.get(<span class="string">'http://localhost:8000/health'</span>)
+data = response.json()
+print(<span class="string">'Status:'</span>, data[<span class="string">'status'</span>])
+print(<span class="string">'Database:'</span>, data[<span class="string">'database'</span>])</pre>
+                    </div>
+                    <div id="health-curl" class="code-content">
+                        <pre>curl -X GET http://localhost:8000/health</pre>
+                    </div>
+                </div>
             </div>
         </div>
 
@@ -815,21 +898,46 @@ curl -X GET http://localhost:8000/health</pre>
     </div>
 
     <script>
+        // Code tab switching
+        function showCode(language) {
+            // Find the parent endpoint card
+            const card = event.target.closest('.endpoint-card');
+            if (!card) return;
+            
+            // Hide all code content in this card
+            card.querySelectorAll('.code-content').forEach(el => {
+                el.classList.remove('active');
+            });
+            
+            // Show selected code content
+            const target = card.querySelector(`#${language}`);
+            if (target) {
+                target.classList.add('active');
+            }
+            
+            // Update tab styles
+            card.querySelectorAll('.code-tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            
+            // Find and activate the clicked tab
+            card.querySelectorAll('.code-tab').forEach(tab => {
+                if (tab.textContent.toLowerCase() === language.split('-')[1] || 
+                    tab.textContent.toLowerCase() === language) {
+                    tab.classList.add('active');
+                }
+            });
+        }
+
         // Fetch real-time stats from the server
         async function fetchStats() {
             try {
-                // Fetch users count
-                const usersResponse = await fetch('/get_users');
-                const users = await usersResponse.json();
-                document.getElementById('totalUsers').textContent = Array.isArray(users) ? users.length : 0;
-
-                // Fetch videos count (non-premium)
+                // Fetch videos count
                 const videosResponse = await fetch('/videos');
                 const videos = await videosResponse.json();
-                document.getElementById('totalVideos').textContent = Array.isArray(videos) ? videos.length : 0;
+                document.getElementById('totalVideos').textContent = videos.total || 0;
             } catch (error) {
                 console.log('Could not fetch stats:', error);
-                // Keep default values if fetch fails
             }
         }
 
@@ -838,29 +946,6 @@ curl -X GET http://localhost:8000/health</pre>
 
         // Refresh stats every 30 seconds
         setInterval(fetchStats, 30000);
-
-        // Code tab switching
-        function showCode(language) {
-            // Hide all code content
-            document.querySelectorAll('.code-content').forEach(el => {
-                el.classList.remove('active');
-            });
-            
-            // Show selected code content
-            document.getElementById(language).classList.add('active');
-            
-            // Update tab styles
-            document.querySelectorAll('.code-tab').forEach(tab => {
-                tab.classList.remove('active');
-            });
-            
-            // Find and activate the clicked tab
-            document.querySelectorAll('.code-tab').forEach(tab => {
-                if (tab.textContent.toLowerCase() === language) {
-                    tab.classList.add('active');
-                }
-            });
-        }
 
         // Manual refresh function
         function refreshStats() {
@@ -871,22 +956,6 @@ curl -X GET http://localhost:8000/health</pre>
             }, 1000);
             return false;
         }
-
-        // Add animation to cards on scroll
-        const observer = new IntersectionObserver((entries) => {
-            entries.forEach(entry => {
-                if (entry.isIntersecting) {
-                    entry.target.style.opacity = '1';
-                    entry.target.style.transform = 'translateY(0)';
-                }
-            });
-        }, { threshold: 0.1 });
-
-        document.querySelectorAll('.endpoint-card').forEach(card => {
-            card.style.opacity = '0';
-            card.style.transform = 'translateY(30px)';
-            observer.observe(card);
-        });
     </script>
 </body>
 </html>
