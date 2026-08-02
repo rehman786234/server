@@ -1,26 +1,33 @@
 import secrets
 from fastapi import APIRouter, HTTPException, status, Header
 from fastapi.responses import HTMLResponse
-from typing import List, Dict, Any
+from typing import Optional
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
+import hashlib
 
 from database import execute_query, get_one
-from models import User, Video, UserCreate, APIKeyRequest
+from models import User, UserCreate, UserLogin, APIKeyRequest, Video
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# Helper function to hash passwords
+def hash_password(password: str) -> str:
+    """Hash a password using SHA-256"""
+    return hashlib.sha256(password.encode()).hexdigest()
 
 # Helper function to validate API key
 def validate_api_key(api_key: str):
     """Validate API key and return user data if valid"""
     try:
         query = """
-            SELECT a.*, u.id as user_id, u.name, u.email 
+            SELECT a.*, u.id as user_id, u.name, u.email, u.is_premium
             FROM apikeys a
             JOIN mydata u ON a.user_id = u.id
-            WHERE a.api_key = %s
+            WHERE a.api_key = %s 
+            AND a.expiry_date > NOW()
         """
         result = get_one(query, (api_key,))
         return result
@@ -32,7 +39,6 @@ def validate_api_key(api_key: str):
 def get_home_html():
     """Read the home.html file and return its content"""
     try:
-        # Get the directory where routes.py is located
         current_dir = os.path.dirname(os.path.abspath(__file__))
         html_path = os.path.join(current_dir, "home.html")
         
@@ -49,175 +55,254 @@ async def home():
     return get_home_html()
 
 
-@router.get("/get_users")
-async def get_users():
-    """Get all users"""
+# ============ AUTHENTICATION ENDPOINTS ============
+
+@router.post("/login")
+async def login(user: UserLogin):
+    """
+    Login endpoint for frontend
+    - Checks if credentials are valid
+    - Returns user data and generates API key for session
+    """
     try:
-        query = "SELECT * FROM mydata ORDER BY id"
-        results = execute_query(query, fetch=True)
+        # Get user by email
+        query = "SELECT * FROM mydata WHERE email = %s"
+        db_user = get_one(query, (user.email,))
         
-        if not results:
-            return {"message": "No Users Found"}
+        if not db_user:
+            return {
+                "success": False,
+                "message": "Invalid email or password"
+            }
         
-        return results
+        # Verify password
+        hashed_input = hash_password(user.password)
+        if db_user['password'] != hashed_input:
+            return {
+                "success": False,
+                "message": "Invalid email or password"
+            }
+        
+        # Generate session API key
+        session_key = secrets.token_hex(16)
+        expiry_date = datetime.now() + timedelta(days=30)
+        
+        # Store session API key
+        insert_key_query = """
+            INSERT INTO apikeys (user_id, api_key, created_at, expiry_date) 
+            VALUES (%s, %s, %s, %s) 
+            RETURNING id, api_key, created_at, expiry_date
+        """
+        api_key_result = get_one(
+            insert_key_query, 
+            (db_user['id'], session_key, datetime.now(), expiry_date)
+        )
+        
+        # Remove password from user data
+        db_user.pop('password', None)
+        
+        return {
+            "success": True,
+            "message": "Login successful",
+            "user": {
+                "id": db_user['id'],
+                "name": db_user['name'],
+                "email": db_user['email'],
+                "is_premium": db_user['is_premium'],
+                "created_at": db_user['created_at']
+            },
+            "api_key": session_key,
+            "expires_in": "30 days"
+        }
         
     except Exception as e:
-        logger.error(f"Error in get_users: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error: {str(e)}"
-        )
+        logger.error(f"Error in login: {e}")
+        return {
+            "success": False,
+            "message": f"Login error: {str(e)}"
+        }
 
 
-@router.post("/users")
-async def create_user(user: UserCreate):
-    """Create a new user"""
+@router.post("/register")
+async def register(user: UserCreate):
+    """
+    Register endpoint for frontend
+    - Creates a new user account
+    - Password is hashed before storage
+    - Returns user details
+    """
     try:
-        query = """
-            INSERT INTO mydata (name, email, password) 
-            VALUES (%s, %s, %s) 
-            RETURNING id, name, email, created_at
-        """
-        result = get_one(query, (user.name, user.email, user.password))
+        # Check if user already exists
+        check_query = "SELECT id FROM mydata WHERE email = %s"
+        existing_user = get_one(check_query, (user.email,))
         
-        if result:
-            return {"message": "User Added Successfully", "user": result}
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to create user"
-            )
-            
-    except Exception as e:
-        logger.error(f"Error in create_user: {e}")
-        if "unique constraint" in str(e).lower() or "duplicate key" in str(e).lower():
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Email already exists"
-            )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error: {str(e)}"
+        if existing_user:
+            return {
+                "success": False,
+                "message": "User with this email already exists"
+            }
+        
+        # Hash password
+        hashed_password = hash_password(user.password)
+        
+        # Insert new user
+        query = """
+            INSERT INTO mydata (name, email, password, is_premium, created_at) 
+            VALUES (%s, %s, %s, %s, %s) 
+            RETURNING id, name, email, is_premium, created_at
+        """
+        result = get_one(
+            query, 
+            (user.name, user.email, hashed_password, user.is_premium or False, datetime.now())
         )
-
-
-@router.post("/apikey")
-async def generate_api_key(user: APIKeyRequest):
-    """Generate a new API key for a user and store in database"""
-    try:
-        # Check if user exists
-        user_query = "SELECT * FROM mydata WHERE id = %s"
-        user_exists = get_one(user_query, (user.user_id,))
-        
-        if not user_exists:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User not found"
-            )
-        
-        api_key = secrets.token_hex(16)
-        
-        # Store API key in database
-        query = """
-            INSERT INTO apikeys (user_id, api_key) 
-            VALUES (%s, %s) 
-            RETURNING id, user_id, api_key, created_at
-        """
-        result = get_one(query, (user.user_id, api_key))
         
         if result:
             return {
+                "success": True,
+                "message": "User registered successfully",
+                "user": result
+            }
+        else:
+            return {
+                "success": False,
+                "message": "Failed to register user"
+            }
+            
+    except Exception as e:
+        logger.error(f"Error in register: {e}")
+        return {
+            "success": False,
+            "message": f"Registration error: {str(e)}"
+        }
+
+
+# ============ API KEY MANAGEMENT ENDPOINTS ============
+
+@router.post("/apikey/gen")
+async def generate_api_key(request: APIKeyRequest):
+    """
+    Generate a new API key for a user
+    - Requires user_id
+    - Creates a permanent API key for external access
+    """
+    try:
+        # Check if user exists
+        user_query = "SELECT * FROM mydata WHERE id = %s"
+        user_exists = get_one(user_query, (request.user_id,))
+        
+        if not user_exists:
+            return {
+                "success": False,
+                "message": "User not found"
+            }
+        
+        api_key = secrets.token_hex(16)
+        expiry_date = datetime.now() + timedelta(days=30)
+        
+        # Store API key in database
+        query = """
+            INSERT INTO apikeys (user_id, api_key, created_at, expiry_date) 
+            VALUES (%s, %s, %s, %s) 
+            RETURNING id, user_id, api_key, created_at, expiry_date
+        """
+        result = get_one(query, (request.user_id, api_key, datetime.now(), expiry_date))
+        
+        if result:
+            return {
+                "success": True,
                 "message": "API Key generated successfully",
                 "api_key": result
             }
         else:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to create API key"
-            )
+            return {
+                "success": False,
+                "message": "Failed to create API key"
+            }
             
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"Error in generate_api_key: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error: {str(e)}"
-        )
+        return {
+            "success": False,
+            "message": f"Database error: {str(e)}"
+        }
 
 
-@router.post("/user_apikeys")
-async def get_user_apikeys(user: User):
-    """Get all API keys for a specific user"""
+@router.get("/apikey/list")
+async def list_user_apikeys(user_id: int):
+    """
+    Get all API keys for a specific user
+    - Requires user_id as query parameter
+    """
     try:
-        query = "SELECT * FROM apikeys WHERE user_id = %s ORDER BY created_at DESC"
-        results = execute_query(query, (user.id,), fetch=True)
-        return results if results else []
-        
-    except Exception as e:
-        logger.error(f"Error in get_user_apikeys: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error: {str(e)}"
-        )
-
-
-@router.post("/user_apikeys/create")
-async def create_user_apikey(user: User):
-    """Create a new API key for a user"""
-    try:
-        api_key = secrets.token_hex(16)
         query = """
-            INSERT INTO apikeys (user_id, api_key) 
-            VALUES (%s, %s) 
-            RETURNING id, user_id, api_key, created_at
+            SELECT id, user_id, api_key, created_at, expiry_date 
+            FROM apikeys 
+            WHERE user_id = %s 
+            ORDER BY created_at DESC
         """
-        result = get_one(query, (user.id, api_key))
+        results = execute_query(query, (user_id,), fetch=True)
+        return {
+            "success": True,
+            "total": len(results) if results else 0,
+            "api_keys": results if results else []
+        }
         
-        if result:
-            return {"message": "API Key created", "apikey": result}
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to create API key"
-            )
-            
     except Exception as e:
-        logger.error(f"Error in create_user_apikey: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error: {str(e)}"
-        )
+        logger.error(f"Error in list_user_apikeys: {e}")
+        return {
+            "success": False,
+            "message": f"Database error: {str(e)}"
+        }
 
 
-@router.delete("/apikey")
+@router.delete("/apikey/del")
 async def delete_apikey(api_key: str):
-    """Delete an API key"""
+    """
+    Delete/Revoke an API key
+    - Requires api_key as query parameter
+    """
     try:
+        # Check if API key exists
+        check_query = "SELECT id FROM apikeys WHERE api_key = %s"
+        existing_key = get_one(check_query, (api_key,))
+        
+        if not existing_key:
+            return {
+                "success": False,
+                "message": "API key not found"
+            }
+        
+        # Delete the API key
         query = "DELETE FROM apikeys WHERE api_key = %s RETURNING id"
         result = get_one(query, (api_key,))
         
         if result:
-            return {"message": "API key deleted successfully"}
+            return {
+                "success": True,
+                "message": "API key deleted successfully"
+            }
         else:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="API key not found"
-            )
+            return {
+                "success": False,
+                "message": "Failed to delete API key"
+            }
             
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"Error in delete_apikey: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error: {str(e)}"
-        )
+        return {
+            "success": False,
+            "message": f"Database error: {str(e)}"
+        }
 
+
+# ============ VIDEOS ENDPOINTS ============
 
 @router.get("/videos")
 async def get_videos():
-    """Get all non-premium videos only (no API key required)"""
+    """
+    Get all free videos (is_premium = false)
+    - No API key required
+    """
     try:
         query = """
             SELECT * FROM videos 
@@ -225,19 +310,26 @@ async def get_videos():
             ORDER BY uploaded_at DESC
         """
         results = execute_query(query, fetch=True)
-        return results if results else []
+        return {
+            "success": True,
+            "total": len(results) if results else 0,
+            "videos": results if results else []
+        }
         
     except Exception as e:
         logger.error(f"Error in get_videos: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error: {str(e)}"
-        )
+        return {
+            "success": False,
+            "message": f"Database error: {str(e)}"
+        }
 
 
 @router.get("/premium_videos")
 async def get_premium_videos(api_key: str = Header(...)):
-    """Get all premium videos (requires API key)"""
+    """
+    Get all premium videos (is_premium = true)
+    - Requires API key
+    """
     # Validate API key
     user_data = validate_api_key(api_key)
     if not user_data:
@@ -262,37 +354,25 @@ async def get_premium_videos(api_key: str = Header(...)):
             "user": {
                 "id": user_data['user_id'],
                 "name": user_data['name'],
-                "email": user_data['email']
+                "email": user_data['email'],
+                "is_premium": user_data['is_premium']
             }
         }
         
     except Exception as e:
         logger.error(f"Error in get_premium_videos: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error: {str(e)}"
-        )
-
-
-@router.get("/all_videos")
-async def get_all_videos():
-    """Get all videos (both premium and non-premium) - no API key required"""
-    try:
-        query = "SELECT * FROM videos ORDER BY uploaded_at DESC"
-        results = execute_query(query, fetch=True)
-        return results if results else []
-        
-    except Exception as e:
-        logger.error(f"Error in get_all_videos: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error: {str(e)}"
-        )
+        return {
+            "success": False,
+            "message": f"Database error: {str(e)}"
+        }
 
 
 @router.post("/upload_videos")
 async def upload_video(video: Video, api_key: str = Header(...)):
-    """Upload a new video (requires API key)"""
+    """
+    Upload a new video
+    - Requires API key
+    """
     # Validate API key
     user_data = validate_api_key(api_key)
     if not user_data:
@@ -316,40 +396,47 @@ async def upload_video(video: Video, api_key: str = Header(...)):
         
         if result:
             return {
-                "message": "Video Upload Success",
+                "success": True,
+                "message": "Video uploaded successfully",
                 "viewkey": viewkey,
                 "video": result,
                 "uploaded_by": user_data.get('name', 'Unknown'),
                 "user_id": user_data.get('user_id')
             }
         else:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to upload video"
-            )
+            return {
+                "success": False,
+                "message": "Failed to upload video"
+            }
             
     except Exception as e:
         logger.error(f"Error in upload_video: {e}")
         if "unique constraint" in str(e).lower() or "duplicate key" in str(e).lower():
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Video with this viewkey already exists"
-            )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error: {str(e)}"
-        )
+            return {
+                "success": False,
+                "message": "Video with this viewkey already exists"
+            }
+        return {
+            "success": False,
+            "message": f"Database error: {str(e)}"
+        }
 
 
 @router.get("/videos/{viewkey}")
 async def get_video_by_key(viewkey: str):
-    """Get a video by its viewkey"""
+    """
+    Get a video by its viewkey
+    - No API key required for free videos
+    """
     try:
         query = "SELECT * FROM videos WHERE viewkey = %s"
         result = get_one(query, (viewkey,))
         
         if result:
-            return result
+            return {
+                "success": True,
+                "video": result
+            }
         else:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -360,10 +447,10 @@ async def get_video_by_key(viewkey: str):
         raise
     except Exception as e:
         logger.error(f"Error in get_video_by_key: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error: {str(e)}"
-        )
+        return {
+            "success": False,
+            "message": f"Database error: {str(e)}"
+        }
 
 
 @router.get("/health")
