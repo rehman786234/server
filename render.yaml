@@ -1,6 +1,8 @@
 services:
   - type: web
-    name: your-service
+    name: server  # ← Your actual service name
+    repo: https://github.com/rehman786234/server  # Optional
+    branch: main
     env: python
     buildCommand: |
       pip install --upgrade pip
@@ -9,7 +11,9 @@ services:
     envVars:
       - key: DATABASE_URL
         fromDatabase:
-          name: your-database-name
+          name: my-postgres-db  # Your database name
           property: connectionString
       - key: PYTHON_VERSION
-        value: 3.11
+        value: 3.11.9
+      - key: ENVIRONMENT
+        value: production
