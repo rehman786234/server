@@ -436,6 +436,158 @@ async def get_video_by_key(viewkey: str):
         }
 
 
+# ============ PLAYLIST ENDPOINTS ============
+
+@router.get("/playlists")
+async def get_playlists():
+    """
+    Get all playlists with their playlist videos.
+
+    No API key required.
+    Returns only playlist-related data.
+    """
+    try:
+        query = """
+            SELECT
+                p.playlist_id,
+                p.playlist_name,
+                p.playlist_type,
+                p.total_videos,
+                p.playlist_thumbnail,
+                p.created_at,
+
+                COALESCE(
+                    json_agg(
+                        json_build_object(
+                            'video_id', v.video_id,
+                            'viewkey', v.viewkey,
+                            'stream_url', v.stream_url,
+                            'video_title', v.video_title,
+                            'video_thumbnail', v.video_thumbnail,
+                            'video_duration', v.video_duration,
+                            'video_quality', v.video_quality
+                        )
+                        ORDER BY v.video_id ASC
+                    ) FILTER (WHERE v.video_id IS NOT NULL),
+                    '[]'::json
+                ) AS videos
+
+            FROM playlist AS p
+
+            LEFT JOIN videos_of_playlist AS v
+                ON v.playlist_id = p.playlist_id
+
+            GROUP BY
+                p.playlist_id,
+                p.playlist_name,
+                p.playlist_type,
+                p.total_videos,
+                p.playlist_thumbnail,
+                p.created_at
+
+            ORDER BY p.created_at DESC
+        """
+
+        results = execute_query(query, fetch=True)
+
+        return {
+            "success": True,
+            "total": len(results) if results else 0,
+            "playlists": results or []
+        }
+
+    except Exception as e:
+        logger.exception("Error while retrieving playlists")
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve playlists"
+        )
+
+
+@router.get("/playlists/{playlist_id}")
+async def get_playlist(playlist_id: int):
+    """
+    Get one playlist with all of its videos.
+
+    No API key required.
+    """
+    if playlist_id <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid playlist ID"
+        )
+
+    try:
+        query = """
+            SELECT
+                p.playlist_id,
+                p.playlist_name,
+                p.playlist_type,
+                p.total_videos,
+                p.playlist_thumbnail,
+                p.created_at,
+
+                COALESCE(
+                    json_agg(
+                        json_build_object(
+                            'video_id', v.video_id,
+                            'viewkey', v.viewkey,
+                            'stream_url', v.stream_url,
+                            'video_title', v.video_title,
+                            'video_thumbnail', v.video_thumbnail,
+                            'video_duration', v.video_duration,
+                            'video_quality', v.video_quality
+                        )
+                        ORDER BY v.video_id ASC
+                    ) FILTER (WHERE v.video_id IS NOT NULL),
+                    '[]'::json
+                ) AS videos
+
+            FROM playlist AS p
+
+            LEFT JOIN videos_of_playlist AS v
+                ON v.playlist_id = p.playlist_id
+
+            WHERE p.playlist_id = %s
+
+            GROUP BY
+                p.playlist_id,
+                p.playlist_name,
+                p.playlist_type,
+                p.total_videos,
+                p.playlist_thumbnail,
+                p.created_at
+        """
+
+        result = get_one(query, (playlist_id,))
+
+        if not result:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Playlist not found"
+            )
+
+        return {
+            "success": True,
+            "playlist": result
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception:
+        logger.exception(
+            "Error while retrieving playlist %s",
+            playlist_id
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve playlist"
+        )
+
+
 @router.get("/health")
 async def health_check():
     """Health check endpoint"""
