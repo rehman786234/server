@@ -451,9 +451,12 @@ async def health_check():
 @router.get("/playlists")
 async def get_playlists():
     """
-    Get all playlists with their videos.
+    Get all playlists with their playlist videos.
+
     No API key required.
+    Returns only playlist-related data.
     """
+
     try:
         query = """
             SELECT
@@ -475,15 +478,15 @@ async def get_playlists():
                             'video_duration', v.video_duration,
                             'video_quality', v.video_quality
                         )
-                        ORDER BY v.video_id
+                        ORDER BY v.video_id ASC
                     ) FILTER (WHERE v.video_id IS NOT NULL),
                     '[]'::json
                 ) AS videos
 
-            FROM playlist p
+            FROM playlist AS p
 
-            LEFT JOIN videos_of_playlist v
-                ON p.playlist_id = v.playlist_id
+            LEFT JOIN videos_of_playlist AS v
+                ON v.playlist_id = p.playlist_id
 
             GROUP BY
                 p.playlist_id,
@@ -501,13 +504,13 @@ async def get_playlists():
         return {
             "success": True,
             "total": len(results) if results else 0,
-            "playlists": results if results else []
+            "playlists": results or []
         }
 
     except Exception as e:
-        logger.error(f"Error in get_playlists: {e}")
+        logger.exception("Error while retrieving playlists")
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error: {str(e)}"
+            detail="Failed to retrieve playlists"
         )
