@@ -454,7 +454,6 @@ async def get_playlists():
     Get all playlists with their videos.
     No API key required.
     """
-
     try:
         query = """
             SELECT
@@ -470,6 +469,7 @@ async def get_playlists():
                         json_build_object(
                             'video_id', v.video_id,
                             'viewkey', v.viewkey,
+                            'stream_url', v.stream_url,
                             'video_title', v.video_title,
                             'video_thumbnail', v.video_thumbnail,
                             'video_duration', v.video_duration,
