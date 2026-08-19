@@ -446,3 +446,68 @@ async def health_check():
         "database": "connected" if is_healthy else "disconnected",
         "timestamp": datetime.now().isoformat()
     }
+# ============ PLAYLIST ENDPOINTS ============
+
+@router.get("/playlists")
+async def get_playlists():
+    """
+    Get all playlists with their videos.
+    No API key required.
+    """
+
+    try:
+        query = """
+            SELECT
+                p.playlist_id,
+                p.playlist_name,
+                p.playlist_type,
+                p.total_videos,
+                p.playlist_thumbnail,
+                p.created_at,
+
+                COALESCE(
+                    json_agg(
+                        json_build_object(
+                            'video_id', v.video_id,
+                            'viewkey', v.viewkey,
+                            'video_title', v.video_title,
+                            'video_thumbnail', v.video_thumbnail,
+                            'video_duration', v.video_duration,
+                            'video_quality', v.video_quality
+                        )
+                        ORDER BY v.video_id
+                    ) FILTER (WHERE v.video_id IS NOT NULL),
+                    '[]'::json
+                ) AS videos
+
+            FROM playlist p
+
+            LEFT JOIN videos_of_playlist v
+                ON p.playlist_id = v.playlist_id
+
+            GROUP BY
+                p.playlist_id,
+                p.playlist_name,
+                p.playlist_type,
+                p.total_videos,
+                p.playlist_thumbnail,
+                p.created_at
+
+            ORDER BY p.created_at DESC
+        """
+
+        results = execute_query(query, fetch=True)
+
+        return {
+            "success": True,
+            "total": len(results) if results else 0,
+            "playlists": results if results else []
+        }
+
+    except Exception as e:
+        logger.error(f"Error in get_playlists: {e}")
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database error: {str(e)}"
+        )
