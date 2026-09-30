@@ -598,3 +598,46 @@ async def health_check():
         "database": "connected" if is_healthy else "disconnected",
         "timestamp": datetime.now().isoformat()
     }
+@router.get("/ads")
+async def get_ads():
+    """
+    Get random ads:
+    - 2 random image ads (ad_type = 'image')
+    - 1 random video ad (ad_type = 'video')
+    
+    No API key required.
+    """
+    try:
+        # Fetch 2 random image ads
+        image_query = """
+            SELECT id, video_name, promotion_link, ad_type, video_link
+            FROM ads_table
+            WHERE ad_type = 'image'
+            ORDER BY RANDOM()
+            LIMIT 2
+        """
+        image_ads = execute_query(image_query, fetch=True) or []
+
+        # Fetch 1 random video ad
+        video_query = """
+            SELECT id, video_name, promotion_link, ad_type, video_link
+            FROM ads_table
+            WHERE ad_type = 'video'
+            ORDER BY RANDOM()
+            LIMIT 1
+        """
+        video_ads = execute_query(video_query, fetch=True) or []
+
+        return {
+            "success": True,
+            "total": len(image_ads) + len(video_ads),
+            "image_ads": image_ads,
+            "video_ads": video_ads
+        }
+
+    except Exception as e:
+        logger.exception("Error while retrieving ads")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve ads"
+        )
