@@ -610,7 +610,7 @@ async def get_ads():
     try:
         # Fetch 2 random image ads
         image_query = """
-            SELECT id, video_name, promotion_link, ad_type, video_link
+            SELECT id, ad_name, promotion_link, ad_type,link
             FROM ads_table
             WHERE ad_type = 'image'
             ORDER BY RANDOM()
@@ -620,7 +620,7 @@ async def get_ads():
 
         # Fetch 1 random video ad
         video_query = """
-            SELECT id, video_name, promotion_link, ad_type, video_link
+            SELECT id, ad_name, promotion_link, ad_type, link
             FROM ads_table
             WHERE ad_type = 'video'
             ORDER BY RANDOM()
