@@ -703,3 +703,145 @@ async def studio_count_view(viewkey: str, request: Request):
             _recent_views.pop(old, None)
     get_one("INSERT INTO video_views (video_id) VALUES (%s) RETURNING id", (row["id"],))
     return {"success": True, "counted": True, "views": row["views"]}
+# =====================================================================
+# ============ NEW: COMMENTS ENDPOINTS ================================
+# Is poore block ko apni router file ke BILKUL END me paste kar dein
+# (studio_count_view ke baad). Naye imports ki zarorat nahi, sab pehle se maujood hain.
+# =====================================================================
+
+class CommentIn(BaseModel):
+    content: str
+    parent_id: Optional[int] = None
+
+
+_last_comment = {}   # user_id -> last comment time (simple spam guard)
+
+COMMENT_SELECT = """
+    SELECT c.id, c.video_id, c.parent_id, c.user_id, c.content, c.created_at,
+           COALESCE(ch.channel_name, u.name)        AS name,
+           ch.handle                                AS handle,
+           COALESCE(ch.avatar_url, u.avatar_url)    AS avatar,
+           (SELECT COUNT(*) FROM comment_likes l  WHERE l.comment_id = c.id)  AS likes,
+           EXISTS(SELECT 1 FROM comment_likes l2
+                  WHERE l2.comment_id = c.id AND l2.user_id = %s::int)        AS liked,
+           (SELECT COUNT(*) FROM comments r WHERE r.parent_id = c.id)         AS reply_count,
+           (c.user_id = v.user_id)                                            AS is_creator,
+           COALESCE(c.user_id = %s::int, false)                               AS is_owner,
+           COALESCE(v.user_id = %s::int, false)                               AS is_video_owner
+    FROM comments c
+    JOIN videos v        ON v.id = c.video_id
+    JOIN mydata u        ON u.id = c.user_id
+    LEFT JOIN channels ch ON ch.user_id = c.user_id
+"""
+
+
+def _optional_viewer_id(api_key: Optional[str]):
+    """Reading comments is public; api-key sirf 'liked/is_owner' flags ke liye hai."""
+    if not api_key:
+        return None
+    u = validate_api_key(api_key)
+    return u["user_id"] if u else None
+
+
+def _comment_video(viewkey: str):
+    v = get_one("SELECT id, user_id FROM videos WHERE viewkey=%s AND visibility <> 'private'", (viewkey,))
+    if not v:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Video not found")
+    return v
+
+
+@router.get("/videos/{viewkey}/comments")
+async def get_comments(viewkey: str, sort: str = "top", limit: int = 20, offset: int = 0,
+                       api_key: Optional[str] = Header(None)):
+    """Top level comments (replies alag endpoint se aate hain). No API key required."""
+    video = _comment_video(viewkey)
+    uid = _optional_viewer_id(api_key)
+    limit = max(1, min(limit, 50))
+    offset = max(0, offset)
+    order = "likes DESC, c.created_at DESC" if sort == "top" else "c.created_at DESC"
+
+    rows = execute_query(
+        COMMENT_SELECT + f" WHERE c.video_id=%s AND c.parent_id IS NULL ORDER BY {order} LIMIT %s OFFSET %s",
+        (uid, uid, uid, video["id"], limit + 1, offset), fetch=True) or []
+    has_more = len(rows) > limit
+    total = get_one("SELECT COUNT(*) AS n FROM comments WHERE video_id=%s", (video["id"],))
+    return {"success": True, "total": total["n"] if total else 0,
+            "has_more": has_more, "comments": rows[:limit]}
+
+
+@router.get("/comments/{comment_id}/replies")
+async def get_replies(comment_id: int, api_key: Optional[str] = Header(None)):
+    uid = _optional_viewer_id(api_key)
+    rows = execute_query(
+        COMMENT_SELECT + " WHERE c.parent_id=%s ORDER BY c.created_at ASC LIMIT 200",
+        (uid, uid, uid, comment_id), fetch=True) or []
+    return {"success": True, "replies": rows}
+
+
+@router.post("/videos/{viewkey}/comments")
+async def post_comment(viewkey: str, body: CommentIn, api_key: str = Header(...)):
+    """Naya comment ya reply (parent_id dein). API key zaroori."""
+    u = current_user(api_key)
+    video = _comment_video(viewkey)
+
+    text = (body.content or "").strip()
+    if not text:
+        return {"success": False, "message": "Comment cannot be empty"}
+    if len(text) > 1000:
+        return {"success": False, "message": "Comment is too long (max 1000 characters)"}
+
+    now = time.time()
+    if now - _last_comment.get(u["user_id"], 0) < 5:
+        return {"success": False, "message": "You are commenting too fast. Please wait a few seconds."}
+
+    parent_id = None
+    if body.parent_id:
+        p = get_one("SELECT id, parent_id FROM comments WHERE id=%s AND video_id=%s",
+                    (body.parent_id, video["id"]))
+        if not p:
+            return {"success": False, "message": "The comment you are replying to no longer exists"}
+        parent_id = p["parent_id"] or p["id"]      # replies sirf 1 level deep (YouTube style)
+
+    try:
+        new = get_one("INSERT INTO comments (video_id, user_id, parent_id, content) VALUES (%s,%s,%s,%s) RETURNING id",
+                      (video["id"], u["user_id"], parent_id, text))
+        _last_comment[u["user_id"]] = now
+        if len(_last_comment) > 5000:
+            for k in [k for k, t in _last_comment.items() if now - t > 60]:
+                _last_comment.pop(k, None)
+        row = get_one(COMMENT_SELECT + " WHERE c.id=%s", (u["user_id"], u["user_id"], u["user_id"], new["id"]))
+        return {"success": True, "comment": row}
+    except Exception:
+        logger.exception("post_comment")
+        return {"success": False, "message": "Could not post comment"}
+
+
+@router.delete("/comments/{comment_id}")
+async def delete_comment(comment_id: int, api_key: str = Header(...)):
+    """Comment ka owner ya video ka owner delete kar sakta hai."""
+    u = current_user(api_key)
+    c = get_one("""SELECT c.id, c.user_id, v.user_id AS video_owner
+                   FROM comments c JOIN videos v ON v.id = c.video_id WHERE c.id=%s""", (comment_id,))
+    if not c:
+        raise HTTPException(404, "Comment not found")
+    if u["user_id"] not in (c["user_id"], c["video_owner"]):
+        raise HTTPException(403, "You can't delete this comment")
+    n = get_one("SELECT COUNT(*) AS n FROM comments WHERE id=%s OR parent_id=%s", (comment_id, comment_id))
+    get_one("DELETE FROM comments WHERE id=%s RETURNING id", (comment_id,))   # replies cascade se delete
+    return {"success": True, "deleted": n["n"] if n else 1}
+
+
+@router.post("/comments/{comment_id}/like")
+async def toggle_comment_like(comment_id: int, api_key: str = Header(...)):
+    """Like / unlike toggle."""
+    u = current_user(api_key)
+    if not get_one("SELECT id FROM comments WHERE id=%s", (comment_id,)):
+        raise HTTPException(404, "Comment not found")
+    ins = get_one("""INSERT INTO comment_likes (comment_id, user_id) VALUES (%s,%s)
+                     ON CONFLICT DO NOTHING RETURNING comment_id""", (comment_id, u["user_id"]))
+    liked = bool(ins)
+    if not liked:
+        get_one("DELETE FROM comment_likes WHERE comment_id=%s AND user_id=%s RETURNING comment_id",
+                (comment_id, u["user_id"]))
+    cnt = get_one("SELECT COUNT(*) AS n FROM comment_likes WHERE comment_id=%s", (comment_id,))
+    return {"success": True, "liked": liked, "likes": cnt["n"] if cnt else 0}
