@@ -21,22 +21,35 @@ def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
 
 
-# Helper function to validate API key
-def validate_api_key(api_key: str):
-    """Validate API key and return user data if valid"""
+# Helper function to validate API key (+ usage tracking for analytics)
+def validate_api_key(api_key: str, endpoint: str = None, method: str = "GET"):
+    """Validate API key, return user data. If endpoint is given, the call is logged."""
     try:
         query = """
-            SELECT a.*, u.id as user_id, u.name, u.email, u.is_premium
+            SELECT a.*, a.id as key_id, u.id as user_id, u.name, u.email, u.is_premium
             FROM apikeys a
             JOIN mydata u ON a.user_id = u.id
             WHERE a.api_key = %s 
             AND a.expiry_date > NOW()
         """
         result = get_one(query, (api_key,))
+        if result and endpoint:
+            track_usage(result, endpoint, method)
         return result
     except Exception as e:
         logger.error(f"API key validation error: {e}")
         return None
+
+
+def track_usage(key_row, endpoint: str, method: str = "GET"):
+    """Save one API call for analytics. Never breaks the main request."""
+    try:
+        get_one("INSERT INTO api_usage (api_key_id, user_id, endpoint, method) VALUES (%s,%s,%s,%s) RETURNING id",
+                (key_row["key_id"], key_row["user_id"], endpoint, method))
+        get_one("UPDATE apikeys SET request_count = request_count + 1, last_used_at = NOW() WHERE id=%s RETURNING id",
+                (key_row["key_id"],))
+    except Exception as e:
+        logger.error(f"Usage tracking error: {e}")
 
 
 # Function to read HTML file
@@ -85,6 +98,9 @@ async def login(user: UserLogin):
                 "name": db_user['name'],
                 "email": db_user['email'],
                 "is_premium": db_user['is_premium'],
+                "phone": db_user.get('phone'),
+                "bio": db_user.get('bio'),
+                "avatar_url": db_user.get('avatar_url'),
                 "created_at": db_user['created_at']
             }
         }
@@ -137,6 +153,12 @@ async def generate_api_key(request: APIKeyRequest):
 
         if not user_exists:
             return {"success": False, "message": "User not found"}
+
+        if not user_exists.get('is_premium'):
+            return {"success": False, "message": "Premium subscription required to generate API keys"}
+        count = get_one("SELECT COUNT(*) AS c FROM apikeys WHERE user_id = %s", (request.user_id,))
+        if count and count['c'] >= 2:
+            return {"success": False, "message": "Maximum 2 API keys allowed per user"}
 
         api_key = secrets.token_hex(16)
         expiry_date = datetime.now() + timedelta(days=30)
@@ -233,7 +255,7 @@ async def get_videos():
 @router.get("/premium_videos")
 async def get_premium_videos(api_key: str = Header(...)):
     """Get all premium PUBLIC videos - requires API key"""
-    user_data = validate_api_key(api_key)
+    user_data = validate_api_key(api_key, "/premium_videos")
     if not user_data:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -270,7 +292,7 @@ async def get_premium_videos(api_key: str = Header(...)):
 @router.post("/upload_videos")
 async def upload_video(video: Video, api_key: str = Header(...)):
     """Upload a new video (old endpoint, still works) - requires API key"""
-    user_data = validate_api_key(api_key)
+    user_data = validate_api_key(api_key, "/upload_videos", "POST")
     if not user_data:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -549,8 +571,8 @@ class ChannelIn(BaseModel):
     description: Optional[str] = ""
 
 
-def current_user(api_key: str):
-    u = validate_api_key(api_key)
+def current_user(api_key: str, endpoint: str = None, method: str = "GET"):
+    u = validate_api_key(api_key, endpoint, method)
     if not u:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired API key")
     return u
@@ -558,7 +580,7 @@ def current_user(api_key: str):
 
 @router.get("/studio/my_videos")
 async def studio_my_videos(api_key: str = Header(...)):
-    u = current_user(api_key)
+    u = current_user(api_key, "/studio/my_videos")
     rows = execute_query(
         "SELECT * FROM videos WHERE user_id=%s ORDER BY uploaded_at DESC",
         (u["user_id"],), fetch=True) or []
@@ -567,7 +589,7 @@ async def studio_my_videos(api_key: str = Header(...)):
 
 @router.post("/studio/videos")
 async def studio_create_video(v: StudioVideoIn, api_key: str = Header(...)):
-    u = current_user(api_key)
+    u = current_user(api_key, "/studio/create_video")
     if v.visibility not in ("public", "unlisted", "private"):
         raise HTTPException(400, "Invalid visibility")
     viewkey = secrets.token_hex(6)
@@ -586,7 +608,7 @@ async def studio_create_video(v: StudioVideoIn, api_key: str = Header(...)):
 
 @router.put("/studio/videos/{video_id}")
 async def studio_edit_video(video_id: int, v: StudioVideoEdit, api_key: str = Header(...)):
-    u = current_user(api_key)
+    u = current_user(api_key, "/studio/edit_video")
     fields = {k: val for k, val in v.dict().items() if val is not None}
     if not fields:
         return {"success": False, "message": "Nothing to update"}
@@ -600,7 +622,7 @@ async def studio_edit_video(video_id: int, v: StudioVideoEdit, api_key: str = He
 
 @router.delete("/studio/videos/{video_id}")
 async def studio_delete_video(video_id: int, api_key: str = Header(...)):
-    u = current_user(api_key)
+    u = current_user(api_key, "/studio/delete_video")
     row = get_one("DELETE FROM videos WHERE id=%s AND user_id=%s RETURNING id",
                   (video_id, u["user_id"]))
     if not row:
@@ -610,7 +632,7 @@ async def studio_delete_video(video_id: int, api_key: str = Header(...)):
 
 @router.get("/studio/stats")
 async def studio_stats(api_key: str = Header(...)):
-    u = current_user(api_key)
+    u = current_user(api_key, "/studio/stats")
     s = get_one("""
         SELECT COUNT(*) AS videos,
                COALESCE(SUM(views),0) AS views,
@@ -621,14 +643,14 @@ async def studio_stats(api_key: str = Header(...)):
 
 @router.get("/studio/channel")
 async def studio_get_channel(api_key: str = Header(...)):
-    u = current_user(api_key)
+    u = current_user(api_key, "/studio/get_channel")
     return {"success": True,
             "channel": get_one("SELECT * FROM channels WHERE user_id=%s", (u["user_id"],))}
 
 
 @router.put("/studio/channel")
 async def studio_save_channel(c: ChannelIn, api_key: str = Header(...)):
-    u = current_user(api_key)
+    u = current_user(api_key, "/studio/save_channel")
     row = get_one("""
         INSERT INTO channels (user_id, channel_name, handle, avatar_url, description)
         VALUES (%s,%s,%s,%s,%s)
@@ -646,3 +668,98 @@ async def studio_count_view(viewkey: str):
     if row:
         get_one("INSERT INTO video_views (video_id) VALUES (%s) RETURNING id", (row["id"],))
     return {"success": bool(row)}
+
+
+# =====================================================================
+# ============ NEW: ANALYTICS + PROFILE ===============================
+# =====================================================================
+
+@router.get("/analytics")
+async def analytics(api_key: str = Header(...)):
+    """API usage analytics for the owner of the given key (key call itself is not counted)."""
+    u = current_user(api_key)
+    uid = u["user_id"]
+    try:
+        totals = get_one("""
+            SELECT COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days') AS last_30_days,
+                   COUNT(*) FILTER (WHERE created_at::date = CURRENT_DATE) AS today
+            FROM api_usage WHERE user_id = %s""", (uid,))
+        daily = execute_query("""
+            SELECT to_char(d, 'Dy DD') AS day, COUNT(a.id) AS requests
+            FROM generate_series(CURRENT_DATE - 6, CURRENT_DATE, '1 day') AS d
+            LEFT JOIN api_usage a ON a.user_id = %s AND a.created_at::date = d::date
+            GROUP BY d ORDER BY d""", (uid,), fetch=True) or []
+        endpoints = execute_query("""
+            SELECT endpoint, COUNT(*) AS requests FROM api_usage
+            WHERE user_id = %s GROUP BY endpoint ORDER BY requests DESC LIMIT 5""",
+            (uid,), fetch=True) or []
+        keys = execute_query("""
+            SELECT id, left(api_key, 8) || '...' || right(api_key, 4) AS key_preview,
+                   request_count, last_used_at, created_at, expiry_date
+            FROM apikeys WHERE user_id = %s ORDER BY created_at DESC""", (uid,), fetch=True) or []
+        return {"success": True, "totals": totals, "daily": daily, "endpoints": endpoints, "keys": keys}
+    except Exception:
+        logger.exception("analytics")
+        return {"success": False, "message": "Could not load analytics"}
+
+
+class ProfileUpdate(BaseModel):
+    user_id: int
+    current_password: str
+    name: str
+    email: str
+    phone: Optional[str] = ""
+    bio: Optional[str] = ""
+    avatar_url: Optional[str] = None
+
+
+class PasswordChange(BaseModel):
+    user_id: int
+    current_password: str
+    new_password: str
+
+
+def _verified_user(user_id: int, password: str):
+    row = get_one("SELECT * FROM mydata WHERE id = %s", (user_id,))
+    if not row or row["password"] != hash_password(password):
+        return None
+    return row
+
+
+@router.put("/profile/update")
+async def update_profile(p: ProfileUpdate):
+    """Update name / email / phone / bio / avatar. Needs current password."""
+    try:
+        if not _verified_user(p.user_id, p.current_password):
+            return {"success": False, "message": "Current password is incorrect"}
+        if not p.name.strip() or "@" not in p.email:
+            return {"success": False, "message": "Enter a valid name and email"}
+        clash = get_one("SELECT id FROM mydata WHERE email = %s AND id <> %s", (p.email, p.user_id))
+        if clash:
+            return {"success": False, "message": "This email is already used by another account"}
+        row = get_one("""
+            UPDATE mydata SET name=%s, email=%s, phone=%s, bio=%s,
+                   avatar_url=COALESCE(%s, avatar_url), updated_at=NOW()
+            WHERE id=%s
+            RETURNING id, name, email, is_premium, phone, bio, avatar_url, created_at""",
+            (p.name.strip(), p.email.strip(), p.phone, p.bio, p.avatar_url, p.user_id))
+        return {"success": True, "message": "Profile updated", "user": row}
+    except Exception:
+        logger.exception("update_profile")
+        return {"success": False, "message": "Could not update profile"}
+
+
+@router.put("/profile/password")
+async def change_password(p: PasswordChange):
+    try:
+        if not _verified_user(p.user_id, p.current_password):
+            return {"success": False, "message": "Current password is incorrect"}
+        if len(p.new_password) < 8:
+            return {"success": False, "message": "New password must be at least 8 characters"}
+        get_one("UPDATE mydata SET password=%s, updated_at=NOW() WHERE id=%s RETURNING id",
+                (hash_password(p.new_password), p.user_id))
+        return {"success": True, "message": "Password changed"}
+    except Exception:
+        logger.exception("change_password")
+        return {"success": False, "message": "Could not change password"}
