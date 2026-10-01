@@ -1,5 +1,5 @@
 import secrets
-from fastapi import APIRouter, HTTPException, status, Header
+from fastapi import APIRouter, HTTPException, status, Header, Request
 from fastapi.responses import HTMLResponse
 from typing import Optional
 from pydantic import BaseModel
@@ -7,6 +7,8 @@ import logging
 from datetime import datetime, timedelta
 import os
 import hashlib
+import time
+import re
 
 from database import execute_query, get_one
 from models import User, UserCreate, UserLogin, APIKeyRequest, Video
@@ -337,7 +339,17 @@ async def upload_video(video: Video, api_key: str = Header(...)):
 async def get_video_by_key(viewkey: str):
     """Get a video by its viewkey"""
     try:
-        query = "SELECT * FROM videos WHERE viewkey = %s AND visibility <> 'private'"  # CHANGED
+        # CHANGED: also returns creator (channel) info
+        query = """
+            SELECT v.*,
+                   COALESCE(c.channel_name, u.name) AS creator_name,
+                   c.handle AS creator_handle,
+                   COALESCE(c.avatar_url, u.avatar_url) AS creator_avatar
+            FROM videos v
+            LEFT JOIN mydata u ON u.id = v.user_id
+            LEFT JOIN channels c ON c.user_id = v.user_id
+            WHERE v.viewkey = %s AND v.visibility <> 'private'
+        """
         result = get_one(query, (viewkey,))
 
         if result:
@@ -590,6 +602,8 @@ async def studio_my_videos(api_key: str = Header(...)):
 @router.post("/studio/videos")
 async def studio_create_video(v: StudioVideoIn, api_key: str = Header(...)):
     u = current_user(api_key, "/studio/create_video")
+    if not get_one("SELECT id FROM channels WHERE user_id=%s", (u["user_id"],)):
+        return {"success": False, "message": "Create your channel before uploading videos"}
     if v.visibility not in ("public", "unlisted", "private"):
         raise HTTPException(400, "Invalid visibility")
     viewkey = secrets.token_hex(6)
@@ -651,115 +665,41 @@ async def studio_get_channel(api_key: str = Header(...)):
 @router.put("/studio/channel")
 async def studio_save_channel(c: ChannelIn, api_key: str = Header(...)):
     u = current_user(api_key, "/studio/save_channel")
+    name = (c.channel_name or "").strip()
+    handle = (c.handle or "").strip().lower()
+    if len(name) < 2:
+        return {"success": False, "message": "Channel name must be at least 2 characters"}
+    if not re.fullmatch(r"[a-z0-9_]{3,30}", handle):
+        return {"success": False, "message": "Handle must be 3-30 characters: lowercase letters, numbers or underscore"}
+    if get_one("SELECT id FROM channels WHERE handle=%s AND user_id<>%s", (handle, u["user_id"])):
+        return {"success": False, "message": "This handle is already taken"}
     row = get_one("""
         INSERT INTO channels (user_id, channel_name, handle, avatar_url, description)
         VALUES (%s,%s,%s,%s,%s)
         ON CONFLICT (user_id) DO UPDATE SET channel_name=EXCLUDED.channel_name,
             handle=EXCLUDED.handle, avatar_url=EXCLUDED.avatar_url,
             description=EXCLUDED.description RETURNING *""",
-        (u["user_id"], c.channel_name, c.handle, c.avatar_url, c.description))
+        (u["user_id"], name, handle, c.avatar_url, c.description))
     return {"success": True, "channel": row}
 
 
+_recent_views = {}   # (ip, viewkey) -> last counted time
+
+
 @router.post("/studio/view/{viewkey}")
-async def studio_count_view(viewkey: str):
-    """Viewer page se call karo - view count barhata hai"""
-    row = get_one("UPDATE videos SET views=views+1 WHERE viewkey=%s RETURNING id", (viewkey,))
-    if row:
-        get_one("INSERT INTO video_views (video_id) VALUES (%s) RETURNING id", (row["id"],))
-    return {"success": bool(row)}
-
-
-# =====================================================================
-# ============ NEW: ANALYTICS + PROFILE ===============================
-# =====================================================================
-
-@router.get("/analytics")
-async def analytics(api_key: str = Header(...)):
-    """API usage analytics for the owner of the given key (key call itself is not counted)."""
-    u = current_user(api_key)
-    uid = u["user_id"]
-    try:
-        totals = get_one("""
-            SELECT COUNT(*) AS total,
-                   COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days') AS last_30_days,
-                   COUNT(*) FILTER (WHERE created_at::date = CURRENT_DATE) AS today
-            FROM api_usage WHERE user_id = %s""", (uid,))
-        daily = execute_query("""
-            SELECT to_char(d, 'Dy DD') AS day, COUNT(a.id) AS requests
-            FROM generate_series(CURRENT_DATE - 6, CURRENT_DATE, '1 day') AS d
-            LEFT JOIN api_usage a ON a.user_id = %s AND a.created_at::date = d::date
-            GROUP BY d ORDER BY d""", (uid,), fetch=True) or []
-        endpoints = execute_query("""
-            SELECT endpoint, COUNT(*) AS requests FROM api_usage
-            WHERE user_id = %s GROUP BY endpoint ORDER BY requests DESC LIMIT 5""",
-            (uid,), fetch=True) or []
-        keys = execute_query("""
-            SELECT id, left(api_key, 8) || '...' || right(api_key, 4) AS key_preview,
-                   request_count, last_used_at, created_at, expiry_date
-            FROM apikeys WHERE user_id = %s ORDER BY created_at DESC""", (uid,), fetch=True) or []
-        return {"success": True, "totals": totals, "daily": daily, "endpoints": endpoints, "keys": keys}
-    except Exception:
-        logger.exception("analytics")
-        return {"success": False, "message": "Could not load analytics"}
-
-
-class ProfileUpdate(BaseModel):
-    user_id: int
-    current_password: str
-    name: str
-    email: str
-    phone: Optional[str] = ""
-    bio: Optional[str] = ""
-    avatar_url: Optional[str] = None
-
-
-class PasswordChange(BaseModel):
-    user_id: int
-    current_password: str
-    new_password: str
-
-
-def _verified_user(user_id: int, password: str):
-    row = get_one("SELECT * FROM mydata WHERE id = %s", (user_id,))
-    if not row or row["password"] != hash_password(password):
-        return None
-    return row
-
-
-@router.put("/profile/update")
-async def update_profile(p: ProfileUpdate):
-    """Update name / email / phone / bio / avatar. Needs current password."""
-    try:
-        if not _verified_user(p.user_id, p.current_password):
-            return {"success": False, "message": "Current password is incorrect"}
-        if not p.name.strip() or "@" not in p.email:
-            return {"success": False, "message": "Enter a valid name and email"}
-        clash = get_one("SELECT id FROM mydata WHERE email = %s AND id <> %s", (p.email, p.user_id))
-        if clash:
-            return {"success": False, "message": "This email is already used by another account"}
-        row = get_one("""
-            UPDATE mydata SET name=%s, email=%s, phone=%s, bio=%s,
-                   avatar_url=COALESCE(%s, avatar_url), updated_at=NOW()
-            WHERE id=%s
-            RETURNING id, name, email, is_premium, phone, bio, avatar_url, created_at""",
-            (p.name.strip(), p.email.strip(), p.phone, p.bio, p.avatar_url, p.user_id))
-        return {"success": True, "message": "Profile updated", "user": row}
-    except Exception:
-        logger.exception("update_profile")
-        return {"success": False, "message": "Could not update profile"}
-
-
-@router.put("/profile/password")
-async def change_password(p: PasswordChange):
-    try:
-        if not _verified_user(p.user_id, p.current_password):
-            return {"success": False, "message": "Current password is incorrect"}
-        if len(p.new_password) < 8:
-            return {"success": False, "message": "New password must be at least 8 characters"}
-        get_one("UPDATE mydata SET password=%s, updated_at=NOW() WHERE id=%s RETURNING id",
-                (hash_password(p.new_password), p.user_id))
-        return {"success": True, "message": "Password changed"}
-    except Exception:
-        logger.exception("change_password")
-        return {"success": False, "message": "Could not change password"}
+async def studio_count_view(viewkey: str, request: Request):
+    """Viewer page calls this after 5 seconds of playback. Same IP + video counts once per 30 min."""
+    ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    k = (ip, viewkey)
+    if now - _recent_views.get(k, 0) < 1800:
+        return {"success": True, "counted": False}
+    row = get_one("UPDATE videos SET views=views+1 WHERE viewkey=%s RETURNING id, views", (viewkey,))
+    if not row:
+        return {"success": False, "counted": False}
+    _recent_views[k] = now
+    if len(_recent_views) > 5000:   # keep memory small
+        for old in [x for x, t in _recent_views.items() if now - t > 1800]:
+            _recent_views.pop(old, None)
+    get_one("INSERT INTO video_views (video_id) VALUES (%s) RETURNING id", (row["id"],))
+    return {"success": True, "counted": True, "views": row["views"]}
