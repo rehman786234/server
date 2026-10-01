@@ -1,81 +1,71 @@
-import logging
-import threading
-from contextlib import contextmanager
-from typing import Any, Dict, Generator, List, Optional
-
+import os
 import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
-
+from contextlib import contextmanager
+from typing import Generator, Dict, Any, List, Optional
+import logging
 from config import Config
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-_pool = None
-_sem = None
-_lock = threading.Lock()
+# Global connection pool
+_connection_pool = None
 
 
 def init_connection_pool():
-    """Thread-safe pool (ThreadedConnectionPool) with keepalives + query timeout."""
-    global _pool, _sem
-    with _lock:
-        if _pool is not None:
-            return _pool
+    """Initialize the PostgreSQL connection pool"""
+    global _connection_pool
+    
+    try:
         Config.validate()
-        _pool = pool.ThreadedConnectionPool(
-            Config.MIN_CONNECTIONS,
-            Config.MAX_CONNECTIONS,
+        
+        # Log connection info (without password)
+        db_url = Config.DATABASE_URL
+        logger.info(f"Initializing database connection")
+        
+        # Create connection pool
+        _connection_pool = pool.SimpleConnectionPool(
+            minconn=Config.MIN_CONNECTIONS,
+            maxconn=Config.MAX_CONNECTIONS,
             dsn=Config.DATABASE_URL,
-            cursor_factory=RealDictCursor,
-            connect_timeout=10,
-            keepalives=1,
-            keepalives_idle=30,
-            keepalives_interval=10,
-            keepalives_count=3,
-            options="-c statement_timeout=15000",
+            cursor_factory=RealDictCursor
         )
-        # Extra threads WAIT for a free connection instead of failing with PoolError
-        _sem = threading.BoundedSemaphore(Config.MAX_CONNECTIONS)
-        logger.info("Database connection pool initialized")
-        return _pool
+        logger.info("Database connection pool initialized successfully")
+        return _connection_pool
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize connection pool: {e}")
+        raise
 
 
 @contextmanager
 def get_connection() -> Generator:
-    if _pool is None:
+    """Context manager for database connections"""
+    global _connection_pool
+    
+    if _connection_pool is None:
         init_connection_pool()
-    if not _sem.acquire(timeout=10):
-        raise RuntimeError("Database busy, try again")
-    conn = None
-    broken = False
+    
+    connection = None
     try:
-        conn = _pool.getconn()
-        if conn.closed:  # stale connection (DB restarted / idle timeout)
-            _pool.putconn(conn, close=True)
-            conn = _pool.getconn()
-        yield conn
-    except (psycopg2.OperationalError, psycopg2.InterfaceError):
-        broken = True
-        raise
-    except Exception:
-        if conn is not None:
-            try:
-                conn.rollback()
-            except Exception:
-                broken = True
+        connection = _connection_pool.getconn()
+        yield connection
+    except Exception as e:
+        if connection:
+            connection.rollback()
+        logger.error(f"Database connection error: {e}")
         raise
     finally:
-        if conn is not None:
-            try:
-                _pool.putconn(conn, close=broken or conn.closed)
-            except Exception:
-                pass
-        _sem.release()
+        if connection:
+            _connection_pool.putconn(connection)
 
 
 @contextmanager
 def get_cursor(connection, cursor_factory=RealDictCursor) -> Generator:
+    """Context manager for database cursors"""
     cursor = connection.cursor(cursor_factory=cursor_factory)
     try:
         yield cursor
@@ -84,19 +74,30 @@ def get_cursor(connection, cursor_factory=RealDictCursor) -> Generator:
 
 
 def execute_query(query: str, params: tuple = (), fetch: bool = False) -> Optional[List[Dict]]:
+    """Execute a query with automatic connection management"""
     try:
         with get_connection() as connection:
             with get_cursor(connection) as cursor:
                 cursor.execute(query, params)
-                result = cursor.fetchall() if fetch else None
-                connection.commit()
-                return [dict(row) for row in result] if fetch else None
+                
+                if fetch:
+                    result = cursor.fetchall()
+                    connection.commit()
+                    return [dict(row) for row in result]
+                else:
+                    connection.commit()
+                    return None
+                    
     except psycopg2.Error as e:
         logger.error(f"Database error: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
         raise
 
 
 def get_one(query: str, params: tuple = ()) -> Optional[Dict]:
+    """Execute a query and return a single row"""
     try:
         with get_connection() as connection:
             with get_cursor(connection) as cursor:
@@ -104,12 +105,14 @@ def get_one(query: str, params: tuple = ()) -> Optional[Dict]:
                 result = cursor.fetchone()
                 connection.commit()
                 return dict(result) if result else None
+                
     except psycopg2.Error as e:
         logger.error(f"Database error in get_one: {e}")
         raise
 
 
 def health_check() -> bool:
+    """Check database connectivity"""
     try:
         with get_connection() as connection:
             with get_cursor(connection) as cursor:
@@ -121,8 +124,8 @@ def health_check() -> bool:
 
 
 def close_all_connections():
-    global _pool
-    if _pool:
-        _pool.closeall()
-        _pool = None
+    """Close all connections in the pool"""
+    global _connection_pool
+    if _connection_pool:
+        _connection_pool.closeall()
         logger.info("All database connections closed")
