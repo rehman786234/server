@@ -705,8 +705,8 @@ async def studio_count_view(viewkey: str, request: Request):
     return {"success": True, "counted": True, "views": row["views"]}
 # =====================================================================
 # ============ NEW: COMMENTS ENDPOINTS ================================
-# Is poore block ko apni router file ke BILKUL END me paste kar dein
-# (studio_count_view ke baad). Naye imports ki zarorat nahi, sab pehle se maujood hain.
+# Fix: frontend ab `x-user-id` aur `x-visitor-id` headers bhejta hai
+# (pehle backend `api_key` maang raha tha jo frontend kabhi bhejta hi nahi tha)
 # =====================================================================
 
 class CommentIn(BaseModel):
@@ -716,14 +716,21 @@ class CommentIn(BaseModel):
 
 _last_comment = {}   # user_id -> last comment time (simple spam guard)
 
+# NOTE: liked subquery ab user_id AUR visitor_id dono check karta hai
 COMMENT_SELECT = """
     SELECT c.id, c.video_id, c.parent_id, c.user_id, c.content, c.created_at,
            COALESCE(ch.channel_name, u.name)        AS name,
            ch.handle                                AS handle,
            COALESCE(ch.avatar_url, u.avatar_url)    AS avatar,
            (SELECT COUNT(*) FROM comment_likes l  WHERE l.comment_id = c.id)  AS likes,
-           EXISTS(SELECT 1 FROM comment_likes l2
-                  WHERE l2.comment_id = c.id AND l2.user_id = %s::int)        AS liked,
+           EXISTS(
+               SELECT 1 FROM comment_likes l2
+               WHERE l2.comment_id = c.id
+                 AND (
+                      (%s::int IS NOT NULL AND l2.user_id = %s::int)
+                   OR (%s::text IS NOT NULL AND l2.visitor_id = %s::text)
+                 )
+           )                                                                    AS liked,
            (SELECT COUNT(*) FROM comments r WHERE r.parent_id = c.id)         AS reply_count,
            (c.user_id = v.user_id)                                            AS is_creator,
            COALESCE(c.user_id = %s::int, false)                               AS is_owner,
@@ -735,12 +742,21 @@ COMMENT_SELECT = """
 """
 
 
-def _optional_viewer_id(api_key: Optional[str]):
-    """Reading comments is public; api-key sirf 'liked/is_owner' flags ke liye hai."""
-    if not api_key:
-        return None
-    u = validate_api_key(api_key)
-    return u["user_id"] if u else None
+def _viewer_ids(x_user_id: Optional[str], x_visitor_id: Optional[str]):
+    """Frontend `x-user-id` (logged in) aur `x-visitor-id` (anonymous) bhejta hai."""
+    uid = int(x_user_id) if (x_user_id and str(x_user_id).isdigit()) else None
+    vid = (x_visitor_id or "").strip() or None
+    return uid, vid
+
+
+def _require_user(x_user_id: Optional[str]) -> int:
+    """Posting / deleting ke liye login zaroori."""
+    uid, _ = _viewer_ids(x_user_id, None)
+    if not uid:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Please sign in")
+    if not get_one("SELECT id FROM mydata WHERE id=%s", (uid,)):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid user")
+    return uid
 
 
 def _comment_video(viewkey: str):
@@ -750,19 +766,25 @@ def _comment_video(viewkey: str):
     return v
 
 
+def _comment_params(uid, vid):
+    """COMMENT_SELECT ke %s placeholders ke liye values, order me."""
+    return (uid, uid, vid, vid, uid, uid)
+
+
 @router.get("/videos/{viewkey}/comments")
 async def get_comments(viewkey: str, sort: str = "top", limit: int = 20, offset: int = 0,
-                       api_key: Optional[str] = Header(None)):
+                       x_user_id: Optional[str] = Header(None),
+                       x_visitor_id: Optional[str] = Header(None)):
     """Top level comments (replies alag endpoint se aate hain). No API key required."""
     video = _comment_video(viewkey)
-    uid = _optional_viewer_id(api_key)
+    uid, vid = _viewer_ids(x_user_id, x_visitor_id)
     limit = max(1, min(limit, 50))
     offset = max(0, offset)
     order = "likes DESC, c.created_at DESC" if sort == "top" else "c.created_at DESC"
 
     rows = execute_query(
         COMMENT_SELECT + f" WHERE c.video_id=%s AND c.parent_id IS NULL ORDER BY {order} LIMIT %s OFFSET %s",
-        (uid, uid, uid, video["id"], limit + 1, offset), fetch=True) or []
+        (*_comment_params(uid, vid), video["id"], limit + 1, offset), fetch=True) or []
     has_more = len(rows) > limit
     total = get_one("SELECT COUNT(*) AS n FROM comments WHERE video_id=%s", (video["id"],))
     return {"success": True, "total": total["n"] if total else 0,
@@ -770,18 +792,21 @@ async def get_comments(viewkey: str, sort: str = "top", limit: int = 20, offset:
 
 
 @router.get("/comments/{comment_id}/replies")
-async def get_replies(comment_id: int, api_key: Optional[str] = Header(None)):
-    uid = _optional_viewer_id(api_key)
+async def get_replies(comment_id: int,
+                      x_user_id: Optional[str] = Header(None),
+                      x_visitor_id: Optional[str] = Header(None)):
+    uid, vid = _viewer_ids(x_user_id, x_visitor_id)
     rows = execute_query(
         COMMENT_SELECT + " WHERE c.parent_id=%s ORDER BY c.created_at ASC LIMIT 200",
-        (uid, uid, uid, comment_id), fetch=True) or []
+        (*_comment_params(uid, vid), comment_id), fetch=True) or []
     return {"success": True, "replies": rows}
 
 
 @router.post("/videos/{viewkey}/comments")
-async def post_comment(viewkey: str, body: CommentIn, api_key: str = Header(...)):
-    """Naya comment ya reply (parent_id dein). API key zaroori."""
-    u = current_user(api_key)
+async def post_comment(viewkey: str, body: CommentIn,
+                       x_user_id: Optional[str] = Header(None)):
+    """Naya comment ya reply (parent_id dein). Login zaroori."""
+    uid = _require_user(x_user_id)
     video = _comment_video(viewkey)
 
     text = (body.content or "").strip()
@@ -791,7 +816,7 @@ async def post_comment(viewkey: str, body: CommentIn, api_key: str = Header(...)
         return {"success": False, "message": "Comment is too long (max 1000 characters)"}
 
     now = time.time()
-    if now - _last_comment.get(u["user_id"], 0) < 5:
+    if now - _last_comment.get(uid, 0) < 5:
         return {"success": False, "message": "You are commenting too fast. Please wait a few seconds."}
 
     parent_id = None
@@ -804,12 +829,13 @@ async def post_comment(viewkey: str, body: CommentIn, api_key: str = Header(...)
 
     try:
         new = get_one("INSERT INTO comments (video_id, user_id, parent_id, content) VALUES (%s,%s,%s,%s) RETURNING id",
-                      (video["id"], u["user_id"], parent_id, text))
-        _last_comment[u["user_id"]] = now
+                      (video["id"], uid, parent_id, text))
+        _last_comment[uid] = now
         if len(_last_comment) > 5000:
             for k in [k for k, t in _last_comment.items() if now - t > 60]:
                 _last_comment.pop(k, None)
-        row = get_one(COMMENT_SELECT + " WHERE c.id=%s", (u["user_id"], u["user_id"], u["user_id"], new["id"]))
+        # is_owner khud ka comment hai → uid
+        row = get_one(COMMENT_SELECT + " WHERE c.id=%s", (*_comment_params(uid, None), new["id"]))
         return {"success": True, "comment": row}
     except Exception:
         logger.exception("post_comment")
@@ -817,14 +843,14 @@ async def post_comment(viewkey: str, body: CommentIn, api_key: str = Header(...)
 
 
 @router.delete("/comments/{comment_id}")
-async def delete_comment(comment_id: int, api_key: str = Header(...)):
+async def delete_comment(comment_id: int, x_user_id: Optional[str] = Header(None)):
     """Comment ka owner ya video ka owner delete kar sakta hai."""
-    u = current_user(api_key)
+    uid = _require_user(x_user_id)
     c = get_one("""SELECT c.id, c.user_id, v.user_id AS video_owner
                    FROM comments c JOIN videos v ON v.id = c.video_id WHERE c.id=%s""", (comment_id,))
     if not c:
         raise HTTPException(404, "Comment not found")
-    if u["user_id"] not in (c["user_id"], c["video_owner"]):
+    if uid not in (c["user_id"], c["video_owner"]):
         raise HTTPException(403, "You can't delete this comment")
     n = get_one("SELECT COUNT(*) AS n FROM comments WHERE id=%s OR parent_id=%s", (comment_id, comment_id))
     get_one("DELETE FROM comments WHERE id=%s RETURNING id", (comment_id,))   # replies cascade se delete
@@ -832,16 +858,32 @@ async def delete_comment(comment_id: int, api_key: str = Header(...)):
 
 
 @router.post("/comments/{comment_id}/like")
-async def toggle_comment_like(comment_id: int, api_key: str = Header(...)):
-    """Like / unlike toggle."""
-    u = current_user(api_key)
+async def toggle_comment_like(comment_id: int,
+                              x_user_id: Optional[str] = Header(None),
+                              x_visitor_id: Optional[str] = Header(None)):
+    """Like / unlike toggle. Logged-in user ya anonymous visitor dono kar sakte hain."""
+    uid, vid = _viewer_ids(x_user_id, x_visitor_id)
+    if not uid and not vid:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Missing visitor id")
+
     if not get_one("SELECT id FROM comments WHERE id=%s", (comment_id,)):
         raise HTTPException(404, "Comment not found")
-    ins = get_one("""INSERT INTO comment_likes (comment_id, user_id) VALUES (%s,%s)
-                     ON CONFLICT DO NOTHING RETURNING comment_id""", (comment_id, u["user_id"]))
-    liked = bool(ins)
-    if not liked:
-        get_one("DELETE FROM comment_likes WHERE comment_id=%s AND user_id=%s RETURNING comment_id",
-                (comment_id, u["user_id"]))
+
+    liked = False
+    if uid:
+        ins = get_one("""INSERT INTO comment_likes (comment_id, user_id) VALUES (%s,%s)
+                         ON CONFLICT DO NOTHING RETURNING comment_id""", (comment_id, uid))
+        liked = bool(ins)
+        if not liked:
+            get_one("DELETE FROM comment_likes WHERE comment_id=%s AND user_id=%s RETURNING comment_id",
+                    (comment_id, uid))
+    else:
+        ins = get_one("""INSERT INTO comment_likes (comment_id, visitor_id) VALUES (%s,%s)
+                         ON CONFLICT DO NOTHING RETURNING comment_id""", (comment_id, vid))
+        liked = bool(ins)
+        if not liked:
+            get_one("DELETE FROM comment_likes WHERE comment_id=%s AND visitor_id=%s RETURNING comment_id",
+                    (comment_id, vid))
+
     cnt = get_one("SELECT COUNT(*) AS n FROM comment_likes WHERE comment_id=%s", (comment_id,))
     return {"success": True, "liked": liked, "likes": cnt["n"] if cnt else 0}
