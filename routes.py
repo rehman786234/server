@@ -17,7 +17,11 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from database import execute_query, get_one
-from models import User, UserCreate, UserLogin, APIKeyRequest, Video
+from models import (
+    User, UserCreate, UserLogin, APIKeyRequest, Video,
+    TagOut, TagsForVideoIn,
+    PlaylistCreateIn, PlaylistUpdateIn, PlaylistAddVideoIn, PlaylistReorderIn,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
