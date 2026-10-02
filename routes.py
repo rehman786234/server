@@ -1613,3 +1613,585 @@ async def list_channels(q: str = "", sort: str = "popular", limit: int = 24, off
     return {"success": True, "has_more": len(rows) > limit, "channels": rows[:limit]}
     cnt = get_one("SELECT COUNT(*) AS n FROM comment_likes WHERE comment_id=%s", (comment_id,))
     return {"success": True, "liked": liked, "likes": cnt["n"] if cnt else 0}
+# =====================================================================
+#  PART 1: TAGS + SMART SEARCH + CUSTOM PLAYLISTS
+#  routes.py ke end me paste karo. Purane endpoints untouched.
+# =====================================================================
+import re as _re  # local, safe
+
+
+# ---------- TAG HELPERS ----------
+
+def _slugify(s: str) -> str:
+    """URL-safe slug: 'Python Tutorial!' -> 'python-tutorial'"""
+    s = (s or "").strip().lower()
+    s = _re.sub(r"[^a-z0-9]+", "-", s)
+    return s.strip("-")[:60] or "tag"
+
+
+def _normalize_tag(raw: str) -> Optional[str]:
+    """Ek tag ko clean karo. Invalid -> None."""
+    t = (raw or "").strip().lower()
+    t = _re.sub(r"\s+", " ", t)
+    if not (2 <= len(t) <= 30):
+        return None
+    if not _re.fullmatch(r"[a-z0-9][a-z0-9 \-_.]*", t):
+        return None
+    return t
+
+
+def _upsert_tag(name: str) -> Optional[int]:
+    """Tag insert ya get karo, id return."""
+    slug = _slugify(name)
+    row = get_one("""
+        INSERT INTO tags (name, slug) VALUES (%s, %s)
+        ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name
+        RETURNING id
+    """, (name, slug))
+    return row["id"] if row else None
+
+
+def _recount_tag(tag_id: int):
+    """usage_count recompute (denormalized)."""
+    get_one("""
+        UPDATE tags SET usage_count = (
+            SELECT COUNT(*) FROM video_tags WHERE tag_id = %s
+        ) WHERE id = %s RETURNING id
+    """, (tag_id, tag_id))
+
+
+def _set_video_tags(video_id: int, tags_in: List[str]) -> List[dict]:
+    """Video ke tags replace karo. Auto-clean, dedupe, max 15."""
+    cleaned = []
+    seen = set()
+    for raw in (tags_in or [])[:30]:
+        n = _normalize_tag(raw)
+        if n and n not in seen:
+            seen.add(n)
+            cleaned.append(n)
+        if len(cleaned) >= 15:
+            break
+
+    # purane tags hatao
+    old = execute_query("SELECT tag_id FROM video_tags WHERE video_id = %s", (video_id,), fetch=True) or []
+    old_ids = {r["tag_id"] for r in old}
+
+    # naye tags attach karo
+    new_ids = set()
+    for name in cleaned:
+        tid = _upsert_tag(name)
+        if tid:
+            new_ids.add(tid)
+            get_one("""
+                INSERT INTO video_tags (video_id, tag_id) VALUES (%s, %s)
+                ON CONFLICT DO NOTHING RETURNING video_id
+            """, (video_id, tid))
+
+    # jo purane tags ab use nahi ho rahe unko hata do
+    to_remove = old_ids - new_ids
+    if to_remove:
+        execute_query("DELETE FROM video_tags WHERE video_id = %s AND tag_id = ANY(%s)",
+                      (video_id, list(to_remove)), fetch=False)
+
+    # sab affected tags ka count refresh
+    for tid in (old_ids | new_ids):
+        _recount_tag(tid)
+
+    return _get_video_tags(video_id)
+
+
+def _get_video_tags(video_id: int) -> List[dict]:
+    return execute_query("""
+        SELECT t.id, t.name, t.slug, t.usage_count
+        FROM video_tags vt JOIN tags t ON t.id = vt.tag_id
+        WHERE vt.video_id = %s
+        ORDER BY t.usage_count DESC, t.name ASC
+    """, (video_id,), fetch=True) or []
+
+
+def _video_owned_by(viewkey: str, uid: int) -> Optional[dict]:
+    v = get_one("SELECT id, user_id FROM videos WHERE viewkey = %s", (viewkey,))
+    if not v:
+        return None
+    if v["user_id"] != uid:
+        return None
+    return v
+
+
+# ---------- TAG ENDPOINTS ----------
+
+@router.get("/tags/popular")
+async def tags_popular(limit: int = 30):
+    """Top tags — frontend me trending tags dikhane ke liye."""
+    limit = max(1, min(limit, 100))
+    rows = execute_query("""
+        SELECT id, name, slug, usage_count FROM tags
+        WHERE usage_count > 0
+        ORDER BY usage_count DESC, name ASC LIMIT %s
+    """, (limit,), fetch=True) or []
+    return {"success": True, "tags": rows}
+
+
+@router.get("/tags/autocomplete")
+async def tags_autocomplete(q: str = "", limit: int = 10):
+    """Search box me type karte waqt suggestions."""
+    q = (q or "").strip().lower()
+    if len(q) < 1:
+        return {"success": True, "tags": []}
+    limit = max(1, min(limit, 20))
+    rows = execute_query("""
+        SELECT id, name, slug, usage_count FROM tags
+        WHERE LOWER(name) LIKE %s OR slug LIKE %s
+        ORDER BY usage_count DESC, name ASC LIMIT %s
+    """, (f"%{q}%", f"{q}%", limit), fetch=True) or []
+    return {"success": True, "tags": rows}
+
+
+@router.get("/tags/{slug}/videos")
+async def videos_by_tag(slug: str, limit: int = 20, offset: int = 0,
+                        actor: dict = Depends(get_actor)):
+    """Ek tag ke videos. Free user ko premium wale nahi milte."""
+    tag = get_one("SELECT id, name FROM tags WHERE slug = %s", (slug.lower(),))
+    if not tag:
+        raise HTTPException(404, "Tag not found")
+    limit = max(1, min(limit, 50))
+    offset = max(0, offset)
+    rows = execute_query("""
+        SELECT v.id, v.title, v.viewkey, v.thumbnail, v.category, v.is_premium,
+               v.views, v.duration, v.uploaded_at,
+               COALESCE(c.channel_name, u.name) AS channel_name,
+               c.handle AS channel_handle,
+               COALESCE(c.avatar_url, u.avatar_url) AS channel_avatar
+        FROM video_tags vt
+        JOIN videos v ON v.id = vt.video_id
+        LEFT JOIN channels c ON c.user_id = v.user_id
+        LEFT JOIN mydata u   ON u.id = v.user_id
+        WHERE vt.tag_id = %s AND v.visibility = 'public'
+          AND (%s::boolean OR v.is_premium = false)
+        ORDER BY v.views DESC, v.uploaded_at DESC
+        LIMIT %s OFFSET %s
+    """, (tag["id"], actor["is_premium"] or False, limit + 1, offset), fetch=True) or []
+    return {"success": True, "tag": tag,
+            "has_more": len(rows) > limit, "videos": rows[:limit]}
+
+
+@router.get("/videos/{viewkey}/tags")
+async def video_tags_get(viewkey: str):
+    v = get_one("SELECT id FROM videos WHERE viewkey = %s", (viewkey,))
+    if not v:
+        raise HTTPException(404, "Video not found")
+    return {"success": True, "tags": _get_video_tags(v["id"])}
+
+
+@router.post("/videos/{viewkey}/tags")
+async def video_tags_set(viewkey: str, body: TagsForVideoIn,
+                         actor: dict = Depends(get_actor)):
+    """Video owner apne video ke tags set kare."""
+    need_verified(actor)
+    v = _video_owned_by(viewkey, actor["user_id"])
+    if not v:
+        raise HTTPException(404, "Video not found or not yours")
+    tags = _set_video_tags(v["id"], body.tags)
+    return {"success": True, "tags": tags}
+
+
+# ---------- SMART SEARCH ----------
+
+@router.get("/search")
+async def smart_search(
+    q: str = "",
+    sort: str = "relevance",     # relevance | latest | popular
+    limit: int = 20,
+    offset: int = 0,
+    actor: dict = Depends(get_actor),
+):
+    """
+    Unified search: title + description + tags + channel name.
+    Ranking:
+      - title match > tag match > description match > channel match
+      - plus views & freshness bonus
+    """
+    q = (q or "").strip()
+    if len(q) < 2:
+        return {"success": True, "query": q, "total": 0, "has_more": False, "videos": []}
+
+    limit = max(1, min(limit, 50))
+    offset = max(0, offset)
+    like = f"%{q.lower()}%"
+    prefix = f"{q.lower()}%"
+
+    order_sql = {
+        "latest":  "v.uploaded_at DESC",
+        "popular": "v.views DESC, v.uploaded_at DESC",
+    }.get(sort, "rank_score DESC, v.views DESC")
+
+    # NOTE: PostgreSQL me aliases HAVING/ORDER me use kar sakte hain yahan.
+    rows = execute_query(f"""
+        WITH matched AS (
+            SELECT
+                v.id,
+                (
+                    CASE WHEN LOWER(v.title) LIKE %s THEN 100 ELSE 0 END +
+                    CASE WHEN LOWER(v.title) LIKE %s THEN 40  ELSE 0 END +
+                    CASE WHEN EXISTS (
+                        SELECT 1 FROM video_tags vt JOIN tags t ON t.id = vt.tag_id
+                        WHERE vt.video_id = v.id AND (LOWER(t.name) LIKE %s OR t.slug LIKE %s)
+                    ) THEN 60 ELSE 0 END +
+                    CASE WHEN LOWER(COALESCE(v.description,'')) LIKE %s THEN 20 ELSE 0 END +
+                    CASE WHEN LOWER(COALESCE(c.channel_name, u.name, '')) LIKE %s THEN 15 ELSE 0 END +
+                    LEAST(COALESCE(v.views,0) / 100.0, 20)
+                ) AS rank_score
+            FROM videos v
+            LEFT JOIN channels c ON c.user_id = v.user_id
+            LEFT JOIN mydata u   ON u.id = v.user_id
+            WHERE v.visibility = 'public'
+              AND (%s::boolean OR v.is_premium = false)
+              AND (
+                    LOWER(v.title) LIKE %s
+                 OR LOWER(COALESCE(v.description,'')) LIKE %s
+                 OR LOWER(COALESCE(c.channel_name, u.name, '')) LIKE %s
+                 OR EXISTS (
+                        SELECT 1 FROM video_tags vt JOIN tags t ON t.id = vt.tag_id
+                        WHERE vt.video_id = v.id AND (LOWER(t.name) LIKE %s OR t.slug LIKE %s)
+                    )
+              )
+        )
+        SELECT
+            v.id, v.title, v.viewkey, v.thumbnail, v.category, v.is_premium,
+            v.views, v.duration, v.uploaded_at,
+            COALESCE(c.channel_name, u.name) AS channel_name,
+            c.handle AS channel_handle,
+            COALESCE(c.avatar_url, u.avatar_url) AS channel_avatar,
+            m.rank_score,
+            COALESCE((
+                SELECT json_agg(json_build_object('name', t.name, 'slug', t.slug)
+                                ORDER BY t.usage_count DESC)
+                FROM video_tags vt JOIN tags t ON t.id = vt.tag_id
+                WHERE vt.video_id = v.id
+                LIMIT 3
+            ), '[]'::json) AS top_tags
+        FROM matched m
+        JOIN videos v        ON v.id = m.id
+        LEFT JOIN channels c ON c.user_id = v.user_id
+        LEFT JOIN mydata u   ON u.id = v.user_id
+        ORDER BY {order_sql}
+        LIMIT %s OFFSET %s
+    """, (
+        prefix, like,           # title rank (2)
+        like, prefix,           # tag rank (2)
+        like,                   # desc rank
+        like,                   # channel rank
+        actor["is_premium"] or False,
+        like, like, like,       # WHERE clauses
+        like, prefix,           # WHERE tag
+        limit + 1, offset,
+    ), fetch=True) or []
+
+    return {
+        "success": True,
+        "query": q,
+        "has_more": len(rows) > limit,
+        "videos": rows[:limit],
+    }
+
+
+# ---------- RELATED VIDEOS (tag-based) ----------
+
+@router.get("/videos/{viewkey}/related")
+async def related_videos(viewkey: str, limit: int = 12,
+                         actor: dict = Depends(get_actor)):
+    """Same tags > same category > same channel. Ranked."""
+    v = get_one("SELECT id, user_id, category FROM videos WHERE viewkey = %s", (viewkey,))
+    if not v:
+        raise HTTPException(404, "Video not found")
+    limit = max(1, min(limit, 30))
+    rows = execute_query("""
+        WITH my_tags AS (
+            SELECT tag_id FROM video_tags WHERE video_id = %s
+        ),
+        scored AS (
+            SELECT v.id,
+                   (SELECT COUNT(*) FROM video_tags vt
+                    WHERE vt.video_id = v.id AND vt.tag_id IN (SELECT tag_id FROM my_tags)
+                   ) * 10
+                   + CASE WHEN %s IS NOT NULL AND v.category = %s THEN 3 ELSE 0 END
+                   + CASE WHEN v.user_id = %s THEN 2 ELSE 0 END
+                   + LEAST(COALESCE(v.views,0) / 200.0, 5) AS score
+            FROM videos v
+            WHERE v.id <> %s AND v.visibility = 'public'
+              AND (%s::boolean OR v.is_premium = false)
+        )
+        SELECT
+            v.id, v.title, v.viewkey, v.thumbnail, v.category, v.is_premium,
+            v.views, v.duration, v.uploaded_at,
+            COALESCE(c.channel_name, u.name) AS channel_name,
+            c.handle AS channel_handle,
+            COALESCE(c.avatar_url, u.avatar_url) AS channel_avatar,
+            s.score
+        FROM scored s
+        JOIN videos v        ON v.id = s.id
+        LEFT JOIN channels c ON c.user_id = v.user_id
+        LEFT JOIN mydata u   ON u.id = v.user_id
+        ORDER BY s.score DESC, v.views DESC, v.uploaded_at DESC
+        LIMIT %s
+    """, (v["id"], v["category"], v["category"], v["user_id"], v["id"],
+          actor["is_premium"] or False, limit), fetch=True) or []
+    return {"success": True, "videos": rows}
+
+
+# ---------- CUSTOM PLAYLISTS ----------
+
+_PL2_COLS = ("id, user_id, title, description, thumbnail, visibility, "
+             "is_system, created_at, updated_at")
+
+
+def _pl2_can_view(pl: dict, actor: dict) -> bool:
+    if pl["visibility"] == "private":
+        return bool(actor["user_id"] and actor["user_id"] == pl["user_id"])
+    return True
+
+
+def _pl2_own(pl_id: int, uid: int) -> Optional[dict]:
+    return get_one(f"SELECT {_PL2_COLS} FROM playlists_v2 WHERE id = %s AND user_id = %s",
+                   (pl_id, uid))
+
+
+@router.post("/playlists/create")
+async def playlist_create(body: PlaylistCreateIn, actor: dict = Depends(get_actor)):
+    """Nayi playlist banao. Login zaroori."""
+    need_verified(actor)
+    title = (body.title or "").strip()
+    if not (2 <= len(title) <= 150):
+        return {"success": False, "message": "Title must be 2-150 characters"}
+    if body.visibility not in ("public", "unlisted", "private"):
+        return {"success": False, "message": "Invalid visibility"}
+    desc = (body.description or "").strip()[:1000]
+    thumb = (body.thumbnail or "").strip()
+    if thumb and not thumb.startswith("https://res.cloudinary.com/"):
+        return {"success": False, "message": "Thumbnail must be a Cloudinary URL"}
+
+    count = get_one("SELECT COUNT(*) AS n FROM playlists_v2 WHERE user_id = %s",
+                    (actor["user_id"],))
+    if count and count["n"] >= 100:
+        return {"success": False, "message": "Maximum 100 playlists per user"}
+
+    row = get_one(f"""
+        INSERT INTO playlists_v2 (user_id, title, description, thumbnail, visibility)
+        VALUES (%s, %s, %s, %s, %s) RETURNING {_PL2_COLS}
+    """, (actor["user_id"], title, desc, thumb or None, body.visibility))
+    return {"success": True, "playlist": row}
+
+
+@router.get("/playlists/my")
+async def playlist_my(limit: int = 50, offset: int = 0,
+                      actor: dict = Depends(get_actor)):
+    """Meri saari playlists."""
+    need_verified(actor)
+    limit = max(1, min(limit, 100))
+    rows = execute_query(f"""
+        SELECT p.{_PL2_COLS.replace(', ', ', p.').replace('p.id', 'id')},
+               (SELECT COUNT(*) FROM playlist_items pi WHERE pi.playlist_id = p.id) AS item_count
+        FROM playlists_v2 p
+        WHERE p.user_id = %s
+        ORDER BY p.is_system DESC, p.updated_at DESC
+        LIMIT %s OFFSET %s
+    """, (actor["user_id"], limit + 1, max(0, offset)), fetch=True) or []
+    return {"success": True, "has_more": len(rows) > limit, "playlists": rows[:limit]}
+
+
+@router.get("/playlists/user/{user_id}")
+async def playlist_by_user(user_id: int, actor: dict = Depends(get_actor)):
+    """Kisi bhi user ki PUBLIC playlists."""
+    rows = execute_query(f"""
+        SELECT p.{_PL2_COLS.replace(', ', ', p.').replace('p.id', 'id')},
+               (SELECT COUNT(*) FROM playlist_items pi WHERE pi.playlist_id = p.id) AS item_count
+        FROM playlists_v2 p
+        WHERE p.user_id = %s AND p.visibility = 'public'
+        ORDER BY p.updated_at DESC LIMIT 100
+    """, (user_id,), fetch=True) or []
+    return {"success": True, "playlists": rows}
+
+
+@router.get("/playlists/detail/{pl_id}")
+async def playlist_detail(pl_id: int, actor: dict = Depends(get_actor)):
+    """Ek playlist + uske videos (ordered)."""
+    pl = get_one(f"SELECT {_PL2_COLS} FROM playlists_v2 WHERE id = %s", (pl_id,))
+    if not pl:
+        raise HTTPException(404, "Playlist not found")
+    if not _pl2_can_view(pl, actor):
+        raise HTTPException(403, "This playlist is private")
+    items = execute_query("""
+        SELECT pi.id AS item_id, pi.position,
+               v.id AS video_id, v.title, v.viewkey, v.thumbnail, v.category,
+               v.is_premium, v.views, v.duration, v.uploaded_at,
+               v.visibility,
+               COALESCE(c.channel_name, u.name) AS channel_name,
+               c.handle AS channel_handle,
+               COALESCE(c.avatar_url, u.avatar_url) AS channel_avatar
+        FROM playlist_items pi
+        JOIN videos v        ON v.id = pi.video_id
+        LEFT JOIN channels c ON c.user_id = v.user_id
+        LEFT JOIN mydata u   ON u.id = v.user_id
+        WHERE pi.playlist_id = %s
+        ORDER BY pi.position ASC, pi.added_at ASC
+    """, (pl_id,), fetch=True) or []
+
+    # Premium lock: agar video premium hai aur user premium nahi to hide
+    for it in items:
+        it["locked"] = bool(it["is_premium"] and not actor["is_premium"]
+                            and actor["user_id"] != pl["user_id"])
+        if it["locked"]:
+            it.pop("viewkey", None)
+
+    pl["is_owner"] = bool(actor["user_id"] and actor["user_id"] == pl["user_id"])
+    return {"success": True, "playlist": pl, "items": items}
+
+
+@router.put("/playlists/detail/{pl_id}")
+async def playlist_update(pl_id: int, body: PlaylistUpdateIn,
+                          actor: dict = Depends(get_actor)):
+    need_verified(actor)
+    pl = _pl2_own(pl_id, actor["user_id"])
+    if not pl:
+        raise HTTPException(404, "Playlist not found")
+
+    fields = {}
+    if body.title is not None:
+        t = body.title.strip()
+        if not (2 <= len(t) <= 150):
+            return {"success": False, "message": "Title must be 2-150 characters"}
+        fields["title"] = t
+    if body.description is not None:
+        fields["description"] = body.description.strip()[:1000]
+    if body.thumbnail is not None:
+        th = body.thumbnail.strip()
+        if th and not th.startswith("https://res.cloudinary.com/"):
+            return {"success": False, "message": "Thumbnail must be a Cloudinary URL"}
+        fields["thumbnail"] = th or None
+    if body.visibility is not None:
+        if body.visibility not in ("public", "unlisted", "private"):
+            return {"success": False, "message": "Invalid visibility"}
+        if pl["is_system"] and body.visibility != "private":
+            return {"success": False, "message": "System playlist must stay private"}
+        fields["visibility"] = body.visibility
+
+    if not fields:
+        return {"success": False, "message": "Nothing to update"}
+
+    sets = ", ".join(f"{k} = %s" for k in fields)
+    row = get_one(f"""
+        UPDATE playlists_v2 SET {sets}, updated_at = now()
+        WHERE id = %s RETURNING {_PL2_COLS}
+    """, (*fields.values(), pl_id))
+    return {"success": True, "playlist": row}
+
+
+@router.delete("/playlists/detail/{pl_id}")
+async def playlist_delete(pl_id: int, actor: dict = Depends(get_actor)):
+    need_verified(actor)
+    pl = _pl2_own(pl_id, actor["user_id"])
+    if not pl:
+        raise HTTPException(404, "Playlist not found")
+    if pl["is_system"]:
+        return {"success": False, "message": "System playlist cannot be deleted"}
+    get_one("DELETE FROM playlists_v2 WHERE id = %s RETURNING id", (pl_id,))
+    return {"success": True}
+
+
+@router.post("/playlists/detail/{pl_id}/add")
+async def playlist_add_video(pl_id: int, body: PlaylistAddVideoIn,
+                             actor: dict = Depends(get_actor)):
+    need_verified(actor)
+    pl = _pl2_own(pl_id, actor["user_id"])
+    if not pl:
+        raise HTTPException(404, "Playlist not found")
+
+    v = get_one("SELECT id, visibility FROM videos WHERE viewkey = %s", (body.viewkey,))
+    if not v:
+        raise HTTPException(404, "Video not found")
+    if v["visibility"] == "private":
+        return {"success": False, "message": "Cannot add a private video"}
+
+    n = get_one("SELECT COUNT(*) AS n FROM playlist_items WHERE playlist_id = %s", (pl_id,))
+    if n and n["n"] >= 500:
+        return {"success": False, "message": "Playlist is full (max 500 videos)"}
+
+    pos = body.position
+    if pos is None:
+        mx = get_one("SELECT COALESCE(MAX(position), -1) + 1 AS p FROM playlist_items WHERE playlist_id = %s", (pl_id,))
+        pos = mx["p"] if mx else 0
+
+    ins = get_one("""
+        INSERT INTO playlist_items (playlist_id, video_id, position)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (playlist_id, video_id) DO NOTHING
+        RETURNING id
+    """, (pl_id, v["id"], pos))
+    if not ins:
+        return {"success": False, "message": "Video already in this playlist"}
+
+    get_one("UPDATE playlists_v2 SET updated_at = now() WHERE id = %s RETURNING id", (pl_id,))
+    return {"success": True, "item_id": ins["id"], "position": pos}
+
+
+@router.delete("/playlists/detail/{pl_id}/remove/{video_id}")
+async def playlist_remove_video(pl_id: int, video_id: int,
+                                actor: dict = Depends(get_actor)):
+    need_verified(actor)
+    pl = _pl2_own(pl_id, actor["user_id"])
+    if not pl:
+        raise HTTPException(404, "Playlist not found")
+    row = get_one("""
+        DELETE FROM playlist_items WHERE playlist_id = %s AND video_id = %s
+        RETURNING id
+    """, (pl_id, video_id))
+    if not row:
+        raise HTTPException(404, "Video not in playlist")
+    get_one("UPDATE playlists_v2 SET updated_at = now() WHERE id = %s RETURNING id", (pl_id,))
+    return {"success": True}
+
+
+@router.put("/playlists/detail/{pl_id}/reorder")
+async def playlist_reorder(pl_id: int, body: PlaylistReorderIn,
+                           actor: dict = Depends(get_actor)):
+    need_verified(actor)
+    pl = _pl2_own(pl_id, actor["user_id"])
+    if not pl:
+        raise HTTPException(404, "Playlist not found")
+    if not body.video_ids:
+        return {"success": False, "message": "Empty order"}
+
+    # Verify ye sab video_ids playlist me hain
+    existing = execute_query("SELECT video_id FROM playlist_items WHERE playlist_id = %s",
+                             (pl_id,), fetch=True) or []
+    existing_ids = {r["video_id"] for r in existing}
+    if set(body.video_ids) - existing_ids:
+        return {"success": False, "message": "Some videos are not in this playlist"}
+
+    for idx, vid in enumerate(body.video_ids):
+        get_one("UPDATE playlist_items SET position = %s WHERE playlist_id = %s AND video_id = %s RETURNING id",
+                (idx, pl_id, vid))
+    get_one("UPDATE playlists_v2 SET updated_at = now() WHERE id = %s RETURNING id", (pl_id,))
+    return {"success": True, "count": len(body.video_ids)}
+
+
+# ---------- WATCH LATER (system playlist) ----------
+
+@router.post("/playlists/watch-later/ensure")
+async def ensure_watch_later(actor: dict = Depends(get_actor)):
+    """Har user ke liye ek 'Watch Later' private system playlist auto-create."""
+    need_verified(actor)
+    pl = get_one("""
+        SELECT id, user_id, title, description, thumbnail, visibility, is_system,
+               created_at, updated_at
+        FROM playlists_v2 WHERE user_id = %s AND is_system = true AND title = 'Watch Later'
+    """, (actor["user_id"],))
+    if pl:
+        return {"success": True, "playlist": pl, "created": False}
+    row = get_one("""
+        INSERT INTO playlists_v2 (user_id, title, description, visibility, is_system)
+        VALUES (%s, 'Watch Later', 'Videos you saved for later', 'private', true)
+        RETURNING id, user_id, title, description, thumbnail, visibility, is_system,
+                  created_at, updated_at
+    """, (actor["user_id"],))
+    return {"success": True, "playlist": row, "created": True}
