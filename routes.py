@@ -1586,6 +1586,30 @@ async def toggle_comment_like(comment_id: int, actor: dict = Depends(get_actor))
             await notify(c["user_id"], "comment_like", uid, video_id=c["video_id"], comment_id=comment_id)
         else:
             _drop_notification(c["user_id"], "comment_like", uid, video_id=c["video_id"], comment_id=comment_id)
+# =====================================================================
+#  Is poore block ko apni routes.py ke BILKUL END me paste kar dein.
+#  (Naye imports ki zarorat nahi. Aap ki baqi file/fixes bilkul untouched rehti hain.)
+#  Ye Channels page aur navbar search ke channel suggestions ke liye hai.
+# =====================================================================
 
+@router.get("/channels")
+async def list_channels(q: str = "", sort: str = "popular", limit: int = 24, offset: int = 0,
+                        actor: dict = Depends(get_actor)):
+    """Channels discover page: search + popular/newest. Login nahi chahiye."""
+    limit = max(1, min(limit, 50))
+    like = f"%{q.strip()}%" if q.strip() else None
+    order = "c.id DESC" if sort == "new" else "subscriber_count DESC, video_count DESC, c.id DESC"
+    rows = execute_query(f"""
+        SELECT c.user_id, c.channel_name, c.handle, c.avatar_url, c.description,
+               (SELECT COUNT(*) FROM subscriptions s WHERE s.channel_user_id = c.user_id) AS subscriber_count,
+               (SELECT COUNT(*) FROM videos v WHERE v.user_id = c.user_id AND v.visibility = 'public'
+                       AND (%s::boolean OR v.is_premium = false)) AS video_count,
+               EXISTS(SELECT 1 FROM subscriptions s2
+                      WHERE s2.channel_user_id = c.user_id AND s2.subscriber_id = %s::int) AS is_subscribed
+        FROM channels c
+        WHERE c.handle IS NOT NULL AND (%s::text IS NULL OR c.channel_name ILIKE %s OR c.handle ILIKE %s)
+        ORDER BY {order} LIMIT %s OFFSET %s
+    """, (actor["is_premium"] or False, actor["user_id"], like, like, like, limit + 1, max(0, offset)), fetch=True) or []
+    return {"success": True, "has_more": len(rows) > limit, "channels": rows[:limit]}
     cnt = get_one("SELECT COUNT(*) AS n FROM comment_likes WHERE comment_id=%s", (comment_id,))
     return {"success": True, "liked": liked, "likes": cnt["n"] if cnt else 0}
