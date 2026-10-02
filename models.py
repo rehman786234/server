@@ -106,3 +106,41 @@ class VideoUploadResponse(BaseModel):
     video: Optional[VideoResponse] = None
     uploaded_by: Optional[str] = None
     user_id: Optional[int] = None
+# =====================================================
+#  PART 1 MODELS: Tags + Custom Playlists
+# =====================================================
+from typing import List  # agar pehle se nahi hai to
+
+
+class TagOut(BaseModel):
+    id: int
+    name: str
+    slug: str
+    usage_count: int
+
+
+class TagsForVideoIn(BaseModel):
+    tags: List[str]  # user input: ["python", "tutorial", "fastapi"]
+
+
+class PlaylistCreateIn(BaseModel):
+    title: str
+    description: Optional[str] = ""
+    thumbnail: Optional[str] = None
+    visibility: Optional[str] = "public"  # public | unlisted | private
+
+
+class PlaylistUpdateIn(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    thumbnail: Optional[str] = None
+    visibility: Optional[str] = None
+
+
+class PlaylistAddVideoIn(BaseModel):
+    viewkey: str                       # video viewkey
+    position: Optional[int] = None     # agar None, end me add
+
+
+class PlaylistReorderIn(BaseModel):
+    video_ids: List[int]               # naya order (video.id list)
