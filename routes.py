@@ -23,31 +23,25 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # =====================================================================
-#  CONFIG  (sab values Render > Environment me set karein, code me nahi)
+#  CONFIG
 # =====================================================================
-# Login token signing secret. ZAROOR set karein (lamba random string), warna har restart par sab logout ho jayen ge.
 AUTH_SECRET = os.getenv("AUTH_SECRET") or secrets.token_hex(32)
 if not os.getenv("AUTH_SECRET"):
     logger.warning("AUTH_SECRET is not set. Tokens will be invalid after every restart. Set it in Render > Environment.")
 
-# "1" = purana frontend (x-user-id header) chalta rahe (sirf comments/likes/subscribe ke liye).
-# Frontend token bhejne lage to isay "0" kar dein, phir poora system strict ho jata hai.
 ALLOW_LEGACY_USER_ID = os.getenv("ALLOW_LEGACY_USER_ID", "1") == "1"
 
-# Admin users (ads manage kar saktay hain): "1,5"
 ADMIN_USER_IDS = {int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()}
 
-# 2nd Cloudinary account (profile pic, channel pic, banner, ads) - SECRET sirf server par
 CLD2_CLOUD = os.getenv("CLOUDINARY2_CLOUD_NAME", "")
 CLD2_KEY = os.getenv("CLOUDINARY2_API_KEY", "")
 CLD2_SECRET = os.getenv("CLOUDINARY2_API_SECRET", "")
 
-# Channel page par free user ko premium videos bilkul na dikhayen (False) ya locked card dikhayen (True)
 SHOW_LOCKED_PREMIUM = False
 
 
 # =====================================================================
-#  AUTH HELPERS (signed token)
+#  AUTH HELPERS
 # =====================================================================
 def _b64(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
@@ -119,11 +113,6 @@ def _clean_visitor(v: Optional[str]) -> Optional[str]:
 
 
 def resolve_actor(authorization=None, api_key=None, x_user_id=None, x_visitor_id=None) -> dict:
-    """
-    Kaun request bhej raha hai?
-      verified=True  -> Bearer token ya valid API key  (secure)
-      verified=False -> sirf purana x-user-id header   (spoof ho sakta hai, sirf low-risk actions ke liye)
-    """
     actor = {"user_id": None, "visitor_id": _clean_visitor(x_visitor_id),
              "verified": False, "is_premium": False, "name": "", "via": "anon"}
     uid = None
@@ -225,7 +214,6 @@ async def home():
 # =====================================================================
 @router.post("/login")
 async def login(user: UserLogin, request: Request):
-    """Login. Ab response me `token` bhi aata hai (frontend isay save kare)."""
     try:
         ip = request.client.host if request.client else "?"
         throttle_key = f"{ip}|{(user.email or '').lower()}"
@@ -270,7 +258,6 @@ async def register(user: UserCreate):
             VALUES (%s, %s, %s, %s, %s) 
             RETURNING id, name, email, is_premium, created_at
         """, (user.name, user.email, hash_password(user.password), False, datetime.now()))
-        # NOTE: pehle yahan user.is_premium use hota tha, jis se koi bhi khud ko premium bana sakta tha. Ab hamesha False.
 
         if result:
             return {"success": True, "message": "User registered successfully",
@@ -298,7 +285,6 @@ class ProfileIn(BaseModel):
 
 @router.put("/me/profile")
 async def update_profile(p: ProfileIn, actor: dict = Depends(get_actor)):
-    """Profile picture / name / bio update. avatar_url Cloudinary ka URL hona chahiye."""
     need_verified(actor)
     fields = {k: v for k, v in p.dict().items() if v is not None}
     if "name" in fields:
@@ -315,9 +301,102 @@ async def update_profile(p: ProfileIn, actor: dict = Depends(get_actor)):
     return {"success": True, "user": row}
 
 
+# ---------------------------------------------------------------------
+#  FIX 3: PUT /profile/update  aur  PUT /profile/password
+#  Legacy-safe (current password verify), ApiDashboard.jsx in dono ko call karta hai.
+# ---------------------------------------------------------------------
+class ProfileUpdateIn(BaseModel):
+    user_id: int
+    name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    bio: Optional[str] = None
+    avatar_url: Optional[str] = None
+    current_password: str
+
+
+class PasswordChangeIn(BaseModel):
+    user_id: int
+    current_password: str
+    new_password: str
+
+
+def _verify_password(user_id: int, password: str, request: Request):
+    """Password sahi ho to user row, warna None. Brute-force guard ke saath."""
+    ip = request.client.host if request.client else "?"
+    key = f"pw|{ip}|{user_id}"
+    if _login_blocked(key):
+        raise HTTPException(429, "Too many attempts. Please try again in a few minutes.")
+    u = get_one("SELECT * FROM mydata WHERE id=%s", (user_id,))
+    if not u or u["password"] != hash_password(password or ""):
+        _login_fail(key)
+        return None
+    _login_fails.pop(key, None)
+    return u
+
+
+_PROFILE_COLS = "id, name, email, is_premium, phone, bio, avatar_url, created_at"
+
+
+@router.put("/profile/update")
+async def profile_update(p: ProfileUpdateIn, request: Request, actor: dict = Depends(get_actor)):
+    _authorize_user_id(actor, p.user_id)
+    if not _verify_password(p.user_id, p.current_password, request):
+        return {"success": False, "message": "Current password is incorrect"}
+
+    fields = {}
+    if p.name is not None:
+        name = p.name.strip()
+        if len(name) < 2:
+            return {"success": False, "message": "Name must be at least 2 characters"}
+        fields["name"] = name[:100]
+
+    if p.email is not None:
+        email = p.email.strip()
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+            return {"success": False, "message": "Enter a valid email address"}
+        if get_one("SELECT id FROM mydata WHERE LOWER(email)=LOWER(%s) AND id<>%s", (email, p.user_id)):
+            return {"success": False, "message": "This email is already used by another account"}
+        fields["email"] = email
+
+    if p.phone is not None:
+        fields["phone"] = p.phone.strip()[:30]
+    if p.bio is not None:
+        fields["bio"] = p.bio.strip()[:300]
+    if p.avatar_url is not None:
+        av = p.avatar_url.strip()
+        if av and not av.startswith("https://res.cloudinary.com/"):
+            return {"success": False, "message": "Profile picture must be uploaded through the app"}
+        fields["avatar_url"] = av
+
+    if not fields:
+        return {"success": False, "message": "Nothing to update"}
+    try:
+        sets = ", ".join(f"{k}=%s" for k in fields)
+        row = get_one(f"UPDATE mydata SET {sets} WHERE id=%s RETURNING {_PROFILE_COLS}",
+                      (*fields.values(), p.user_id))
+    except Exception:
+        logger.exception("profile_update")
+        return {"success": False, "message": "Could not update profile"}
+    return {"success": True, "message": "Profile updated", "user": row}
+
+
+@router.put("/profile/password")
+async def profile_password(p: PasswordChangeIn, request: Request, actor: dict = Depends(get_actor)):
+    _authorize_user_id(actor, p.user_id)
+    if len(p.new_password or "") < 8:
+        return {"success": False, "message": "New password must be at least 8 characters"}
+    if not _verify_password(p.user_id, p.current_password, request):
+        return {"success": False, "message": "Current password is incorrect"}
+    if p.new_password == p.current_password:
+        return {"success": False, "message": "New password must be different from the current one"}
+    get_one("UPDATE mydata SET password=%s WHERE id=%s RETURNING id",
+            (hash_password(p.new_password), p.user_id))
+    return {"success": True, "message": "Password changed"}
+
+
 # =====================================================================
 #  CLOUDINARY (2nd account) - signed upload
-#  Credentials sirf server env me; frontend ko sirf cloud_name, api_key aur signature milta hai.
 # =====================================================================
 UPLOAD_PURPOSES = {
     "avatar":   {"folder": "profiles", "type": "image", "formats": "jpg,jpeg,png,webp", "admin": False},
@@ -362,8 +441,8 @@ async def sign_upload(body: SignIn, actor: dict = Depends(get_actor)):
 # =====================================================================
 class AdIn(BaseModel):
     ad_name: str
-    ad_type: str                       # image | video
-    link: str                          # Cloudinary media URL
+    ad_type: str
+    link: str
     promotion_link: Optional[str] = ""
 
 
@@ -403,7 +482,7 @@ async def admin_delete_ad(ad_id: int, actor: dict = Depends(get_actor)):
 
 
 # =====================================================================
-#  API KEYS  (ab ownership check hota hai)
+#  API KEYS
 # =====================================================================
 def _authorize_user_id(actor: dict, user_id: int):
     """Token wala user sirf apni hi id use kar sakta hai. Legacy mode me purana behaviour."""
@@ -450,8 +529,11 @@ async def generate_api_key(request: APIKeyRequest, actor: dict = Depends(get_act
 async def list_user_apikeys(user_id: int, actor: dict = Depends(get_actor)):
     try:
         _authorize_user_id(actor, user_id)
+        # FIX 1: request_count aur last_used_at bhi bhejein taake frontend me
+        # "Total requests" aur "Last used" sahi dikhein.
         results = execute_query("""
-            SELECT id, user_id, api_key, created_at, expiry_date 
+            SELECT id, user_id, api_key, created_at, expiry_date,
+                   COALESCE(request_count, 0) AS request_count, last_used_at
             FROM apikeys WHERE user_id = %s ORDER BY created_at DESC
         """, (user_id,), fetch=True)
         return {"success": True, "total": len(results) if results else 0, "api_keys": results or []}
@@ -480,17 +562,71 @@ async def delete_apikey(api_key: str, actor: dict = Depends(get_actor)):
         return {"success": False, "message": "Database error"}
 
 
+# ---------------------------------------------------------------------
+#  FIX 2: GET /analytics  (Developer Console > Analytics tab)
+#  Response shape wahi jo ApiDashboard.jsx expect karta hai.
+# ---------------------------------------------------------------------
+@router.get("/analytics")
+async def api_analytics(api_key: str = Header(...)):
+    k = validate_api_key(api_key)          # endpoint nahi diya => ye call khud count nahi hoti
+    if not k:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired API key")
+    uid = k["user_id"]
+    try:
+        totals = get_one("""
+            SELECT COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days') AS last_30_days,
+                   COUNT(*) FILTER (WHERE created_at >= CURRENT_DATE)               AS today
+            FROM api_usage WHERE user_id = %s""", (uid,)) or {}
+
+        daily = execute_query("""
+            SELECT to_char(d, 'Mon DD') AS day, COALESCE(x.n, 0) AS requests
+            FROM generate_series(CURRENT_DATE - 6, CURRENT_DATE, interval '1 day') d
+            LEFT JOIN (SELECT created_at::date AS dd, COUNT(*) AS n
+                       FROM api_usage
+                       WHERE user_id = %s AND created_at >= CURRENT_DATE - 6
+                       GROUP BY 1) x ON x.dd = d::date
+            ORDER BY d""", (uid,), fetch=True) or []
+
+        endpoints = execute_query("""
+            SELECT endpoint, COUNT(*) AS requests
+            FROM api_usage WHERE user_id = %s
+            GROUP BY endpoint ORDER BY requests DESC LIMIT 8""", (uid,), fetch=True) or []
+
+        keys = execute_query("""
+            SELECT id, api_key, COALESCE(request_count, 0) AS request_count, last_used_at
+            FROM apikeys WHERE user_id = %s ORDER BY created_at DESC""", (uid,), fetch=True) or []
+        for r in keys:
+            full = r.pop("api_key", "") or ""
+            r["key_preview"] = f"{full[:8]}••••{full[-4:]}" if len(full) > 12 else full
+
+        return {"success": True,
+                "totals": {"total": totals.get("total", 0),
+                           "last_30_days": totals.get("last_30_days", 0),
+                           "today": totals.get("today", 0)},
+                "daily": daily, "endpoints": endpoints, "keys": keys}
+    except Exception:
+        logger.exception("api_analytics")
+        return {"success": False, "message": "Could not load analytics"}
+
+
 # =====================================================================
-#  VIDEOS  (premium content server par lock hota hai)
+#  VIDEOS
 # =====================================================================
 @router.get("/videos")
 async def get_videos():
-    """Free PUBLIC videos. No login needed."""
+    """Free PUBLIC videos. No login needed. FIX 6: channel info bhi aati hai."""
     try:
         results = execute_query("""
-            SELECT * FROM videos 
-            WHERE is_premium = false AND visibility = 'public'
-            ORDER BY uploaded_at DESC
+            SELECT v.*,
+                   COALESCE(c.channel_name, u.name)     AS channel_name,
+                   c.handle                             AS channel_handle,
+                   COALESCE(c.avatar_url, u.avatar_url) AS channel_avatar
+            FROM videos v
+            LEFT JOIN channels c ON c.user_id = v.user_id
+            LEFT JOIN mydata u   ON u.id = v.user_id
+            WHERE v.is_premium = false AND v.visibility = 'public'
+            ORDER BY v.uploaded_at DESC
         """, fetch=True)
         return results if results else []
     except Exception as e:
@@ -500,7 +636,7 @@ async def get_videos():
 
 @router.get("/premium_videos")
 async def get_premium_videos(api_key: str = Header(...)):
-    """Premium PUBLIC videos - valid API key + ACTIVE premium account zaroori."""
+    """Premium PUBLIC videos - valid API key + ACTIVE premium account zaroori. FIX 6: channel info."""
     user_data = validate_api_key(api_key, "/premium_videos")
     if not user_data:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired API key")
@@ -508,9 +644,15 @@ async def get_premium_videos(api_key: str = Header(...)):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Premium subscription required")
     try:
         results = execute_query("""
-            SELECT * FROM videos 
-            WHERE is_premium = true AND visibility = 'public'
-            ORDER BY uploaded_at DESC
+            SELECT v.*,
+                   COALESCE(c.channel_name, u.name)     AS channel_name,
+                   c.handle                             AS channel_handle,
+                   COALESCE(c.avatar_url, u.avatar_url) AS channel_avatar
+            FROM videos v
+            LEFT JOIN channels c ON c.user_id = v.user_id
+            LEFT JOIN mydata u   ON u.id = v.user_id
+            WHERE v.is_premium = true AND v.visibility = 'public'
+            ORDER BY v.uploaded_at DESC
         """, fetch=True)
         return {
             "success": True,
@@ -553,10 +695,7 @@ async def upload_video(video: Video, api_key: str = Header(...)):
 
 @router.get("/videos/{viewkey}")
 async def get_video_by_key(viewkey: str, actor: dict = Depends(get_actor)):
-    """
-    Single video. Premium video ka stream_link sirf premium (verified) user ko milta hai,
-    baaqi ko stream_link khali + locked=true milta hai.
-    """
+    """Single video. FIX 5: is_own_channel bhi bhejta hai."""
     try:
         row = get_one("""
             SELECT v.*,
@@ -583,6 +722,10 @@ async def get_video_by_key(viewkey: str, actor: dict = Depends(get_actor)):
             row["locked"] = True
         else:
             row["locked"] = False
+
+        # FIX 5: apna hi video ho to frontend Subscribe button chupa sake
+        row["is_own_channel"] = bool(actor["user_id"] and actor["user_id"] == row.get("user_id"))
+
         return {"success": True, "video": row}
     except HTTPException:
         raise
@@ -612,7 +755,7 @@ async def toggle_video_like(viewkey: str, actor: dict = Depends(get_actor)):
 
 
 # =====================================================================
-#  PLAYLISTS  (premium playlist ke stream_url lock hotay hain)
+#  PLAYLISTS
 # =====================================================================
 PLAYLIST_SELECT = """
     SELECT p.playlist_id, p.playlist_name, p.playlist_type, p.total_videos,
@@ -701,7 +844,7 @@ async def get_ads():
 
 
 # =====================================================================
-#  CREATOR STUDIO  (API key based, pehle jaisa)
+#  CREATOR STUDIO
 # =====================================================================
 class StudioVideoIn(BaseModel):
     title: str
@@ -841,7 +984,7 @@ async def studio_save_channel(c: ChannelIn, api_key: str = Header(...)):
     return {"success": True, "channel": row}
 
 
-_recent_views = {}   # (ip, viewkey) -> last counted time
+_recent_views = {}
 
 
 @router.post("/studio/view/{viewkey}")
@@ -863,12 +1006,111 @@ async def studio_count_view(viewkey: str, request: Request):
     return {"success": True, "counted": True, "views": row["views"]}
 
 
+# ---------------------------------------------------------------------
+#  Studio Analytics: internal helper (dono /studio/analytics aur /studio/init use karte hain)
+# ---------------------------------------------------------------------
+def _analytics_for(uid: int):
+    """28 din ka analytics dict, ya error par None."""
+    try:
+        views_daily = execute_query("""
+            SELECT to_char(d, 'Mon DD') AS day, COALESCE(x.n, 0) AS n
+            FROM generate_series(CURRENT_DATE - 27, CURRENT_DATE, interval '1 day') d
+            LEFT JOIN (SELECT vv.created_at::date AS dd, COUNT(*) AS n
+                       FROM video_views vv JOIN videos v ON v.id = vv.video_id
+                       WHERE v.user_id = %s AND vv.created_at >= CURRENT_DATE - 27
+                       GROUP BY 1) x ON x.dd = d::date
+            ORDER BY d""", (uid,), fetch=True) or []
+
+        subs_daily = execute_query("""
+            SELECT to_char(d, 'Mon DD') AS day, COALESCE(x.n, 0) AS n
+            FROM generate_series(CURRENT_DATE - 27, CURRENT_DATE, interval '1 day') d
+            LEFT JOIN (SELECT created_at::date AS dd, COUNT(*) AS n
+                       FROM subscriptions
+                       WHERE channel_user_id = %s AND created_at >= CURRENT_DATE - 27
+                       GROUP BY 1) x ON x.dd = d::date
+            ORDER BY d""", (uid,), fetch=True) or []
+
+        top_videos = execute_query("""
+            SELECT v.id, v.title, v.viewkey, v.thumbnail, v.views, v.is_premium,
+                   (SELECT COUNT(*) FROM video_likes l WHERE l.video_id = v.id) AS likes,
+                   (SELECT COUNT(*) FROM comments c WHERE c.video_id = v.id)    AS comments
+            FROM videos v WHERE v.user_id = %s
+            ORDER BY v.views DESC NULLS LAST, v.uploaded_at DESC LIMIT 5""", (uid,), fetch=True) or []
+
+        recent_comments = execute_query("""
+            SELECT cm.id, LEFT(cm.content, 140) AS content, cm.created_at,
+                   COALESCE(ch.channel_name, mu.name) AS name,
+                   COALESCE(ch.avatar_url, mu.avatar_url) AS avatar,
+                   v.title AS video_title, v.viewkey, v.is_premium
+            FROM comments cm
+            JOIN videos v  ON v.id = cm.video_id
+            JOIN mydata mu ON mu.id = cm.user_id
+            LEFT JOIN channels ch ON ch.user_id = cm.user_id
+            WHERE v.user_id = %s AND cm.user_id <> %s
+            ORDER BY cm.created_at DESC LIMIT 5""", (uid, uid), fetch=True) or []
+
+        recent_subscribers = execute_query("""
+            SELECT s.created_at, COALESCE(c.channel_name, mu.name) AS name, c.handle,
+                   COALESCE(c.avatar_url, mu.avatar_url) AS avatar
+            FROM subscriptions s
+            JOIN mydata mu ON mu.id = s.subscriber_id
+            LEFT JOIN channels c ON c.user_id = mu.id
+            WHERE s.channel_user_id = %s
+            ORDER BY s.created_at DESC LIMIT 5""", (uid,), fetch=True) or []
+
+        return {
+            "views_daily": views_daily,
+            "subs_daily": subs_daily,
+            "views_28d": sum(int(r["n"]) for r in views_daily),
+            "subs_28d": sum(int(r["n"]) for r in subs_daily),
+            "top_videos": top_videos,
+            "recent_comments": recent_comments,
+            "recent_subscribers": recent_subscribers,
+        }
+    except Exception:
+        logger.exception("studio_analytics")
+        return None
+
+
+@router.get("/studio/analytics")
+async def studio_analytics(api_key: str = Header(...)):
+    u = current_user(api_key)               # tracking off: dashboard baar baar refresh hota hai
+    a = _analytics_for(u["user_id"])
+    if a:
+        return {"success": True, "analytics": a}
+    return {"success": False, "message": "Could not load analytics"}
+
+
+# ---------------------------------------------------------------------
+#  FIX 4: /studio/init — dashboard ke liye sirf EK request (4 ki jagah)
+# ---------------------------------------------------------------------
+@router.get("/studio/init")
+async def studio_init(api_key: str = Header(...)):
+    u = current_user(api_key)               # tracking off
+    uid = u["user_id"]
+    channel = get_one("SELECT * FROM channels WHERE user_id=%s", (uid,))
+    stats = get_one("""
+        SELECT COUNT(*) AS videos,
+               COALESCE(SUM(views),0) AS views,
+               COUNT(*) FILTER (WHERE is_premium) AS premium,
+               (SELECT COUNT(*) FROM subscriptions WHERE channel_user_id=%s) AS subscribers,
+               (SELECT COUNT(*) FROM video_likes vl JOIN videos x ON x.id=vl.video_id WHERE x.user_id=%s) AS likes,
+               (SELECT COUNT(*) FROM comments cm JOIN videos y ON y.id=cm.video_id WHERE y.user_id=%s) AS comments
+        FROM videos WHERE user_id=%s""", (uid, uid, uid, uid))
+    videos = execute_query("""
+        SELECT id, title, viewkey, thumbnail, category, description, visibility, is_premium,
+               views, duration, uploaded_at
+        FROM videos WHERE user_id=%s ORDER BY uploaded_at DESC LIMIT 100""", (uid,), fetch=True) or []
+    analytics = _analytics_for(uid) if channel else None
+    return {"success": True, "channel": channel, "stats": stats, "videos": videos, "analytics": analytics}
+
+
 # =====================================================================
 #  CHANNELS + SUBSCRIPTIONS
 # =====================================================================
 @router.get("/channels/{handle}")
 async def get_channel(handle: str, actor: dict = Depends(get_actor)):
-    """Public channel page data (subscribers, video count, views, is_subscribed)."""
+    """Public channel page data. FIX 5: is_own bhi bhejta hai."""
     row = get_one("""
         SELECT c.*,
                (SELECT COUNT(*) FROM subscriptions s WHERE s.channel_user_id = c.user_id) AS subscriber_count,
@@ -883,13 +1125,15 @@ async def get_channel(handle: str, actor: dict = Depends(get_actor)):
     if not row:
         raise HTTPException(404, "Channel not found")
     row["is_owner"] = _is_owner(actor, row["user_id"])
+    # FIX 5: apna channel ho to Subscribe button chupa sake
+    row["is_own"] = bool(actor["user_id"] and actor["user_id"] == row["user_id"])
     return {"success": True, "channel": row}
 
 
 @router.get("/channels/{handle}/videos")
 async def get_channel_videos(handle: str, sort: str = "latest", limit: int = 20, offset: int = 0,
                              actor: dict = Depends(get_actor)):
-    """Channel ki videos. Free user ko premium videos nahi milti (stream_link kabhi nahi bheja jata)."""
+    """Channel ki videos. Free user ko premium videos nahi milti."""
     ch = get_one("SELECT user_id FROM channels WHERE handle=%s", (handle.lower(),))
     if not ch:
         raise HTTPException(404, "Channel not found")
@@ -991,11 +1235,9 @@ async def my_subscription_feed(limit: int = 20, offset: int = 0, actor: dict = D
 
 
 # =====================================================================
-#  NOTIFICATIONS  (DB + WebSocket push)
+#  NOTIFICATIONS
 # =====================================================================
 class WSManager:
-    """user_id -> open websocket connections. (Single uvicorn worker ke liye; multi-worker me Redis chahiye.)"""
-
     def __init__(self):
         self.conns = {}
 
@@ -1068,7 +1310,6 @@ _UNIQUE_TYPES = ("video_like", "comment_like", "new_subscriber")
 
 
 async def notify(user_id, ntype: str, actor_id, video_id=None, comment_id=None):
-    """Notification save karo aur recipient ko live push karo. Kabhi main request ko fail nahi karta."""
     try:
         if not user_id or user_id == actor_id:
             return
@@ -1101,7 +1342,6 @@ def _drop_notification(user_id, ntype, actor_id, video_id=None, comment_id=None)
 
 
 async def _notify_new_upload(owner_id: int, video_id: int, is_premium: bool):
-    """Naya public video upload hone par subscribers ko notification (premium video sirf premium subscribers ko)."""
     try:
         subs = execute_query("""
             SELECT s.subscriber_id FROM subscriptions s JOIN mydata m ON m.id = s.subscriber_id
@@ -1142,7 +1382,7 @@ async def unread_count(actor: dict = Depends(get_actor)):
 
 
 class ReadIn(BaseModel):
-    ids: Optional[List[int]] = None     # None = sab read mark karo
+    ids: Optional[List[int]] = None
 
 
 @router.post("/notifications/read")
@@ -1164,11 +1404,6 @@ async def delete_notification(notification_id: int, actor: dict = Depends(get_ac
 
 @router.websocket("/ws/notifications")
 async def ws_notifications(ws: WebSocket):
-    """
-    Connect: wss://<server>/ws/notifications?token=<login token>
-    Server bhejta hai: {"type":"connected","unread":N}, {"type":"notification",...}, {"type":"refresh"}, {"type":"pong"}
-    Client "ping" text bhej sakta hai (har ~25 sec) taa ke connection zinda rahe.
-    """
     uid = read_token(ws.query_params.get("token"))
     if not uid or not get_one("SELECT id FROM mydata WHERE id=%s", (uid,)):
         await ws.close(code=4401)
@@ -1190,15 +1425,14 @@ async def ws_notifications(ws: WebSocket):
 
 
 # =====================================================================
-#  COMMENTS  (YouTube style: comment, reply, like)
-#  Padhna: sab | Comment/reply/like: login (like anonymous bhi) | Delete: token wala owner
+#  COMMENTS
 # =====================================================================
 class CommentIn(BaseModel):
     content: str
     parent_id: Optional[int] = None
 
 
-_last_comment = {}   # user_id -> last comment time (spam guard)
+_last_comment = {}
 
 COMMENT_SELECT = """
     SELECT c.id, c.video_id, c.parent_id, c.user_id, c.content, c.created_at,
@@ -1224,7 +1458,6 @@ COMMENT_SELECT = """
 
 
 def _cp(actor: dict, with_visitor: bool = True):
-    """COMMENT_SELECT ke 4 placeholders ki values."""
     uid = actor["user_id"]
     vid = actor["visitor_id"] if with_visitor else None
     return (uid, vid, uid, uid)
@@ -1286,7 +1519,7 @@ async def post_comment(viewkey: str, body: CommentIn, actor: dict = Depends(get_
                     (body.parent_id, video["id"]))
         if not p:
             return {"success": False, "message": "The comment you are replying to no longer exists"}
-        parent_id = p["parent_id"] or p["id"]       # replies sirf 1 level deep
+        parent_id = p["parent_id"] or p["id"]
         reply_to_user = p["user_id"]
 
     try:
@@ -1310,7 +1543,6 @@ async def post_comment(viewkey: str, body: CommentIn, actor: dict = Depends(get_
 
 @router.delete("/comments/{comment_id}")
 async def delete_comment(comment_id: int, actor: dict = Depends(get_actor)):
-    """Comment ka owner ya video ka owner delete kar sakta hai (token zaroori)."""
     need_verified(actor)
     c = get_one("""SELECT c.id, c.user_id, v.user_id AS video_owner
                    FROM comments c JOIN videos v ON v.id = c.video_id WHERE c.id=%s""", (comment_id,))
@@ -1325,7 +1557,6 @@ async def delete_comment(comment_id: int, actor: dict = Depends(get_actor)):
 
 @router.post("/comments/{comment_id}/like")
 async def toggle_comment_like(comment_id: int, actor: dict = Depends(get_actor)):
-    """Like / unlike. Logged-in user ya anonymous visitor (x-visitor-id) dono kar sakte hain."""
     uid, vid = actor["user_id"], actor["visitor_id"]
     if not uid and not vid:
         raise HTTPException(400, "Missing visitor id")
@@ -1358,263 +1589,3 @@ async def toggle_comment_like(comment_id: int, actor: dict = Depends(get_actor))
 
     cnt = get_one("SELECT COUNT(*) AS n FROM comment_likes WHERE comment_id=%s", (comment_id,))
     return {"success": True, "liked": liked, "likes": cnt["n"] if cnt else 0}
-# =====================================================================
-#  routes.py PATCH
-#  Is file ka code routes.py ke END me paste karein (comments ke neeche wali
-#  classes/functions). Pehle FIX 1 ko routes.py me apni jagah par badal dein.
-# =====================================================================
-
-# ---------------------------------------------------------------------
-# FIX 1  (routes.py me pehle se maujood /apikey/list ki query badlein)
-# Frontend "Total requests" aur "Last used" dikhata hai, lekin query me
-# request_count / last_used_at tha hi nahi, is liye hamesha 0 / "—" aata tha.
-#
-#   SELECT id, user_id, api_key, created_at, expiry_date
-#   FROM apikeys WHERE user_id = %s ORDER BY created_at DESC
-#
-# ko is se replace karein:
-#
-#   SELECT id, user_id, api_key, created_at, expiry_date,
-#          COALESCE(request_count, 0) AS request_count, last_used_at
-#   FROM apikeys WHERE user_id = %s ORDER BY created_at DESC
-# ---------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------
-# FIX 2:  GET /analytics   (Developer Console > Analytics tab)
-# Frontend isay call karta tha, magar routes.py me ye route tha hi nahi (404).
-# Response shape bilkul wahi hai jo ApiDashboard.jsx expect karta hai.
-#
-# NOTE: maine maan liya hai ke api_usage table me time wala column
-# "created_at" hai. Agar aap ka naam alag hai (e.g. called_at) to neeche
-# sab jagah created_at badal dein.
-# ---------------------------------------------------------------------
-@router.get("/analytics")
-async def api_analytics(api_key: str = Header(...)):
-    k = validate_api_key(api_key)          # endpoint nahi diya => ye call khud count nahi hoti
-    if not k:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired API key")
-    uid = k["user_id"]
-    try:
-        totals = get_one("""
-            SELECT COUNT(*) AS total,
-                   COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days') AS last_30_days,
-                   COUNT(*) FILTER (WHERE created_at >= CURRENT_DATE)               AS today
-            FROM api_usage WHERE user_id = %s""", (uid,)) or {}
-
-        daily = execute_query("""
-            SELECT to_char(d, 'Mon DD') AS day, COALESCE(x.n, 0) AS requests
-            FROM generate_series(CURRENT_DATE - 6, CURRENT_DATE, interval '1 day') d
-            LEFT JOIN (SELECT created_at::date AS dd, COUNT(*) AS n
-                       FROM api_usage
-                       WHERE user_id = %s AND created_at >= CURRENT_DATE - 6
-                       GROUP BY 1) x ON x.dd = d::date
-            ORDER BY d""", (uid,), fetch=True) or []
-
-        endpoints = execute_query("""
-            SELECT endpoint, COUNT(*) AS requests
-            FROM api_usage WHERE user_id = %s
-            GROUP BY endpoint ORDER BY requests DESC LIMIT 8""", (uid,), fetch=True) or []
-
-        keys = execute_query("""
-            SELECT id, api_key, COALESCE(request_count, 0) AS request_count, last_used_at
-            FROM apikeys WHERE user_id = %s ORDER BY created_at DESC""", (uid,), fetch=True) or []
-        for r in keys:
-            full = r.pop("api_key", "") or ""
-            r["key_preview"] = f"{full[:8]}••••{full[-4:]}" if len(full) > 12 else full
-
-        return {"success": True,
-                "totals": {"total": totals.get("total", 0),
-                           "last_30_days": totals.get("last_30_days", 0),
-                           "today": totals.get("today", 0)},
-                "daily": daily, "endpoints": endpoints, "keys": keys}
-    except Exception:
-        logger.exception("api_analytics")
-        return {"success": False, "message": "Could not load analytics"}
-
-
-# ---------------------------------------------------------------------
-# FIX 3:  PUT /profile/update   aur   PUT /profile/password
-# Frontend (ApiDashboard.jsx) in dono ko call karta tha, routes.py me sirf
-# /me/profile tha (jo token mangta hai aur frontend token bhejta hi nahi).
-# Channel isi liye chal raha tha (wo /studio/channel + api-key use karta hai).
-# Yahan current password se verify hota hai, is liye legacy mode me bhi safe.
-# ---------------------------------------------------------------------
-class ProfileUpdateIn(BaseModel):
-    user_id: int
-    name: Optional[str] = None
-    email: Optional[str] = None
-    phone: Optional[str] = None
-    bio: Optional[str] = None
-    avatar_url: Optional[str] = None
-    current_password: str
-
-
-class PasswordChangeIn(BaseModel):
-    user_id: int
-    current_password: str
-    new_password: str
-
-
-def _verify_password(user_id: int, password: str, request: Request):
-    """Password sahi ho to user row, warna None. Brute-force guard ke saath."""
-    ip = request.client.host if request.client else "?"
-    key = f"pw|{ip}|{user_id}"
-    if _login_blocked(key):
-        raise HTTPException(429, "Too many attempts. Please try again in a few minutes.")
-    u = get_one("SELECT * FROM mydata WHERE id=%s", (user_id,))
-    if not u or u["password"] != hash_password(password or ""):
-        _login_fail(key)
-        return None
-    _login_fails.pop(key, None)
-    return u
-
-
-_PROFILE_COLS = "id, name, email, is_premium, phone, bio, avatar_url, created_at"
-
-
-@router.put("/profile/update")
-async def profile_update(p: ProfileUpdateIn, request: Request, actor: dict = Depends(get_actor)):
-    _authorize_user_id(actor, p.user_id)
-    if not _verify_password(p.user_id, p.current_password, request):
-        return {"success": False, "message": "Current password is incorrect"}
-
-    fields = {}
-    if p.name is not None:
-        name = p.name.strip()
-        if len(name) < 2:
-            return {"success": False, "message": "Name must be at least 2 characters"}
-        fields["name"] = name[:100]
-
-    if p.email is not None:
-        email = p.email.strip()
-        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
-            return {"success": False, "message": "Enter a valid email address"}
-        if get_one("SELECT id FROM mydata WHERE LOWER(email)=LOWER(%s) AND id<>%s", (email, p.user_id)):
-            return {"success": False, "message": "This email is already used by another account"}
-        fields["email"] = email
-
-    if p.phone is not None:
-        fields["phone"] = p.phone.strip()[:30]
-    if p.bio is not None:
-        fields["bio"] = p.bio.strip()[:300]
-    if p.avatar_url is not None:
-        av = p.avatar_url.strip()
-        if av and not av.startswith("https://res.cloudinary.com/"):
-            return {"success": False, "message": "Profile picture must be uploaded through the app"}
-        fields["avatar_url"] = av
-
-    if not fields:
-        return {"success": False, "message": "Nothing to update"}
-    try:
-        sets = ", ".join(f"{k}=%s" for k in fields)
-        row = get_one(f"UPDATE mydata SET {sets} WHERE id=%s RETURNING {_PROFILE_COLS}",
-                      (*fields.values(), p.user_id))
-    except Exception:
-        logger.exception("profile_update")
-        return {"success": False, "message": "Could not update profile"}
-    return {"success": True, "message": "Profile updated", "user": row}
-
-
-@router.put("/profile/password")
-async def profile_password(p: PasswordChangeIn, request: Request, actor: dict = Depends(get_actor)):
-    _authorize_user_id(actor, p.user_id)
-    if len(p.new_password or "") < 8:
-        return {"success": False, "message": "New password must be at least 8 characters"}
-    if not _verify_password(p.user_id, p.current_password, request):
-        return {"success": False, "message": "Current password is incorrect"}
-    if p.new_password == p.current_password:
-        return {"success": False, "message": "New password must be different from the current one"}
-    get_one("UPDATE mydata SET password=%s WHERE id=%s RETURNING id",
-            (hash_password(p.new_password), p.user_id))
-    return {"success": True, "message": "Password changed"}
-
-
-# ---------------------------------------------------------------------
-# NEW:  GET /studio/analytics   (Creator Studio dashboard: YouTube jaisa)
-# 28 din ke views + subscribers graph, top videos, recent comments,
-# recent subscribers. video_views table me time column "created_at" maana hai.
-# ---------------------------------------------------------------------
-@router.get("/studio/analytics")
-async def studio_analytics(api_key: str = Header(...)):
-    u = current_user(api_key)               # tracking off: dashboard baar baar refresh hota hai
-    uid = u["user_id"]
-    try:
-        views_daily = execute_query("""
-            SELECT to_char(d, 'Mon DD') AS day, COALESCE(x.n, 0) AS n
-            FROM generate_series(CURRENT_DATE - 27, CURRENT_DATE, interval '1 day') d
-            LEFT JOIN (SELECT vv.created_at::date AS dd, COUNT(*) AS n
-                       FROM video_views vv JOIN videos v ON v.id = vv.video_id
-                       WHERE v.user_id = %s AND vv.created_at >= CURRENT_DATE - 27
-                       GROUP BY 1) x ON x.dd = d::date
-            ORDER BY d""", (uid,), fetch=True) or []
-
-        subs_daily = execute_query("""
-            SELECT to_char(d, 'Mon DD') AS day, COALESCE(x.n, 0) AS n
-            FROM generate_series(CURRENT_DATE - 27, CURRENT_DATE, interval '1 day') d
-            LEFT JOIN (SELECT created_at::date AS dd, COUNT(*) AS n
-                       FROM subscriptions
-                       WHERE channel_user_id = %s AND created_at >= CURRENT_DATE - 27
-                       GROUP BY 1) x ON x.dd = d::date
-            ORDER BY d""", (uid,), fetch=True) or []
-
-        top_videos = execute_query("""
-            SELECT v.id, v.title, v.viewkey, v.thumbnail, v.views, v.is_premium,
-                   (SELECT COUNT(*) FROM video_likes l WHERE l.video_id = v.id) AS likes,
-                   (SELECT COUNT(*) FROM comments c WHERE c.video_id = v.id)    AS comments
-            FROM videos v WHERE v.user_id = %s
-            ORDER BY v.views DESC NULLS LAST, v.uploaded_at DESC LIMIT 5""", (uid,), fetch=True) or []
-
-        recent_comments = execute_query("""
-            SELECT cm.id, LEFT(cm.content, 140) AS content, cm.created_at,
-                   COALESCE(ch.channel_name, mu.name) AS name,
-                   COALESCE(ch.avatar_url, mu.avatar_url) AS avatar,
-                   v.title AS video_title, v.viewkey, v.is_premium
-            FROM comments cm
-            JOIN videos v  ON v.id = cm.video_id
-            JOIN mydata mu ON mu.id = cm.user_id
-            LEFT JOIN channels ch ON ch.user_id = cm.user_id
-            WHERE v.user_id = %s AND cm.user_id <> %s
-            ORDER BY cm.created_at DESC LIMIT 5""", (uid, uid), fetch=True) or []
-
-        recent_subscribers = execute_query("""
-            SELECT s.created_at, COALESCE(c.channel_name, mu.name) AS name, c.handle,
-                   COALESCE(c.avatar_url, mu.avatar_url) AS avatar
-            FROM subscriptions s
-            JOIN mydata mu ON mu.id = s.subscriber_id
-            LEFT JOIN channels c ON c.user_id = mu.id
-            WHERE s.channel_user_id = %s
-            ORDER BY s.created_at DESC LIMIT 5""", (uid,), fetch=True) or []
-
-        return {"success": True, "analytics": {
-            "views_daily": views_daily,
-            "subs_daily": subs_daily,
-            "views_28d": sum(int(r["n"]) for r in views_daily),
-            "subs_28d": sum(int(r["n"]) for r in subs_daily),
-            "top_videos": top_videos,
-            "recent_comments": recent_comments,
-            "recent_subscribers": recent_subscribers,
-        }}
-    except Exception:
-        logger.exception("studio_analytics")
-        return {"success": False, "message": "Could not load analytics"}
-@router.get("/studio/init")
-async def studio_init(api_key: str = Header(...)):
-    u = current_user(api_key)               # tracking off
-    uid = u["user_id"]
-    channel = get_one("SELECT * FROM channels WHERE user_id=%s", (uid,))
-    stats = get_one("""
-        SELECT COUNT(*) AS videos,
-               COALESCE(SUM(views),0) AS views,
-               COUNT(*) FILTER (WHERE is_premium) AS premium,
-               (SELECT COUNT(*) FROM subscriptions WHERE channel_user_id=%s) AS subscribers,
-               (SELECT COUNT(*) FROM video_likes vl JOIN videos x ON x.id=vl.video_id WHERE x.user_id=%s) AS likes,
-               (SELECT COUNT(*) FROM comments cm JOIN videos y ON y.id=cm.video_id WHERE y.user_id=%s) AS comments
-        FROM videos WHERE user_id=%s""", (uid, uid, uid, uid))
-    videos = execute_query("""
-        SELECT id, title, viewkey, thumbnail, category, description, visibility, is_premium,
-               views, duration, uploaded_at
-        FROM videos WHERE user_id=%s ORDER BY uploaded_at DESC LIMIT 100""", (uid,), fetch=True) or []
-    analytics = _analytics_for(uid) if channel else None
-    return {"success": True, "channel": channel, "stats": stats, "videos": videos, "analytics": analytics}
-
