@@ -1598,3 +1598,23 @@ async def studio_analytics(api_key: str = Header(...)):
     except Exception:
         logger.exception("studio_analytics")
         return {"success": False, "message": "Could not load analytics"}
+@router.get("/studio/init")
+async def studio_init(api_key: str = Header(...)):
+    u = current_user(api_key)               # tracking off
+    uid = u["user_id"]
+    channel = get_one("SELECT * FROM channels WHERE user_id=%s", (uid,))
+    stats = get_one("""
+        SELECT COUNT(*) AS videos,
+               COALESCE(SUM(views),0) AS views,
+               COUNT(*) FILTER (WHERE is_premium) AS premium,
+               (SELECT COUNT(*) FROM subscriptions WHERE channel_user_id=%s) AS subscribers,
+               (SELECT COUNT(*) FROM video_likes vl JOIN videos x ON x.id=vl.video_id WHERE x.user_id=%s) AS likes,
+               (SELECT COUNT(*) FROM comments cm JOIN videos y ON y.id=cm.video_id WHERE y.user_id=%s) AS comments
+        FROM videos WHERE user_id=%s""", (uid, uid, uid, uid))
+    videos = execute_query("""
+        SELECT id, title, viewkey, thumbnail, category, description, visibility, is_premium,
+               views, duration, uploaded_at
+        FROM videos WHERE user_id=%s ORDER BY uploaded_at DESC LIMIT 100""", (uid,), fetch=True) or []
+    analytics = _analytics_for(uid) if channel else None
+    return {"success": True, "channel": channel, "stats": stats, "videos": videos, "analytics": analytics}
+
