@@ -2836,3 +2836,15 @@ async def admin_edit_ad_pricing(model: str, body: AdPricingEditIn,
     if not row:
         raise HTTPException(404, "Pricing not found")
     return {"success": True, "pricing": row}
+from fastapi.responses import HTMLResponse
+
+@router.get("/admin", response_class=HTMLResponse)
+async def admin_panel():
+    """Serve admin panel HTML."""
+    try:
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(current_dir, "static", "admin.html"), "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:
+        logger.error(f"Error reading admin.html: {e}")
+        return "<h1>Admin panel not found. Make sure static/admin.html exists.</h1>"
