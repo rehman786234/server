@@ -144,3 +144,40 @@ class PlaylistAddVideoIn(BaseModel):
 
 class PlaylistReorderIn(BaseModel):
     video_ids: List[int]               # naya order (video.id list)
+# =====================================================
+#  PART 2 MODELS: Plans + Payments + Support Chat
+# =====================================================
+from typing import List, Optional  # already imported, safe
+
+
+class PaymentSubmitIn(BaseModel):
+    plan_id: int
+    amount: float
+    currency: Optional[str] = "PKR"
+    method: str                          # jazzcash | easypaisa | bank | crypto | other
+    transaction_id: str
+    sender_name: Optional[str] = None
+    sender_account: Optional[str] = None
+    screenshot_url: Optional[str] = None
+    user_note: Optional[str] = ""
+
+
+class PaymentReviewIn(BaseModel):
+    action: str                          # approve | reject
+    admin_note: Optional[str] = ""
+
+
+class SupportThreadCreateIn(BaseModel):
+    subject: Optional[str] = "Support"
+    message: str
+    attachment: Optional[str] = None
+
+
+class SupportMessageIn(BaseModel):
+    content: str
+    attachment: Optional[str] = None
+
+
+class SupportStatusIn(BaseModel):
+    status: str                          # open | closed
+    priority: Optional[str] = None       # low | normal | high
