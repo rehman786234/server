@@ -9,7 +9,7 @@ import os
 import re
 import time
 from collections import defaultdict, deque
-from threading import Lock
+from threading import Lock, Thread
 from datetime import datetime, timedelta
 from typing import Optional, List
 
@@ -78,6 +78,67 @@ def _invalidate_video_caches():
     cache_del_prefix("chvideos:")
     cache_del_prefix("tagvideos:")
     cache_del_prefix("channels:list:")
+
+
+# =====================================================================
+#  DB INDEXES (sirf NAYE / missing indexes — "IF NOT EXISTS" ki wajah se
+#  baar baar chalane se koi nuqsan nahi). Background thread me chalta hai
+#  taake server start hone me rukawat na ho.
+#  Band karne ke liye Render env me:  AUTO_CREATE_INDEXES=0
+# =====================================================================
+AUTO_CREATE_INDEXES = os.getenv("AUTO_CREATE_INDEXES", "1") == "1"
+
+_NEW_INDEXES = [
+    # --- pg_trgm: LIKE '%text%' / ILIKE search ko index se tez karta hai ---
+    "CREATE EXTENSION IF NOT EXISTS pg_trgm",
+    "CREATE INDEX IF NOT EXISTS idx_videos_title_trgm "
+    "ON videos USING gin (lower(title) gin_trgm_ops)",
+    "CREATE INDEX IF NOT EXISTS idx_videos_desc_trgm "
+    "ON videos USING gin (lower(COALESCE(description, '')) gin_trgm_ops)",
+    "CREATE INDEX IF NOT EXISTS idx_tags_name_trgm "
+    "ON tags USING gin (lower(name) gin_trgm_ops)",
+    "CREATE INDEX IF NOT EXISTS idx_channels_name_trgm "
+    "ON channels USING gin (channel_name gin_trgm_ops)",
+    "CREATE INDEX IF NOT EXISTS idx_channels_handle_trgm "
+    "ON channels USING gin (handle gin_trgm_ops)",
+
+    # --- partial indexes: public video lists (/videos, /premium_videos, popular, tags) ---
+    "CREATE INDEX IF NOT EXISTS idx_videos_public_free "
+    "ON videos (uploaded_at DESC) WHERE visibility = 'public' AND is_premium = false",
+    "CREATE INDEX IF NOT EXISTS idx_videos_public_premium "
+    "ON videos (uploaded_at DESC) WHERE visibility = 'public' AND is_premium = true",
+    "CREATE INDEX IF NOT EXISTS idx_videos_public_views "
+    "ON videos (views DESC, uploaded_at DESC) WHERE visibility = 'public'",
+
+    # --- notifications: notify() ka duplicate check ---
+    "CREATE INDEX IF NOT EXISTS idx_notif_dedup "
+    "ON notifications (user_id, type, actor_id)",
+
+    # --- payments: pending count (user_id + status) ---
+    "CREATE INDEX IF NOT EXISTS idx_pay_user_status "
+    "ON payments (user_id, status)",
+]
+
+
+def _create_indexes_worker():
+    ok = skipped = 0
+    for sql in _NEW_INDEXES:
+        try:
+            execute_query(sql, fetch=False)
+            ok += 1
+        except Exception as e:
+            skipped += 1
+            logger.warning(f"Index step skipped: {sql[:70]}... ({e})")
+    logger.info(f"DB index check done: {ok} ok, {skipped} skipped")
+
+
+def ensure_db_indexes():
+    if not AUTO_CREATE_INDEXES:
+        return
+    Thread(target=_create_indexes_worker, daemon=True, name="index-builder").start()
+
+
+ensure_db_indexes()
 
 
 # =====================================================================
