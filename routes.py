@@ -2520,6 +2520,108 @@ async def my_payment_status(actor: dict = Depends(get_actor)):
 
 # ---------- SUPPORT CHAT ----------
 
+_support_conns: dict = {}
+_support_lock = Lock()
+
+
+async def _support_push(uid: int, payload: dict):
+    with _support_lock:
+        sockets = list(_support_conns.get(uid, ()))
+    dead = []
+    for ws in sockets:
+        try:
+            await ws.send_json(jsonable_encoder(payload))
+        except Exception:
+            dead.append(ws)
+    if dead:
+        with _support_lock:
+            user_sockets = _support_conns.get(uid)
+            if user_sockets:
+                for ws in dead:
+                    user_sockets.discard(ws)
+                if not user_sockets:
+                    _support_conns.pop(uid, None)
+
+
+async def _support_push_admins(payload: dict):
+    for admin_id in ADMIN_USER_IDS:
+        await _support_push(admin_id, payload)
+
+
+async def _support_broadcast_new_message(thread_id: int, message: dict,
+                                         is_admin: bool, thread_owner_id: int):
+    payload = {
+        "type": "support_message",
+        "thread_id": thread_id,
+        "message": {**message, "thread_id": thread_id},
+    }
+    if is_admin:
+        await _support_push(thread_owner_id, payload)
+    else:
+        await _support_push_admins(payload)
+    await _support_push_admins({
+        "type": "support_thread_update",
+        "thread_id": thread_id,
+    })
+
+
+@router.websocket("/ws/support")
+async def ws_support(ws: WebSocket):
+    uid = read_token(ws.query_params.get("token"))
+    if not uid or not get_one("SELECT id FROM mydata WHERE id=%s", (uid,)):
+        await ws.close(code=4401)
+        return
+
+    await ws.accept()
+    with _support_lock:
+        _support_conns.setdefault(uid, set()).add(ws)
+
+    try:
+        await ws.send_json({"type": "connected", "user_id": uid})
+        while True:
+            try:
+                data = json.loads(await ws.receive_text())
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+
+            if data.get("type") == "ping":
+                await ws.send_json({"type": "pong"})
+                continue
+            if data.get("type") != "typing":
+                continue
+
+            thread_id = data.get("thread_id")
+            if not isinstance(thread_id, int) or thread_id <= 0:
+                continue
+            thread = get_one("SELECT user_id FROM support_threads WHERE id=%s", (thread_id,))
+            is_admin = uid in ADMIN_USER_IDS
+            if not thread or (not is_admin and thread["user_id"] != uid):
+                continue
+
+            payload = {
+                "type": "support_typing",
+                "thread_id": thread_id,
+                "is_admin": is_admin,
+                "user_id": uid,
+            }
+            if is_admin:
+                await _support_push(thread["user_id"], payload)
+            else:
+                await _support_push_admins(payload)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        logger.exception("ws_support error")
+    finally:
+        with _support_lock:
+            user_sockets = _support_conns.get(uid)
+            if user_sockets:
+                user_sockets.discard(ws)
+                if not user_sockets:
+                    _support_conns.pop(uid, None)
+
 @router.post("/support/threads/create")
 async def support_create_thread(body: SupportThreadCreateIn,
                                 actor: dict = Depends(get_actor)):
@@ -2553,6 +2655,14 @@ async def support_create_thread(body: SupportThreadCreateIn,
             await notify(admin_id, "support_message", actor["user_id"])
     except Exception:
         logger.exception("notify support create")
+
+    try:
+        await _support_push_admins({
+            "type": "support_thread_update",
+            "thread_id": th["id"],
+        })
+    except Exception:
+        logger.exception("broadcast support_create_thread")
 
     return {"success": True, "thread": th}
 
@@ -2634,6 +2744,16 @@ async def support_user_reply(thread_id: int, body: SupportMessageIn,
             await notify(admin_id, "support_message", actor["user_id"])
     except Exception:
         logger.exception("notify support reply")
+
+    try:
+        await _support_broadcast_new_message(
+            thread_id=thread_id,
+            message=m,
+            is_admin=False,
+            thread_owner_id=actor["user_id"],
+        )
+    except Exception:
+        logger.exception("broadcast support_user_reply")
 
     return {"success": True, "message": m}
 
@@ -2867,6 +2987,16 @@ async def admin_thread_reply(thread_id: int, body: SupportMessageIn,
         })
     except Exception:
         logger.exception("notify admin reply")
+
+    try:
+        await _support_broadcast_new_message(
+            thread_id=thread_id,
+            message=m,
+            is_admin=True,
+            thread_owner_id=t["user_id"],
+        )
+    except Exception:
+        logger.exception("broadcast admin_thread_reply")
 
     return {"success": True, "message": m}
 
