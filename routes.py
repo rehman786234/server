@@ -935,10 +935,64 @@ async def get_playlists(actor: dict = Depends(get_actor)):
             raw = execute_query(PLAYLIST_SELECT + PLAYLIST_GROUP + " ORDER BY p.created_at DESC", fetch=True) or []
             cache_set("playlists:legacy", raw, TTL_LEGACY_PLAYLIST)
         results = [_lock_playlist(p, actor) for p in copy.deepcopy(raw)]
+        for playlist in results:
+            playlist["playlist_source"] = "legacy"
         return {"success": True, "total": len(results), "playlists": results}
     except Exception:
         logger.exception("Error while retrieving playlists")
         raise HTTPException(500, "Failed to retrieve playlists")
+
+
+@router.get("/playlists/public")
+async def get_public_playlists(actor: dict = Depends(get_actor)):
+    rows = execute_query("""
+        SELECT p.id AS playlist_id, p.title AS playlist_name,
+               'free' AS playlist_type, p.thumbnail AS playlist_thumbnail,
+               p.created_at,
+               COALESCE(
+                   json_agg(json_build_object(
+                       'video_id', v.id,
+                       'viewkey', v.viewkey,
+                       'stream_url', '',
+                       'video_title', v.title,
+                       'video_thumbnail', v.thumbnail,
+                       'video_duration', v.duration,
+                       'category', v.category,
+                       'is_premium', v.is_premium,
+                       'views', v.views,
+                       'uploaded_at', v.uploaded_at,
+                       'visibility', v.visibility,
+                       'user_id', v.user_id
+                   ) ORDER BY pi.position ASC, pi.added_at ASC)
+                   FILTER (WHERE v.id IS NOT NULL), '[]'::json
+               ) AS videos
+        FROM playlists_v2 p
+        LEFT JOIN playlist_items pi ON pi.playlist_id = p.id
+        LEFT JOIN videos v ON v.id = pi.video_id
+        WHERE p.visibility = 'public'
+        GROUP BY p.id, p.title, p.thumbnail, p.created_at, p.updated_at
+        ORDER BY p.updated_at DESC
+        LIMIT 100
+    """, fetch=True) or []
+
+    for playlist in rows:
+        videos = playlist.get("videos") or []
+        if isinstance(videos, str):
+            videos = json.loads(videos)
+        visible_videos = []
+        for video in videos:
+            if video.get("visibility") == "private" and not _is_owner(actor, video.get("user_id")):
+                continue
+            can_view = _can_view_video(video, actor)
+            video["locked"] = not can_view
+            video["stream_url"] = ""
+            video.pop("user_id", None)
+            visible_videos.append(video)
+        playlist["videos"] = visible_videos
+        playlist["total_videos"] = len(visible_videos)
+        playlist["playlist_source"] = "v2"
+
+    return {"success": True, "total": len(rows), "playlists": rows}
 
 
 # IMPORTANT: specific routes PEHLE, phir dynamic route
@@ -2786,9 +2840,14 @@ async def admin_dashboard(actor: dict = Depends(get_actor)):
         SELECT
           (SELECT COUNT(*) FROM mydata)                                  AS total_users,
           (SELECT COUNT(*) FROM mydata WHERE is_premium = true)          AS premium_users,
-          (SELECT COUNT(*) FROM payments WHERE status = 'pending')       AS pending_payments,
-          (SELECT COUNT(*) FROM payments WHERE status = 'approved')      AS approved_payments,
-          (SELECT COALESCE(SUM(amount),0) FROM payments WHERE status='approved') AS total_revenue,
+             (SELECT COUNT(*) FROM payments WHERE status = 'pending'
+                 AND COALESCE(purpose, '') <> 'ad_topup' AND plan_id IS NOT NULL) AS pending_payments,
+             (SELECT COUNT(*) FROM payments WHERE status = 'pending'
+                 AND (purpose = 'ad_topup' OR plan_id IS NULL)) AS pending_topups,
+             (SELECT COUNT(*) FROM payments WHERE status = 'approved'
+                 AND COALESCE(purpose, '') <> 'ad_topup' AND plan_id IS NOT NULL) AS approved_payments,
+             (SELECT COALESCE(SUM(amount),0) FROM payments WHERE status='approved'
+                 AND COALESCE(purpose, '') <> 'ad_topup' AND plan_id IS NOT NULL) AS total_revenue,
           (SELECT COUNT(*) FROM support_threads WHERE status = 'open')   AS open_threads,
           (SELECT COUNT(*) FROM support_threads WHERE unread_admin > 0)  AS unread_threads,
           (SELECT COUNT(*) FROM videos)                                  AS total_videos,
@@ -2798,26 +2857,38 @@ async def admin_dashboard(actor: dict = Depends(get_actor)):
 
 
 @router.get("/admin/payments")
-async def admin_list_payments(status: str = "pending", limit: int = 30, offset: int = 0,
+async def admin_list_payments(status: str = "pending", kind: str = "all",
+                              limit: int = 30, offset: int = 0,
                               actor: dict = Depends(get_actor)):
     _need_admin(actor)
     if status not in ("pending", "approved", "rejected", "all"):
         raise HTTPException(400, "Invalid status")
+    if kind not in ("premium", "ad_topup", "all"):
+        raise HTTPException(400, "Invalid payment kind")
     limit = max(1, min(limit, 100))
-    where = "" if status == "all" else "WHERE p.status = %s"
-    params = (limit + 1, max(0, offset)) if status == "all" else (status, limit + 1, max(0, offset))
+    conditions = []
+    values = []
+    if status != "all":
+        conditions.append("p.status = %s")
+        values.append(status)
+    if kind == "ad_topup":
+        conditions.append("(p.purpose = 'ad_topup' OR p.plan_id IS NULL)")
+    elif kind == "premium":
+        conditions.append("(COALESCE(p.purpose, '') <> 'ad_topup' AND p.plan_id IS NOT NULL)")
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    values.extend((limit + 1, max(0, offset)))
     rows = execute_query(f"""
         SELECT p.id, p.user_id, u.name AS user_name, u.email AS user_email,
                p.plan_id, pl.name AS plan_name,
                p.amount, p.currency, p.method, p.transaction_id,
                p.sender_name, p.sender_account, p.screenshot_url, p.user_note,
-               p.status, p.admin_note, p.reviewed_by, p.reviewed_at, p.created_at
+               p.purpose, p.status, p.admin_note, p.reviewed_by, p.reviewed_at, p.created_at
         FROM payments p
         JOIN mydata u ON u.id = p.user_id
         LEFT JOIN plans pl ON pl.id = p.plan_id
         {where}
         ORDER BY p.created_at DESC LIMIT %s OFFSET %s
-    """, params, fetch=True) or []
+    """, tuple(values), fetch=True) or []
     return {"success": True, "has_more": len(rows) > limit, "payments": rows[:limit]}
 
 
@@ -2855,15 +2926,62 @@ async def admin_review_payment(payment_id: int, body: PaymentReviewIn,
         return {"success": False, "message": f"Payment already {p['status']}"}
 
     note = (body.admin_note or "").strip()[:1000]
+    is_topup = p.get("purpose") == "ad_topup" or p.get("plan_id") is None
 
     if body.action == "approve":
-        get_one("UPDATE mydata SET is_premium = true WHERE id = %s RETURNING id",
-                (p["user_id"],))
-        get_one("""
-            UPDATE payments SET status='approved', admin_note=%s,
-                                reviewed_by=%s, reviewed_at=now()
-            WHERE id = %s RETURNING id
-        """, (note, actor["user_id"], payment_id))
+        if is_topup:
+            done = get_one("""
+                WITH pending AS MATERIALIZED (
+                    SELECT id, user_id, amount FROM payments
+                    WHERE id = %s AND status = 'pending'
+                    FOR UPDATE
+                ), wallet AS (
+                    INSERT INTO ad_wallets (user_id, balance, total_spent, total_added)
+                    SELECT user_id, amount, 0, amount FROM pending
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        balance = ad_wallets.balance + EXCLUDED.balance,
+                        total_added = ad_wallets.total_added + EXCLUDED.total_added,
+                        updated_at = now()
+                    RETURNING user_id, balance
+                ), ledger AS (
+                    INSERT INTO ad_transactions
+                        (user_id, kind, amount, balance_after, reference, note)
+                    SELECT p.user_id, 'topup', p.amount, w.balance, %s, %s
+                    FROM pending p JOIN wallet w USING (user_id)
+                    RETURNING id
+                )
+                UPDATE payments payment
+                SET status = 'approved', admin_note = %s,
+                    reviewed_by = %s, reviewed_at = now()
+                FROM pending p JOIN ledger l ON true
+                WHERE payment.id = p.id AND payment.status = 'pending'
+                RETURNING payment.id
+            """, (payment_id, f"payment:{payment_id}", "Top-up approved",
+                  note, actor["user_id"]))
+            message = "Top-up approved, ad wallet credited"
+        else:
+            done = get_one("""
+                WITH pending AS MATERIALIZED (
+                    SELECT id, user_id FROM payments
+                    WHERE id = %s AND status = 'pending'
+                      AND COALESCE(purpose, '') <> 'ad_topup' AND plan_id IS NOT NULL
+                    FOR UPDATE
+                ), promoted AS (
+                    UPDATE mydata user_row SET is_premium = true
+                    FROM pending p WHERE user_row.id = p.user_id
+                    RETURNING user_row.id
+                )
+                UPDATE payments payment
+                SET status = 'approved', admin_note = %s,
+                    reviewed_by = %s, reviewed_at = now()
+                FROM pending p JOIN promoted u ON u.id = p.user_id
+                WHERE payment.id = p.id AND payment.status = 'pending'
+                RETURNING payment.id
+            """, (payment_id, note, actor["user_id"]))
+            message = "Payment approved, user is now premium"
+
+        if not done:
+            return {"success": False, "message": "Payment already reviewed"}
 
         try:
             await notify(p["user_id"], "payment_approved", actor["user_id"])
@@ -2875,13 +2993,15 @@ async def admin_review_payment(payment_id: int, body: PaymentReviewIn,
         except Exception:
             logger.exception("notify payment approved")
 
-        return {"success": True, "message": "Payment approved, user is now premium"}
+        return {"success": True, "message": message}
 
-    get_one("""
+    done = get_one("""
         UPDATE payments SET status='rejected', admin_note=%s,
                             reviewed_by=%s, reviewed_at=now()
-        WHERE id = %s RETURNING id
+        WHERE id = %s AND status = 'pending' RETURNING id
     """, (note, actor["user_id"], payment_id))
+    if not done:
+        return {"success": False, "message": "Payment already reviewed"}
 
     try:
         await notify(p["user_id"], "payment_rejected", actor["user_id"])
@@ -3687,12 +3807,14 @@ def _ad_recent_served(creative_id: int, viewer_ip: str, minutes: int = 30) -> bo
 async def ad_serve(viewkey: str, request: Request, actor: dict = Depends(get_actor)):
     """Video page ke liye ek ad pick karo."""
     v = get_one("""
-        SELECT v.id, v.category,
+        SELECT v.id, v.user_id, v.visibility, v.is_premium, v.category,
                COALESCE((SELECT array_agg(tag_id) FROM video_tags WHERE video_id = v.id), '{}') AS tags
         FROM videos v WHERE v.viewkey = %s
     """, (viewkey,))
     if not v:
         return {"success": False, "message": "Video not found"}
+    if actor["is_premium"] or _is_owner(actor, v["user_id"]) or not _can_view_video(v, actor):
+        return {"success": True, "ad": None}
 
     camp = _ad_pick_for_video(v["id"], v["category"], v["tags"] or [])
     if not camp:
