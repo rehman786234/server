@@ -1988,7 +1988,7 @@ async def playlist_create(body: PlaylistCreateIn, actor: dict = Depends(get_acto
     return {"success": True, "playlist": row}
 
 
-@router.get("/playlists/my")
+@router.get("/me/playlists")
 async def playlist_my(limit: int = 50, offset: int = 0,
                       actor: dict = Depends(get_actor)):
     """Meri saari playlists."""
