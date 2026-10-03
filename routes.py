@@ -1,3 +1,4 @@
+import copy
 import secrets
 import hmac
 import base64
@@ -19,6 +20,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from database import execute_query, get_one
+from cache import cache_get, cache_set, cache_del, cache_del_prefix
 from models import (
     User, UserCreate, UserLogin, APIKeyRequest, Video,
     TagOut, TagsForVideoIn,
@@ -46,6 +48,36 @@ CLD2_KEY = os.getenv("CLOUDINARY2_API_KEY", "")
 CLD2_SECRET = os.getenv("CLOUDINARY2_API_SECRET", "")
 
 SHOW_LOCKED_PREMIUM = False
+
+
+# =====================================================================
+#  CACHE SETTINGS (TTL seconds) + INVALIDATION HELPERS
+#  Rule: sirf public / user-independent data cache hota hai.
+#  Jahan result premium status ya user pe depend karta hai, wahan
+#  cache key me wo value shamil hai. Login/auth/wallet/payments/
+#  comments/notifications kabhi cache nahi hote.
+# =====================================================================
+TTL_VIDEOS = 30          # /videos, /premium_videos
+TTL_SEARCH = 30          # /search
+TTL_RELATED = 60         # /videos/{viewkey}/related
+TTL_CHANNEL_LIST = 20    # /channels
+TTL_CHANNEL_VIDEOS = 30  # /channels/{handle}/videos
+TTL_TAGS = 120           # /tags/popular
+TTL_TAG_AC = 60          # /tags/autocomplete
+TTL_TAG_VIDEOS = 60      # /tags/{slug}/videos
+TTL_PLANS = 300          # /plans, /ad-pricing
+TTL_LEGACY_PLAYLIST = 60 # /playlists (legacy)
+TTL_STUDIO_ANALYTICS = 60
+
+
+def _invalidate_video_caches():
+    """Video / channel / profile change hone par saare video-related caches saaf."""
+    cache_del("videos:free", "videos:premium")
+    cache_del_prefix("search:")
+    cache_del_prefix("related:")
+    cache_del_prefix("chvideos:")
+    cache_del_prefix("tagvideos:")
+    cache_del_prefix("channels:list:")
 
 
 # =====================================================================
@@ -341,6 +373,7 @@ async def update_profile(p: ProfileIn, actor: dict = Depends(get_actor)):
     sets = ", ".join(f"{k}=%s" for k in fields)
     row = get_one(f"UPDATE mydata SET {sets} WHERE id=%s RETURNING id, name, email, is_premium, phone, bio, avatar_url",
                   (*fields.values(), actor["user_id"]))
+    _invalidate_video_caches()  # channel_name / avatar video lists me dikhte hain
     return {"success": True, "user": row}
 
 
@@ -416,6 +449,7 @@ async def profile_update(p: ProfileUpdateIn, request: Request, actor: dict = Dep
     except Exception:
         logger.exception("profile_update")
         return {"success": False, "message": "Could not update profile"}
+    _invalidate_video_caches()  # channel_name / avatar video lists me dikhte hain
     return {"success": True, "message": "Profile updated", "user": row}
 
 
@@ -650,7 +684,10 @@ async def api_analytics(api_key: str = Header(...)):
 # =====================================================================
 @router.get("/videos")
 async def get_videos():
-    """Free PUBLIC videos. No login needed."""
+    """Free PUBLIC videos. No login needed. (cached)"""
+    cached = cache_get("videos:free")
+    if cached is not None:
+        return cached
     try:
         results = execute_query("""
             SELECT v.*,
@@ -663,7 +700,9 @@ async def get_videos():
             WHERE v.is_premium = false AND v.visibility = 'public'
             ORDER BY v.uploaded_at DESC
         """, fetch=True)
-        return results if results else []
+        results = results if results else []
+        cache_set("videos:free", results, TTL_VIDEOS)
+        return results
     except Exception as e:
         logger.error(f"Error in get_videos: {e}")
         raise HTTPException(status_code=500, detail="Database error")
@@ -671,23 +710,27 @@ async def get_videos():
 
 @router.get("/premium_videos")
 async def get_premium_videos(api_key: str = Header(...)):
+    # API key + premium check HAR request par hota hai (cache se pehle) — sirf video list cache hoti hai
     user_data = validate_api_key(api_key, "/premium_videos")
     if not user_data:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired API key")
     if not user_data.get("is_premium"):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Premium subscription required")
     try:
-        results = execute_query("""
-            SELECT v.*,
-                   COALESCE(c.channel_name, u.name)     AS channel_name,
-                   c.handle                             AS channel_handle,
-                   COALESCE(c.avatar_url, u.avatar_url) AS channel_avatar
-            FROM videos v
-            LEFT JOIN channels c ON c.user_id = v.user_id
-            LEFT JOIN mydata u   ON u.id = v.user_id
-            WHERE v.is_premium = true AND v.visibility = 'public'
-            ORDER BY v.uploaded_at DESC
-        """, fetch=True)
+        results = cache_get("videos:premium")
+        if results is None:
+            results = execute_query("""
+                SELECT v.*,
+                       COALESCE(c.channel_name, u.name)     AS channel_name,
+                       c.handle                             AS channel_handle,
+                       COALESCE(c.avatar_url, u.avatar_url) AS channel_avatar
+                FROM videos v
+                LEFT JOIN channels c ON c.user_id = v.user_id
+                LEFT JOIN mydata u   ON u.id = v.user_id
+                WHERE v.is_premium = true AND v.visibility = 'public'
+                ORDER BY v.uploaded_at DESC
+            """, fetch=True) or []
+            cache_set("videos:premium", results, TTL_VIDEOS)
         return {
             "success": True,
             "message": "Premium videos retrieved successfully",
@@ -715,6 +758,8 @@ async def upload_video(video: Video, api_key: str = Header(...)):
         """, (video.title, video.stream_link, viewkey, video.thumbnail,
               video.category, video.is_premium, user_data.get('user_id')))
         if result:
+            _invalidate_video_caches()
+            cache_del(f"studio:analytics:{user_data.get('user_id')}")
             return {"success": True, "message": "Video uploaded successfully", "viewkey": viewkey,
                     "video": result, "uploaded_by": user_data.get('name', 'Unknown'),
                     "user_id": user_data.get('user_id')}
@@ -823,8 +868,12 @@ def _lock_playlist(p: dict, actor: dict) -> dict:
 @router.get("/playlists")
 async def get_playlists(actor: dict = Depends(get_actor)):
     try:
-        results = execute_query(PLAYLIST_SELECT + PLAYLIST_GROUP + " ORDER BY p.created_at DESC", fetch=True) or []
-        results = [_lock_playlist(p, actor) for p in results]
+        # RAW rows cache hoti hain (stream_url ke saath); lock har request par copy par lagta hai
+        raw = cache_get("playlists:legacy")
+        if raw is None:
+            raw = execute_query(PLAYLIST_SELECT + PLAYLIST_GROUP + " ORDER BY p.created_at DESC", fetch=True) or []
+            cache_set("playlists:legacy", raw, TTL_LEGACY_PLAYLIST)
+        results = [_lock_playlist(p, actor) for p in copy.deepcopy(raw)]
         return {"success": True, "total": len(results), "playlists": results}
     except Exception:
         logger.exception("Error while retrieving playlists")
@@ -844,9 +893,14 @@ async def get_playlist(playlist_id: str, actor: dict = Depends(get_actor)):
     if playlist_id <= 0:
         raise HTTPException(400, "Invalid playlist ID")
     try:
-        result = get_one(PLAYLIST_SELECT + " WHERE p.playlist_id = %s " + PLAYLIST_GROUP, (playlist_id,))
-        if not result:
-            raise HTTPException(404, "Playlist not found")
+        ckey = f"playlists:legacy:{playlist_id}"
+        raw = cache_get(ckey)
+        if raw is None:
+            raw = get_one(PLAYLIST_SELECT + " WHERE p.playlist_id = %s " + PLAYLIST_GROUP, (playlist_id,))
+            if not raw:
+                raise HTTPException(404, "Playlist not found")
+            cache_set(ckey, raw, TTL_LEGACY_PLAYLIST)
+        result = copy.deepcopy(raw)
         return {"success": True, "playlist": _lock_playlist(result, actor)}
     except HTTPException:
         raise
@@ -866,7 +920,7 @@ async def health_check():
 
 @router.get("/ads")
 async def get_ads():
-    """Legacy random ads: 2 image + 1 video."""
+    """Legacy random ads: 2 image + 1 video. (NOT cached — random rotation chahiye)"""
     try:
         image_ads = execute_query("""
             SELECT id, ad_name, promotion_link, ad_type, link
@@ -948,6 +1002,8 @@ async def studio_create_video(v: StudioVideoIn, api_key: str = Header(...)):
     except Exception:
         logger.exception("studio_create_video")
         return {"success": False, "message": "Could not save video"}
+    _invalidate_video_caches()
+    cache_del(f"studio:analytics:{u['user_id']}")
     if v.visibility == "public":
         await _notify_new_upload(u["user_id"], row["id"], v.is_premium)
     return {"success": True, "viewkey": viewkey, "video": row}
@@ -967,6 +1023,8 @@ async def studio_edit_video(video_id: int, v: StudioVideoEdit, api_key: str = He
                   (*fields.values(), video_id, u["user_id"]))
     if not row:
         raise HTTPException(404, "Video not found")
+    _invalidate_video_caches()
+    cache_del(f"studio:analytics:{u['user_id']}")
     return {"success": True, "video": row}
 
 
@@ -976,6 +1034,8 @@ async def studio_delete_video(video_id: int, api_key: str = Header(...)):
     row = get_one("DELETE FROM videos WHERE id=%s AND user_id=%s RETURNING id", (video_id, u["user_id"]))
     if not row:
         raise HTTPException(404, "Video not found")
+    _invalidate_video_caches()
+    cache_del(f"studio:analytics:{u['user_id']}")
     return {"success": True}
 
 
@@ -1019,6 +1079,8 @@ async def studio_save_channel(c: ChannelIn, api_key: str = Header(...)):
             banner_url=COALESCE(EXCLUDED.banner_url, channels.banner_url),
             description=EXCLUDED.description RETURNING *""",
         (u["user_id"], name, handle, c.avatar_url, c.banner_url, c.description))
+    _invalidate_video_caches()
+    cache_del(f"studio:analytics:{u['user_id']}")
     return {"success": True, "channel": row}
 
 
@@ -1045,7 +1107,11 @@ async def studio_count_view(viewkey: str, request: Request):
 
 
 def _analytics_for(uid: int):
-    """28 din ka analytics dict, ya error par None."""
+    """28 din ka analytics dict, ya error par None. (60s cache per user)"""
+    ckey = f"studio:analytics:{uid}"
+    cached = cache_get(ckey)
+    if cached is not None:
+        return cached
     try:
         views_daily = execute_query("""
             SELECT to_char(d, 'Mon DD') AS day, COALESCE(x.n, 0) AS n
@@ -1093,7 +1159,7 @@ def _analytics_for(uid: int):
             WHERE s.channel_user_id = %s
             ORDER BY s.created_at DESC LIMIT 5""", (uid,), fetch=True) or []
 
-        return {
+        result = {
             "views_daily": views_daily,
             "subs_daily": subs_daily,
             "views_28d": sum(int(r["n"]) for r in views_daily),
@@ -1102,6 +1168,8 @@ def _analytics_for(uid: int):
             "recent_comments": recent_comments,
             "recent_subscribers": recent_subscribers,
         }
+        cache_set(ckey, result, TTL_STUDIO_ANALYTICS)
+        return result
     except Exception:
         logger.exception("studio_analytics")
         return None
@@ -1143,8 +1211,14 @@ async def studio_init(api_key: str = Header(...)):
 @router.get("/channels")
 async def list_channels(q: str = "", sort: str = "popular", limit: int = 24, offset: int = 0,
                         actor: dict = Depends(get_actor)):
-    """Channels discover page: search + popular/newest."""
+    """Channels discover page: search + popular/newest. (cached per user + premium)"""
     limit = max(1, min(limit, 50))
+    offset = max(0, offset)
+    ckey = (f"channels:list:{actor['user_id']}:{int(bool(actor['is_premium']))}:"
+            f"{sort}:{q.strip().lower()}:{limit}:{offset}")
+    cached = cache_get(ckey)
+    if cached is not None:
+        return cached
     like = f"%{q.strip()}%" if q.strip() else None
     order = "c.id DESC" if sort == "new" else "subscriber_count DESC, video_count DESC, c.id DESC"
     rows = execute_query(f"""
@@ -1157,8 +1231,10 @@ async def list_channels(q: str = "", sort: str = "popular", limit: int = 24, off
         FROM channels c
         WHERE c.handle IS NOT NULL AND (%s::text IS NULL OR c.channel_name ILIKE %s OR c.handle ILIKE %s)
         ORDER BY {order} LIMIT %s OFFSET %s
-    """, (actor["is_premium"] or False, actor["user_id"], like, like, like, limit + 1, max(0, offset)), fetch=True) or []
-    return {"success": True, "has_more": len(rows) > limit, "channels": rows[:limit]}
+    """, (actor["is_premium"] or False, actor["user_id"], like, like, like, limit + 1, offset), fetch=True) or []
+    payload = {"success": True, "has_more": len(rows) > limit, "channels": rows[:limit]}
+    cache_set(ckey, payload, TTL_CHANNEL_LIST)
+    return payload
 
 
 @router.get("/channels/{handle}")
@@ -1190,6 +1266,10 @@ async def get_channel_videos(handle: str, sort: str = "latest", limit: int = 20,
     can_premium = actor["is_premium"] or _is_owner(actor, ch["user_id"])
     limit = max(1, min(limit, 50))
     offset = max(0, offset)
+    ckey = f"chvideos:{handle.lower()}:{sort}:{limit}:{offset}:{int(bool(can_premium))}"
+    cached = cache_get(ckey)
+    if cached is not None:
+        return cached
     where = "v.user_id = %s AND v.visibility = 'public'"
     if not can_premium and not SHOW_LOCKED_PREMIUM:
         where += " AND v.is_premium = false"
@@ -1201,7 +1281,9 @@ async def get_channel_videos(handle: str, sort: str = "latest", limit: int = 20,
     """, (ch["user_id"], limit + 1, offset), fetch=True) or []
     for r in rows:
         r["locked"] = bool(r["is_premium"] and not can_premium)
-    return {"success": True, "has_more": len(rows) > limit, "videos": rows[:limit]}
+    payload = {"success": True, "has_more": len(rows) > limit, "videos": rows[:limit]}
+    cache_set(ckey, payload, TTL_CHANNEL_VIDEOS)
+    return payload
 
 
 @router.post("/channels/{handle}/subscribe")
@@ -1216,6 +1298,8 @@ async def subscribe(handle: str, actor: dict = Depends(get_actor)):
                      ON CONFLICT DO NOTHING RETURNING subscriber_id""", (actor["user_id"], ch["user_id"]))
     if ins:
         await notify(ch["user_id"], "new_subscriber", actor["user_id"])
+    cache_del_prefix("channels:list:")
+    cache_del(f"studio:analytics:{ch['user_id']}")
     cnt = get_one("SELECT COUNT(*) AS n FROM subscriptions WHERE channel_user_id=%s", (ch["user_id"],))
     return {"success": True, "subscribed": True, "subscriber_count": cnt["n"] if cnt else 0}
 
@@ -1228,6 +1312,8 @@ async def unsubscribe(handle: str, actor: dict = Depends(get_actor)):
         raise HTTPException(404, "Channel not found")
     get_one("DELETE FROM subscriptions WHERE subscriber_id=%s AND channel_user_id=%s RETURNING subscriber_id",
             (actor["user_id"], ch["user_id"]))
+    cache_del_prefix("channels:list:")
+    cache_del(f"studio:analytics:{ch['user_id']}")
     cnt = get_one("SELECT COUNT(*) AS n FROM subscriptions WHERE channel_user_id=%s", (ch["user_id"],))
     return {"success": True, "subscribed": False, "subscriber_count": cnt["n"] if cnt else 0}
 
@@ -1718,6 +1804,7 @@ def _set_video_tags(video_id: int, tags_in: List[str]) -> List[dict]:
     for tid in (old_ids | new_ids):
         _recount_tag(tid)
 
+    cache_del_prefix("tags:")  # popular / autocomplete counts badal gaye
     return _get_video_tags(video_id)
 
 
@@ -1742,12 +1829,18 @@ def _video_owned_by(viewkey: str, uid: int) -> Optional[dict]:
 @router.get("/tags/popular")
 async def tags_popular(limit: int = 30):
     limit = max(1, min(limit, 100))
+    ckey = f"tags:popular:{limit}"
+    cached = cache_get(ckey)
+    if cached is not None:
+        return cached
     rows = execute_query("""
         SELECT id, name, slug, usage_count FROM tags
         WHERE usage_count > 0
         ORDER BY usage_count DESC, name ASC LIMIT %s
     """, (limit,), fetch=True) or []
-    return {"success": True, "tags": rows}
+    payload = {"success": True, "tags": rows}
+    cache_set(ckey, payload, TTL_TAGS)
+    return payload
 
 
 @router.get("/tags/autocomplete")
@@ -1756,22 +1849,32 @@ async def tags_autocomplete(q: str = "", limit: int = 10):
     if len(q) < 1:
         return {"success": True, "tags": []}
     limit = max(1, min(limit, 20))
+    ckey = f"tags:ac:{q}:{limit}"
+    cached = cache_get(ckey)
+    if cached is not None:
+        return cached
     rows = execute_query("""
         SELECT id, name, slug, usage_count FROM tags
         WHERE LOWER(name) LIKE %s OR slug LIKE %s
         ORDER BY usage_count DESC, name ASC LIMIT %s
     """, (f"%{q}%", f"{q}%", limit), fetch=True) or []
-    return {"success": True, "tags": rows}
+    payload = {"success": True, "tags": rows}
+    cache_set(ckey, payload, TTL_TAG_AC)
+    return payload
 
 
 @router.get("/tags/{slug}/videos")
 async def videos_by_tag(slug: str, limit: int = 20, offset: int = 0,
                         actor: dict = Depends(get_actor)):
+    limit = max(1, min(limit, 50))
+    offset = max(0, offset)
+    ckey = f"tagvideos:{slug.lower()}:{limit}:{offset}:{int(bool(actor['is_premium']))}"
+    cached = cache_get(ckey)
+    if cached is not None:
+        return cached
     tag = get_one("SELECT id, name FROM tags WHERE slug = %s", (slug.lower(),))
     if not tag:
         raise HTTPException(404, "Tag not found")
-    limit = max(1, min(limit, 50))
-    offset = max(0, offset)
     rows = execute_query("""
         SELECT v.id, v.title, v.viewkey, v.thumbnail, v.category, v.is_premium,
                v.views, v.duration, v.uploaded_at,
@@ -1787,8 +1890,10 @@ async def videos_by_tag(slug: str, limit: int = 20, offset: int = 0,
         ORDER BY v.views DESC, v.uploaded_at DESC
         LIMIT %s OFFSET %s
     """, (tag["id"], actor["is_premium"] or False, limit + 1, offset), fetch=True) or []
-    return {"success": True, "tag": tag,
-            "has_more": len(rows) > limit, "videos": rows[:limit]}
+    payload = {"success": True, "tag": tag,
+               "has_more": len(rows) > limit, "videos": rows[:limit]}
+    cache_set(ckey, payload, TTL_TAG_VIDEOS)
+    return payload
 
 
 @router.get("/videos/{viewkey}/tags")
@@ -1807,6 +1912,7 @@ async def video_tags_set(viewkey: str, body: TagsForVideoIn,
     if not v:
         raise HTTPException(404, "Video not found or not yours")
     tags = _set_video_tags(v["id"], body.tags)
+    _invalidate_video_caches()  # search / related / tag-videos tags par depend karte hain
     return {"success": True, "tags": tags}
 
 
@@ -1824,6 +1930,10 @@ async def smart_search(
 
     limit = max(1, min(limit, 50))
     offset = max(0, offset)
+    ckey = f"search:{q.lower()}:{sort}:{limit}:{offset}:{int(bool(actor['is_premium']))}"
+    cached = cache_get(ckey)
+    if cached is not None:
+        return cached
     like = f"%{q.lower()}%"
     prefix = f"{q.lower()}%"
 
@@ -1893,21 +2003,27 @@ async def smart_search(
         limit + 1, offset,
     ), fetch=True) or []
 
-    return {
+    payload = {
         "success": True,
         "query": q,
         "has_more": len(rows) > limit,
         "videos": rows[:limit],
     }
+    cache_set(ckey, payload, TTL_SEARCH)
+    return payload
 
 
 @router.get("/videos/{viewkey}/related")
 async def related_videos(viewkey: str, limit: int = 12,
                          actor: dict = Depends(get_actor)):
+    limit = max(1, min(limit, 30))
+    ckey = f"related:{viewkey}:{limit}:{int(bool(actor['is_premium']))}"
+    cached = cache_get(ckey)
+    if cached is not None:
+        return cached
     v = get_one("SELECT id, user_id, category FROM videos WHERE viewkey = %s", (viewkey,))
     if not v:
         raise HTTPException(404, "Video not found")
-    limit = max(1, min(limit, 30))
     rows = execute_query("""
         WITH my_tags AS (
             SELECT tag_id FROM video_tags WHERE video_id = %s
@@ -1939,7 +2055,9 @@ async def related_videos(viewkey: str, limit: int = 12,
         LIMIT %s
     """, (v["id"], v["category"], v["category"], v["user_id"], v["id"],
           actor["is_premium"] or False, limit), fetch=True) or []
-    return {"success": True, "videos": rows}
+    payload = {"success": True, "videos": rows}
+    cache_set(ckey, payload, TTL_RELATED)
+    return payload
 
 
 # =====================================================================
@@ -2210,22 +2328,32 @@ async def ensure_watch_later(actor: dict = Depends(get_actor)):
 # =====================================================================
 @router.get("/plans")
 async def list_plans():
+    cached = cache_get("plans:list")
+    if cached is not None:
+        return cached
     rows = execute_query("""
         SELECT id, code, name, description, price_pkr, price_usd,
                duration_days, features, sort_order
         FROM plans WHERE is_active = true
         ORDER BY sort_order ASC, id ASC
     """, fetch=True) or []
-    return {"success": True, "plans": rows}
+    payload = {"success": True, "plans": rows}
+    cache_set("plans:list", payload, TTL_PLANS)
+    return payload
 
 
 @router.get("/ad-pricing")
 async def list_ad_pricing():
+    cached = cache_get("adpricing:list")
+    if cached is not None:
+        return cached
     rows = execute_query("""
         SELECT id, model, price_pkr, price_usd, min_budget
         FROM ad_pricing WHERE is_active = true ORDER BY model ASC
     """, fetch=True) or []
-    return {"success": True, "pricing": rows}
+    payload = {"success": True, "pricing": rows}
+    cache_set("adpricing:list", payload, TTL_PLANS)
+    return payload
 
 
 @router.post("/payments/submit")
@@ -2778,6 +2906,7 @@ async def admin_edit_plan(plan_id: int, body: PlanEditIn,
         """, (*fields.values(), plan_id))
     if not row:
         raise HTTPException(404, "Plan not found")
+    cache_del("plans:list")
     return {"success": True, "plan": row}
 
 
@@ -2804,6 +2933,7 @@ async def admin_edit_ad_pricing(model: str, body: AdPricingEditIn,
     """, (*fields.values(), model))
     if not row:
         raise HTTPException(404, "Pricing not found")
+    cache_del("adpricing:list")
     return {"success": True, "pricing": row}
 
 
@@ -2914,7 +3044,7 @@ def _ad_campaign_owned(campaign_id: int, uid: int) -> Optional[dict]:
 
 
 # =====================================================================
-#  AD CENTER — USER WALLET
+#  AD CENTER — USER WALLET  (money related: kabhi cache nahi)
 # =====================================================================
 @router.get("/ads/wallet")
 async def ad_wallet(actor: dict = Depends(get_actor)):
@@ -3289,7 +3419,7 @@ async def ad_creative_delete(creative_id: int, actor: dict = Depends(get_actor))
 
 
 # =====================================================================
-#  AD CENTER — SERVING
+#  AD CENTER — SERVING  (NOT cached: har impression ka paisa katta hai)
 # =====================================================================
 def _ad_pick_for_video(video_id: int, video_category: str, video_tags: list):
     rows = execute_query("""
