@@ -7,6 +7,8 @@ import logging
 import os
 import re
 import time
+from collections import defaultdict, deque
+from threading import Lock
 from datetime import datetime, timedelta
 from typing import Optional, List
 
@@ -47,6 +49,37 @@ SHOW_LOCKED_PREMIUM = False
 
 
 # =====================================================================
+#  RATE LIMITING (in-memory, thread-safe)
+# =====================================================================
+_rate_buckets: dict = defaultdict(deque)
+_rate_lock = Lock()
+
+
+def rate_limit(key: str, max_calls: int, window_sec: int) -> bool:
+    """True = allowed. False = blocked. Per-worker in-memory."""
+    now = time.time()
+    cutoff = now - window_sec
+    with _rate_lock:
+        bucket = _rate_buckets[key]
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        if len(bucket) >= max_calls:
+            return False
+        bucket.append(now)
+        if len(_rate_buckets) > 10000:
+            for k in list(_rate_buckets.keys())[:1000]:
+                _rate_buckets.pop(k, None)
+    return True
+
+
+def _ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "?"
+
+
+# =====================================================================
 #  AUTH HELPERS
 # =====================================================================
 def _b64(b: bytes) -> str:
@@ -79,12 +112,10 @@ def read_token(token: Optional[str]) -> Optional[int]:
 
 
 def hash_password(password: str) -> str:
-    """Hash a password using SHA-256"""
     return hashlib.sha256(password.encode()).hexdigest()
 
 
 def validate_api_key(api_key: str, endpoint: str = None, method: str = "GET"):
-    """Validate API key, return user data. If endpoint is given, the call is logged."""
     try:
         query = """
             SELECT a.*, a.id as key_id, u.id as user_id, u.name, u.email, u.is_premium
@@ -103,7 +134,6 @@ def validate_api_key(api_key: str, endpoint: str = None, method: str = "GET"):
 
 
 def track_usage(key_row, endpoint: str, method: str = "GET"):
-    """Save one API call for analytics. Never breaks the main request."""
     try:
         get_one("INSERT INTO api_usage (api_key_id, user_id, endpoint, method) VALUES (%s,%s,%s,%s) RETURNING id",
                 (key_row["key_id"], key_row["user_id"], endpoint, method))
@@ -221,7 +251,10 @@ async def home():
 @router.post("/login")
 async def login(user: UserLogin, request: Request):
     try:
-        ip = request.client.host if request.client else "?"
+        ip = _ip(request)
+        if not rate_limit(f"login:{ip}", 10, 60):
+            return {"success": False, "message": "Too many attempts. Try again in a minute."}
+
         throttle_key = f"{ip}|{(user.email or '').lower()}"
         if _login_blocked(throttle_key):
             return {"success": False, "message": "Too many attempts. Please try again in a few minutes."}
@@ -254,8 +287,12 @@ async def login(user: UserLogin, request: Request):
 
 
 @router.post("/register")
-async def register(user: UserCreate):
+async def register(user: UserCreate, request: Request):
     try:
+        ip = _ip(request)
+        if not rate_limit(f"register:{ip}", 5, 3600):
+            return {"success": False, "message": "Too many registrations. Try again later."}
+
         if get_one("SELECT id FROM mydata WHERE email = %s", (user.email,)):
             return {"success": False, "message": "User with this email already exists"}
 
@@ -307,10 +344,6 @@ async def update_profile(p: ProfileIn, actor: dict = Depends(get_actor)):
     return {"success": True, "user": row}
 
 
-# ---------------------------------------------------------------------
-#  FIX 3: PUT /profile/update  aur  PUT /profile/password
-#  Legacy-safe (current password verify), ApiDashboard.jsx in dono ko call karta hai.
-# ---------------------------------------------------------------------
 class ProfileUpdateIn(BaseModel):
     user_id: int
     name: Optional[str] = None
@@ -328,8 +361,7 @@ class PasswordChangeIn(BaseModel):
 
 
 def _verify_password(user_id: int, password: str, request: Request):
-    """Password sahi ho to user row, warna None. Brute-force guard ke saath."""
-    ip = request.client.host if request.client else "?"
+    ip = _ip(request)
     key = f"pw|{ip}|{user_id}"
     if _login_blocked(key):
         raise HTTPException(429, "Too many attempts. Please try again in a few minutes.")
@@ -402,7 +434,7 @@ async def profile_password(p: PasswordChangeIn, request: Request, actor: dict = 
 
 
 # =====================================================================
-#  CLOUDINARY (2nd account) - signed upload
+#  CLOUDINARY (2nd account) — signed upload
 # =====================================================================
 UPLOAD_PURPOSES = {
     "avatar":   {"folder": "profiles", "type": "image", "formats": "jpg,jpeg,png,webp", "admin": False},
@@ -410,6 +442,8 @@ UPLOAD_PURPOSES = {
     "banner":   {"folder": "banners",  "type": "image", "formats": "jpg,jpeg,png,webp", "admin": False},
     "ad_image": {"folder": "ads",      "type": "image", "formats": "jpg,jpeg,png,webp,gif", "admin": True},
     "ad_video": {"folder": "ads",      "type": "video", "formats": "mp4,webm,mov", "admin": True},
+    "ad_creative_image": {"folder": "ads/creatives", "type": "image", "formats": "jpg,jpeg,png,webp,gif", "admin": False},
+    "ad_creative_video": {"folder": "ads/creatives", "type": "video", "formats": "mp4,webm,mov", "admin": False},
 }
 
 
@@ -443,7 +477,7 @@ async def sign_upload(body: SignIn, actor: dict = Depends(get_actor)):
 
 
 # =====================================================================
-#  ADMIN: ADS
+#  ADMIN: LEGACY ADS (ads_table)
 # =====================================================================
 class AdIn(BaseModel):
     ad_name: str
@@ -491,7 +525,6 @@ async def admin_delete_ad(ad_id: int, actor: dict = Depends(get_actor)):
 #  API KEYS
 # =====================================================================
 def _authorize_user_id(actor: dict, user_id: int):
-    """Token wala user sirf apni hi id use kar sakta hai. Legacy mode me purana behaviour."""
     if actor["user_id"] and actor["verified"]:
         if actor["user_id"] != user_id:
             raise HTTPException(403, "Not allowed")
@@ -505,6 +538,8 @@ def _authorize_user_id(actor: dict, user_id: int):
 async def generate_api_key(request: APIKeyRequest, actor: dict = Depends(get_actor)):
     try:
         _authorize_user_id(actor, request.user_id)
+        if not rate_limit(f"apikeygen:{request.user_id}", 5, 3600):
+            return {"success": False, "message": "Too many API key requests. Try again later."}
         user_exists = get_one("SELECT * FROM mydata WHERE id = %s", (request.user_id,))
         if not user_exists:
             return {"success": False, "message": "User not found"}
@@ -535,8 +570,6 @@ async def generate_api_key(request: APIKeyRequest, actor: dict = Depends(get_act
 async def list_user_apikeys(user_id: int, actor: dict = Depends(get_actor)):
     try:
         _authorize_user_id(actor, user_id)
-        # FIX 1: request_count aur last_used_at bhi bhejein taake frontend me
-        # "Total requests" aur "Last used" sahi dikhein.
         results = execute_query("""
             SELECT id, user_id, api_key, created_at, expiry_date,
                    COALESCE(request_count, 0) AS request_count, last_used_at
@@ -568,13 +601,9 @@ async def delete_apikey(api_key: str, actor: dict = Depends(get_actor)):
         return {"success": False, "message": "Database error"}
 
 
-# ---------------------------------------------------------------------
-#  FIX 2: GET /analytics  (Developer Console > Analytics tab)
-#  Response shape wahi jo ApiDashboard.jsx expect karta hai.
-# ---------------------------------------------------------------------
 @router.get("/analytics")
 async def api_analytics(api_key: str = Header(...)):
-    k = validate_api_key(api_key)          # endpoint nahi diya => ye call khud count nahi hoti
+    k = validate_api_key(api_key)
     if not k:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired API key")
     uid = k["user_id"]
@@ -621,7 +650,7 @@ async def api_analytics(api_key: str = Header(...)):
 # =====================================================================
 @router.get("/videos")
 async def get_videos():
-    """Free PUBLIC videos. No login needed. FIX 6: channel info bhi aati hai."""
+    """Free PUBLIC videos. No login needed."""
     try:
         results = execute_query("""
             SELECT v.*,
@@ -642,7 +671,6 @@ async def get_videos():
 
 @router.get("/premium_videos")
 async def get_premium_videos(api_key: str = Header(...)):
-    """Premium PUBLIC videos - valid API key + ACTIVE premium account zaroori. FIX 6: channel info."""
     user_data = validate_api_key(api_key, "/premium_videos")
     if not user_data:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired API key")
@@ -675,7 +703,6 @@ async def get_premium_videos(api_key: str = Header(...)):
 
 @router.post("/upload_videos")
 async def upload_video(video: Video, api_key: str = Header(...)):
-    """Old upload endpoint (API key)."""
     user_data = validate_api_key(api_key, "/upload_videos", "POST")
     if not user_data:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired API key")
@@ -701,7 +728,6 @@ async def upload_video(video: Video, api_key: str = Header(...)):
 
 @router.get("/videos/{viewkey}")
 async def get_video_by_key(viewkey: str, actor: dict = Depends(get_actor)):
-    """Single video. FIX 5: is_own_channel bhi bhejta hai."""
     try:
         row = get_one("""
             SELECT v.*,
@@ -729,7 +755,6 @@ async def get_video_by_key(viewkey: str, actor: dict = Depends(get_actor)):
         else:
             row["locked"] = False
 
-        # FIX 5: apna hi video ho to frontend Subscribe button chupa sake
         row["is_own_channel"] = bool(actor["user_id"] and actor["user_id"] == row.get("user_id"))
 
         return {"success": True, "video": row}
@@ -742,8 +767,9 @@ async def get_video_by_key(viewkey: str, actor: dict = Depends(get_actor)):
 
 @router.post("/videos/{viewkey}/like")
 async def toggle_video_like(viewkey: str, actor: dict = Depends(get_actor)):
-    """Video like / unlike. Login zaroori."""
     need_login(actor)
+    if not rate_limit(f"like:{actor['user_id']}", 30, 60):
+        raise HTTPException(429, "Too many likes. Slow down.")
     v = get_one("SELECT id, user_id, is_premium, visibility FROM videos WHERE viewkey=%s", (viewkey,))
     if not v or not _can_view_video(v, actor):
         raise HTTPException(404, "Video not found")
@@ -761,7 +787,7 @@ async def toggle_video_like(viewkey: str, actor: dict = Depends(get_actor)):
 
 
 # =====================================================================
-#  PLAYLISTS
+#  PLAYLISTS (LEGACY — videos_of_playlist based)
 # =====================================================================
 PLAYLIST_SELECT = """
     SELECT p.playlist_id, p.playlist_name, p.playlist_type, p.total_videos,
@@ -805,8 +831,16 @@ async def get_playlists(actor: dict = Depends(get_actor)):
         raise HTTPException(500, "Failed to retrieve playlists")
 
 
+# IMPORTANT: specific routes PEHLE, phir dynamic route
+# Ye line FastAPI ke route-matching order ko preserve karti hai
+
+
 @router.get("/playlists/{playlist_id}")
-async def get_playlist(playlist_id: int, actor: dict = Depends(get_actor)):
+async def get_playlist(playlist_id: str, actor: dict = Depends(get_actor)):
+    # Safety: non-numeric IDs (jaise "my") ko gracefully handle karo
+    if not playlist_id.isdigit():
+        raise HTTPException(404, "Playlist not found")
+    playlist_id = int(playlist_id)
     if playlist_id <= 0:
         raise HTTPException(400, "Invalid playlist ID")
     try:
@@ -832,7 +866,7 @@ async def health_check():
 
 @router.get("/ads")
 async def get_ads():
-    """Random ads: 2 image + 1 video. No login needed."""
+    """Legacy random ads: 2 image + 1 video."""
     try:
         image_ads = execute_query("""
             SELECT id, ad_name, promotion_link, ad_type, link
@@ -847,8 +881,6 @@ async def get_ads():
     except Exception:
         logger.exception("Error while retrieving ads")
         raise HTTPException(500, "Failed to retrieve ads")
-
-
 # =====================================================================
 #  CREATOR STUDIO
 # =====================================================================
@@ -996,7 +1028,7 @@ _recent_views = {}
 @router.post("/studio/view/{viewkey}")
 async def studio_count_view(viewkey: str, request: Request):
     """Viewer page 5 second playback ke baad call karta hai. Same IP + video 30 min me ek dafa count hota hai."""
-    ip = request.client.host if request.client else "unknown"
+    ip = _ip(request)
     now = time.time()
     k = (ip, viewkey)
     if now - _recent_views.get(k, 0) < 1800:
@@ -1012,9 +1044,6 @@ async def studio_count_view(viewkey: str, request: Request):
     return {"success": True, "counted": True, "views": row["views"]}
 
 
-# ---------------------------------------------------------------------
-#  Studio Analytics: internal helper (dono /studio/analytics aur /studio/init use karte hain)
-# ---------------------------------------------------------------------
 def _analytics_for(uid: int):
     """28 din ka analytics dict, ya error par None."""
     try:
@@ -1080,19 +1109,16 @@ def _analytics_for(uid: int):
 
 @router.get("/studio/analytics")
 async def studio_analytics(api_key: str = Header(...)):
-    u = current_user(api_key)               # tracking off: dashboard baar baar refresh hota hai
+    u = current_user(api_key)
     a = _analytics_for(u["user_id"])
     if a:
         return {"success": True, "analytics": a}
     return {"success": False, "message": "Could not load analytics"}
 
 
-# ---------------------------------------------------------------------
-#  FIX 4: /studio/init — dashboard ke liye sirf EK request (4 ki jagah)
-# ---------------------------------------------------------------------
 @router.get("/studio/init")
 async def studio_init(api_key: str = Header(...)):
-    u = current_user(api_key)               # tracking off
+    u = current_user(api_key)
     uid = u["user_id"]
     channel = get_one("SELECT * FROM channels WHERE user_id=%s", (uid,))
     stats = get_one("""
@@ -1114,9 +1140,29 @@ async def studio_init(api_key: str = Header(...)):
 # =====================================================================
 #  CHANNELS + SUBSCRIPTIONS
 # =====================================================================
+@router.get("/channels")
+async def list_channels(q: str = "", sort: str = "popular", limit: int = 24, offset: int = 0,
+                        actor: dict = Depends(get_actor)):
+    """Channels discover page: search + popular/newest."""
+    limit = max(1, min(limit, 50))
+    like = f"%{q.strip()}%" if q.strip() else None
+    order = "c.id DESC" if sort == "new" else "subscriber_count DESC, video_count DESC, c.id DESC"
+    rows = execute_query(f"""
+        SELECT c.user_id, c.channel_name, c.handle, c.avatar_url, c.description,
+               (SELECT COUNT(*) FROM subscriptions s WHERE s.channel_user_id = c.user_id) AS subscriber_count,
+               (SELECT COUNT(*) FROM videos v WHERE v.user_id = c.user_id AND v.visibility = 'public'
+                       AND (%s::boolean OR v.is_premium = false)) AS video_count,
+               EXISTS(SELECT 1 FROM subscriptions s2
+                      WHERE s2.channel_user_id = c.user_id AND s2.subscriber_id = %s::int) AS is_subscribed
+        FROM channels c
+        WHERE c.handle IS NOT NULL AND (%s::text IS NULL OR c.channel_name ILIKE %s OR c.handle ILIKE %s)
+        ORDER BY {order} LIMIT %s OFFSET %s
+    """, (actor["is_premium"] or False, actor["user_id"], like, like, like, limit + 1, max(0, offset)), fetch=True) or []
+    return {"success": True, "has_more": len(rows) > limit, "channels": rows[:limit]}
+
+
 @router.get("/channels/{handle}")
 async def get_channel(handle: str, actor: dict = Depends(get_actor)):
-    """Public channel page data. FIX 5: is_own bhi bhejta hai."""
     row = get_one("""
         SELECT c.*,
                (SELECT COUNT(*) FROM subscriptions s WHERE s.channel_user_id = c.user_id) AS subscriber_count,
@@ -1131,7 +1177,6 @@ async def get_channel(handle: str, actor: dict = Depends(get_actor)):
     if not row:
         raise HTTPException(404, "Channel not found")
     row["is_owner"] = _is_owner(actor, row["user_id"])
-    # FIX 5: apna channel ho to Subscribe button chupa sake
     row["is_own"] = bool(actor["user_id"] and actor["user_id"] == row["user_id"])
     return {"success": True, "channel": row}
 
@@ -1139,7 +1184,6 @@ async def get_channel(handle: str, actor: dict = Depends(get_actor)):
 @router.get("/channels/{handle}/videos")
 async def get_channel_videos(handle: str, sort: str = "latest", limit: int = 20, offset: int = 0,
                              actor: dict = Depends(get_actor)):
-    """Channel ki videos. Free user ko premium videos nahi milti."""
     ch = get_one("SELECT user_id FROM channels WHERE handle=%s", (handle.lower(),))
     if not ch:
         raise HTTPException(404, "Channel not found")
@@ -1190,7 +1234,6 @@ async def unsubscribe(handle: str, actor: dict = Depends(get_actor)):
 
 @router.get("/channels/{handle}/subscribers")
 async def channel_subscribers(handle: str, limit: int = 50, offset: int = 0, actor: dict = Depends(get_actor)):
-    """Subscribers ki list sirf channel owner dekh sakta hai (token zaroori)."""
     need_verified(actor)
     ch = get_one("SELECT user_id FROM channels WHERE handle=%s", (handle.lower(),))
     if not ch:
@@ -1225,7 +1268,6 @@ async def my_subscriptions(actor: dict = Depends(get_actor)):
 
 @router.get("/me/subscriptions/feed")
 async def my_subscription_feed(limit: int = 20, offset: int = 0, actor: dict = Depends(get_actor)):
-    """Subscribed channels ki latest videos (premium sirf premium user ko)."""
     need_login(actor)
     limit = max(1, min(limit, 50))
     rows = execute_query("""
@@ -1394,9 +1436,12 @@ class ReadIn(BaseModel):
 @router.post("/notifications/read")
 async def mark_read(body: ReadIn, actor: dict = Depends(get_actor)):
     need_verified(actor)
-    get_one("""UPDATE notifications SET is_read = true
-               WHERE user_id = %s AND (%s::int[] IS NULL OR id = ANY(%s::int[])) RETURNING id""",
-            (actor["user_id"], body.ids, body.ids))
+    if body.ids:
+        execute_query("UPDATE notifications SET is_read = true WHERE user_id = %s AND id = ANY(%s)",
+                      (actor["user_id"], body.ids), fetch=False)
+    else:
+        execute_query("UPDATE notifications SET is_read = true WHERE user_id = %s",
+                      (actor["user_id"],), fetch=False)
     unread = get_one("SELECT COUNT(*) AS n FROM notifications WHERE user_id=%s AND is_read=false", (actor["user_id"],))
     return {"success": True, "unread": unread["n"] if unread else 0}
 
@@ -1508,6 +1553,8 @@ async def get_replies(comment_id: int, actor: dict = Depends(get_actor)):
 async def post_comment(viewkey: str, body: CommentIn, actor: dict = Depends(get_actor)):
     need_login(actor)
     uid = actor["user_id"]
+    if not rate_limit(f"comment:{uid}", 5, 60):
+        return {"success": False, "message": "You are commenting too fast. Please wait."}
     video = _comment_video(viewkey, actor)
 
     text = (body.content or "").strip()
@@ -1566,6 +1613,8 @@ async def toggle_comment_like(comment_id: int, actor: dict = Depends(get_actor))
     uid, vid = actor["user_id"], actor["visitor_id"]
     if not uid and not vid:
         raise HTTPException(400, "Missing visitor id")
+    if uid and not rate_limit(f"clike:{uid}", 30, 60):
+        raise HTTPException(429, "Too many likes. Slow down.")
     c = get_one("""SELECT c.id, c.user_id, c.video_id, v.user_id AS vo, v.is_premium, v.visibility
                    FROM comments c JOIN videos v ON v.id = c.video_id WHERE c.id=%s""", (comment_id,))
     if not c or not _can_view_video({"user_id": c["vo"], "is_premium": c["is_premium"],
@@ -1592,51 +1641,24 @@ async def toggle_comment_like(comment_id: int, actor: dict = Depends(get_actor))
             await notify(c["user_id"], "comment_like", uid, video_id=c["video_id"], comment_id=comment_id)
         else:
             _drop_notification(c["user_id"], "comment_like", uid, video_id=c["video_id"], comment_id=comment_id)
-# =====================================================================
-#  Is poore block ko apni routes.py ke BILKUL END me paste kar dein.
-#  (Naye imports ki zarorat nahi. Aap ki baqi file/fixes bilkul untouched rehti hain.)
-#  Ye Channels page aur navbar search ke channel suggestions ke liye hai.
-# =====================================================================
 
-@router.get("/channels")
-async def list_channels(q: str = "", sort: str = "popular", limit: int = 24, offset: int = 0,
-                        actor: dict = Depends(get_actor)):
-    """Channels discover page: search + popular/newest. Login nahi chahiye."""
-    limit = max(1, min(limit, 50))
-    like = f"%{q.strip()}%" if q.strip() else None
-    order = "c.id DESC" if sort == "new" else "subscriber_count DESC, video_count DESC, c.id DESC"
-    rows = execute_query(f"""
-        SELECT c.user_id, c.channel_name, c.handle, c.avatar_url, c.description,
-               (SELECT COUNT(*) FROM subscriptions s WHERE s.channel_user_id = c.user_id) AS subscriber_count,
-               (SELECT COUNT(*) FROM videos v WHERE v.user_id = c.user_id AND v.visibility = 'public'
-                       AND (%s::boolean OR v.is_premium = false)) AS video_count,
-               EXISTS(SELECT 1 FROM subscriptions s2
-                      WHERE s2.channel_user_id = c.user_id AND s2.subscriber_id = %s::int) AS is_subscribed
-        FROM channels c
-        WHERE c.handle IS NOT NULL AND (%s::text IS NULL OR c.channel_name ILIKE %s OR c.handle ILIKE %s)
-        ORDER BY {order} LIMIT %s OFFSET %s
-    """, (actor["is_premium"] or False, actor["user_id"], like, like, like, limit + 1, max(0, offset)), fetch=True) or []
-    return {"success": True, "has_more": len(rows) > limit, "channels": rows[:limit]}
     cnt = get_one("SELECT COUNT(*) AS n FROM comment_likes WHERE comment_id=%s", (comment_id,))
     return {"success": True, "liked": liked, "likes": cnt["n"] if cnt else 0}
-# =====================================================================
-#  PART 1: TAGS + SMART SEARCH + CUSTOM PLAYLISTS
-#  routes.py ke end me paste karo. Purane endpoints untouched.
-# =====================================================================
-import re as _re  # local, safe
 
 
-# ---------- TAG HELPERS ----------
+# =====================================================================
+#  PART 1: TAGS + SMART SEARCH + RELATED
+# =====================================================================
+import re as _re
+
 
 def _slugify(s: str) -> str:
-    """URL-safe slug: 'Python Tutorial!' -> 'python-tutorial'"""
     s = (s or "").strip().lower()
     s = _re.sub(r"[^a-z0-9]+", "-", s)
     return s.strip("-")[:60] or "tag"
 
 
 def _normalize_tag(raw: str) -> Optional[str]:
-    """Ek tag ko clean karo. Invalid -> None."""
     t = (raw or "").strip().lower()
     t = _re.sub(r"\s+", " ", t)
     if not (2 <= len(t) <= 30):
@@ -1647,7 +1669,6 @@ def _normalize_tag(raw: str) -> Optional[str]:
 
 
 def _upsert_tag(name: str) -> Optional[int]:
-    """Tag insert ya get karo, id return."""
     slug = _slugify(name)
     row = get_one("""
         INSERT INTO tags (name, slug) VALUES (%s, %s)
@@ -1658,7 +1679,6 @@ def _upsert_tag(name: str) -> Optional[int]:
 
 
 def _recount_tag(tag_id: int):
-    """usage_count recompute (denormalized)."""
     get_one("""
         UPDATE tags SET usage_count = (
             SELECT COUNT(*) FROM video_tags WHERE tag_id = %s
@@ -1667,7 +1687,6 @@ def _recount_tag(tag_id: int):
 
 
 def _set_video_tags(video_id: int, tags_in: List[str]) -> List[dict]:
-    """Video ke tags replace karo. Auto-clean, dedupe, max 15."""
     cleaned = []
     seen = set()
     for raw in (tags_in or [])[:30]:
@@ -1678,11 +1697,9 @@ def _set_video_tags(video_id: int, tags_in: List[str]) -> List[dict]:
         if len(cleaned) >= 15:
             break
 
-    # purane tags hatao
     old = execute_query("SELECT tag_id FROM video_tags WHERE video_id = %s", (video_id,), fetch=True) or []
     old_ids = {r["tag_id"] for r in old}
 
-    # naye tags attach karo
     new_ids = set()
     for name in cleaned:
         tid = _upsert_tag(name)
@@ -1693,13 +1710,11 @@ def _set_video_tags(video_id: int, tags_in: List[str]) -> List[dict]:
                 ON CONFLICT DO NOTHING RETURNING video_id
             """, (video_id, tid))
 
-    # jo purane tags ab use nahi ho rahe unko hata do
     to_remove = old_ids - new_ids
     if to_remove:
         execute_query("DELETE FROM video_tags WHERE video_id = %s AND tag_id = ANY(%s)",
                       (video_id, list(to_remove)), fetch=False)
 
-    # sab affected tags ka count refresh
     for tid in (old_ids | new_ids):
         _recount_tag(tid)
 
@@ -1724,11 +1739,8 @@ def _video_owned_by(viewkey: str, uid: int) -> Optional[dict]:
     return v
 
 
-# ---------- TAG ENDPOINTS ----------
-
 @router.get("/tags/popular")
 async def tags_popular(limit: int = 30):
-    """Top tags — frontend me trending tags dikhane ke liye."""
     limit = max(1, min(limit, 100))
     rows = execute_query("""
         SELECT id, name, slug, usage_count FROM tags
@@ -1740,7 +1752,6 @@ async def tags_popular(limit: int = 30):
 
 @router.get("/tags/autocomplete")
 async def tags_autocomplete(q: str = "", limit: int = 10):
-    """Search box me type karte waqt suggestions."""
     q = (q or "").strip().lower()
     if len(q) < 1:
         return {"success": True, "tags": []}
@@ -1756,7 +1767,6 @@ async def tags_autocomplete(q: str = "", limit: int = 10):
 @router.get("/tags/{slug}/videos")
 async def videos_by_tag(slug: str, limit: int = 20, offset: int = 0,
                         actor: dict = Depends(get_actor)):
-    """Ek tag ke videos. Free user ko premium wale nahi milte."""
     tag = get_one("SELECT id, name FROM tags WHERE slug = %s", (slug.lower(),))
     if not tag:
         raise HTTPException(404, "Tag not found")
@@ -1792,7 +1802,6 @@ async def video_tags_get(viewkey: str):
 @router.post("/videos/{viewkey}/tags")
 async def video_tags_set(viewkey: str, body: TagsForVideoIn,
                          actor: dict = Depends(get_actor)):
-    """Video owner apne video ke tags set kare."""
     need_verified(actor)
     v = _video_owned_by(viewkey, actor["user_id"])
     if not v:
@@ -1801,22 +1810,14 @@ async def video_tags_set(viewkey: str, body: TagsForVideoIn,
     return {"success": True, "tags": tags}
 
 
-# ---------- SMART SEARCH ----------
-
 @router.get("/search")
 async def smart_search(
     q: str = "",
-    sort: str = "relevance",     # relevance | latest | popular
+    sort: str = "relevance",
     limit: int = 20,
     offset: int = 0,
     actor: dict = Depends(get_actor),
 ):
-    """
-    Unified search: title + description + tags + channel name.
-    Ranking:
-      - title match > tag match > description match > channel match
-      - plus views & freshness bonus
-    """
     q = (q or "").strip()
     if len(q) < 2:
         return {"success": True, "query": q, "total": 0, "has_more": False, "videos": []}
@@ -1831,7 +1832,6 @@ async def smart_search(
         "popular": "v.views DESC, v.uploaded_at DESC",
     }.get(sort, "rank_score DESC, v.views DESC")
 
-    # NOTE: PostgreSQL me aliases HAVING/ORDER me use kar sakte hain yahan.
     rows = execute_query(f"""
         WITH matched AS (
             SELECT
@@ -1883,13 +1883,13 @@ async def smart_search(
         ORDER BY {order_sql}
         LIMIT %s OFFSET %s
     """, (
-        prefix, like,           # title rank (2)
-        like, prefix,           # tag rank (2)
-        like,                   # desc rank
-        like,                   # channel rank
+        prefix, like,
+        like, prefix,
+        like,
+        like,
         actor["is_premium"] or False,
-        like, like, like,       # WHERE clauses
-        like, prefix,           # WHERE tag
+        like, like, like,
+        like, prefix,
         limit + 1, offset,
     ), fetch=True) or []
 
@@ -1901,12 +1901,9 @@ async def smart_search(
     }
 
 
-# ---------- RELATED VIDEOS (tag-based) ----------
-
 @router.get("/videos/{viewkey}/related")
 async def related_videos(viewkey: str, limit: int = 12,
                          actor: dict = Depends(get_actor)):
-    """Same tags > same category > same channel. Ranked."""
     v = get_one("SELECT id, user_id, category FROM videos WHERE viewkey = %s", (viewkey,))
     if not v:
         raise HTTPException(404, "Video not found")
@@ -1945,8 +1942,9 @@ async def related_videos(viewkey: str, limit: int = 12,
     return {"success": True, "videos": rows}
 
 
-# ---------- CUSTOM PLAYLISTS ----------
-
+# =====================================================================
+#  CUSTOM PLAYLISTS v2 (user playlists)
+# =====================================================================
 _PL2_COLS = ("id, user_id, title, description, thumbnail, visibility, "
              "is_system, created_at, updated_at")
 
@@ -1964,8 +1962,9 @@ def _pl2_own(pl_id: int, uid: int) -> Optional[dict]:
 
 @router.post("/playlists/create")
 async def playlist_create(body: PlaylistCreateIn, actor: dict = Depends(get_actor)):
-    """Nayi playlist banao. Login zaroori."""
     need_verified(actor)
+    if not rate_limit(f"plcreate:{actor['user_id']}", 10, 3600):
+        return {"success": False, "message": "Too many playlists created. Try again later."}
     title = (body.title or "").strip()
     if not (2 <= len(title) <= 150):
         return {"success": False, "message": "Title must be 2-150 characters"}
@@ -1976,8 +1975,7 @@ async def playlist_create(body: PlaylistCreateIn, actor: dict = Depends(get_acto
     if thumb and not thumb.startswith("https://res.cloudinary.com/"):
         return {"success": False, "message": "Thumbnail must be a Cloudinary URL"}
 
-    count = get_one("SELECT COUNT(*) AS n FROM playlists_v2 WHERE user_id = %s",
-                    (actor["user_id"],))
+    count = get_one("SELECT COUNT(*) AS n FROM playlists_v2 WHERE user_id = %s", (actor["user_id"],))
     if count and count["n"] >= 100:
         return {"success": False, "message": "Maximum 100 playlists per user"}
 
@@ -1991,7 +1989,6 @@ async def playlist_create(body: PlaylistCreateIn, actor: dict = Depends(get_acto
 @router.get("/me/playlists")
 async def playlist_my(limit: int = 50, offset: int = 0,
                       actor: dict = Depends(get_actor)):
-    """Meri saari playlists."""
     need_verified(actor)
     limit = max(1, min(limit, 100))
     rows = execute_query(f"""
@@ -2005,9 +2002,8 @@ async def playlist_my(limit: int = 50, offset: int = 0,
     return {"success": True, "has_more": len(rows) > limit, "playlists": rows[:limit]}
 
 
-@router.get("/playlists/user/{user_id}")
+@router.get("/me/playlists/user/{user_id}")
 async def playlist_by_user(user_id: int, actor: dict = Depends(get_actor)):
-    """Kisi bhi user ki PUBLIC playlists."""
     rows = execute_query(f"""
         SELECT p.{_PL2_COLS.replace(', ', ', p.').replace('p.id', 'id')},
                (SELECT COUNT(*) FROM playlist_items pi WHERE pi.playlist_id = p.id) AS item_count
@@ -2020,7 +2016,6 @@ async def playlist_by_user(user_id: int, actor: dict = Depends(get_actor)):
 
 @router.get("/playlists/detail/{pl_id}")
 async def playlist_detail(pl_id: int, actor: dict = Depends(get_actor)):
-    """Ek playlist + uske videos (ordered)."""
     pl = get_one(f"SELECT {_PL2_COLS} FROM playlists_v2 WHERE id = %s", (pl_id,))
     if not pl:
         raise HTTPException(404, "Playlist not found")
@@ -2042,7 +2037,6 @@ async def playlist_detail(pl_id: int, actor: dict = Depends(get_actor)):
         ORDER BY pi.position ASC, pi.added_at ASC
     """, (pl_id,), fetch=True) or []
 
-    # Premium lock: agar video premium hai aur user premium nahi to hide
     for it in items:
         it["locked"] = bool(it["is_premium"] and not actor["is_premium"]
                             and actor["user_id"] != pl["user_id"])
@@ -2107,37 +2101,49 @@ async def playlist_delete(pl_id: int, actor: dict = Depends(get_actor)):
 @router.post("/playlists/detail/{pl_id}/add")
 async def playlist_add_video(pl_id: int, body: PlaylistAddVideoIn,
                              actor: dict = Depends(get_actor)):
+    """
+    OPTIMIZED: 2 queries instead of 6.
+    """
     need_verified(actor)
-    pl = _pl2_own(pl_id, actor["user_id"])
-    if not pl:
+    if not rate_limit(f"pladd:{actor['user_id']}", 60, 60):
+        return {"success": False, "message": "Slow down a bit."}
+
+    info = get_one("""
+        SELECT
+            p.id AS pl_id,
+            (SELECT COUNT(*) FROM playlist_items WHERE playlist_id = p.id) AS item_count,
+            (SELECT COALESCE(MAX(position), -1) + 1 FROM playlist_items WHERE playlist_id = p.id) AS next_pos
+        FROM playlists_v2 p
+        WHERE p.id = %s AND p.user_id = %s
+    """, (pl_id, actor["user_id"]))
+
+    if not info:
         raise HTTPException(404, "Playlist not found")
-
-    v = get_one("SELECT id, visibility FROM videos WHERE viewkey = %s", (body.viewkey,))
-    if not v:
-        raise HTTPException(404, "Video not found")
-    if v["visibility"] == "private":
-        return {"success": False, "message": "Cannot add a private video"}
-
-    n = get_one("SELECT COUNT(*) AS n FROM playlist_items WHERE playlist_id = %s", (pl_id,))
-    if n and n["n"] >= 500:
+    if info["item_count"] >= 500:
         return {"success": False, "message": "Playlist is full (max 500 videos)"}
-
-    pos = body.position
-    if pos is None:
-        mx = get_one("SELECT COALESCE(MAX(position), -1) + 1 AS p FROM playlist_items WHERE playlist_id = %s", (pl_id,))
-        pos = mx["p"] if mx else 0
 
     ins = get_one("""
         INSERT INTO playlist_items (playlist_id, video_id, position)
-        VALUES (%s, %s, %s)
+        SELECT %s, v.id, COALESCE(%s, %s)
+        FROM videos v
+        WHERE v.viewkey = %s AND v.visibility <> 'private'
         ON CONFLICT (playlist_id, video_id) DO NOTHING
-        RETURNING id
-    """, (pl_id, v["id"], pos))
+        RETURNING id, video_id, position
+    """, (pl_id, body.position, info["next_pos"], body.viewkey))
+
     if not ins:
+        exists = get_one("SELECT 1 FROM videos WHERE viewkey = %s AND visibility <> 'private'",
+                         (body.viewkey,))
+        if not exists:
+            return {"success": False, "message": "Video not found or is private"}
         return {"success": False, "message": "Video already in this playlist"}
 
-    get_one("UPDATE playlists_v2 SET updated_at = now() WHERE id = %s RETURNING id", (pl_id,))
-    return {"success": True, "item_id": ins["id"], "position": pos}
+    try:
+        get_one("UPDATE playlists_v2 SET updated_at = now() WHERE id = %s RETURNING id", (pl_id,))
+    except Exception:
+        pass
+
+    return {"success": True, "item_id": ins["id"], "position": ins["position"]}
 
 
 @router.delete("/playlists/detail/{pl_id}/remove/{video_id}")
@@ -2167,7 +2173,6 @@ async def playlist_reorder(pl_id: int, body: PlaylistReorderIn,
     if not body.video_ids:
         return {"success": False, "message": "Empty order"}
 
-    # Verify ye sab video_ids playlist me hain
     existing = execute_query("SELECT video_id FROM playlist_items WHERE playlist_id = %s",
                              (pl_id,), fetch=True) or []
     existing_ids = {r["video_id"] for r in existing}
@@ -2181,11 +2186,8 @@ async def playlist_reorder(pl_id: int, body: PlaylistReorderIn,
     return {"success": True, "count": len(body.video_ids)}
 
 
-# ---------- WATCH LATER (system playlist) ----------
-
 @router.post("/playlists/watch-later/ensure")
 async def ensure_watch_later(actor: dict = Depends(get_actor)):
-    """Har user ke liye ek 'Watch Later' private system playlist auto-create."""
     need_verified(actor)
     pl = get_one("""
         SELECT id, user_id, title, description, thumbnail, visibility, is_system,
@@ -2201,17 +2203,13 @@ async def ensure_watch_later(actor: dict = Depends(get_actor)):
                   created_at, updated_at
     """, (actor["user_id"],))
     return {"success": True, "playlist": row, "created": True}
+
+
 # =====================================================================
-#  PART 2: PLANS + PAYMENTS + SUPPORT CHAT + ADMIN
-#  Ye block routes.py ke bilkul end me paste karo
+#  PART 2: PLANS + PAYMENTS + SUPPORT + ADMIN
 # =====================================================================
-
-
-# ---------- PLANS (public) ----------
-
 @router.get("/plans")
 async def list_plans():
-    """Public pricing page ke liye."""
     rows = execute_query("""
         SELECT id, code, name, description, price_pkr, price_usd,
                duration_days, features, sort_order
@@ -2223,7 +2221,6 @@ async def list_plans():
 
 @router.get("/ad-pricing")
 async def list_ad_pricing():
-    """Ad rates — advertiser dashboard ke liye."""
     rows = execute_query("""
         SELECT id, model, price_pkr, price_usd, min_budget
         FROM ad_pricing WHERE is_active = true ORDER BY model ASC
@@ -2231,18 +2228,13 @@ async def list_ad_pricing():
     return {"success": True, "pricing": rows}
 
 
-# ---------- PAYMENTS (user side) ----------
-
 @router.post("/payments/submit")
 async def payment_submit(body: PaymentSubmitIn, actor: dict = Depends(get_actor)):
-    """
-    User payment submit karta hai. Admin manually verify karega.
-    Screenshot Cloudinary pe upload hoga (existing signed endpoint se).
-    """
     need_verified(actor)
     uid = actor["user_id"]
+    if not rate_limit(f"pay:{uid}", 5, 3600):
+        return {"success": False, "message": "Too many payment submissions. Try later."}
 
-    # Validation
     method = (body.method or "").strip().lower()
     if method not in ("jazzcash", "easypaisa", "bank", "crypto", "other"):
         return {"success": False, "message": "Invalid payment method"}
@@ -2265,7 +2257,6 @@ async def payment_submit(body: PaymentSubmitIn, actor: dict = Depends(get_actor)
     if ss and not ss.startswith("https://res.cloudinary.com/"):
         return {"success": False, "message": "Screenshot must be a Cloudinary URL"}
 
-    # Duplicate TID check (same method + TID ke saath pending/approved already hai?)
     dup = get_one("""
         SELECT id FROM payments
         WHERE method = %s AND transaction_id = %s AND status <> 'rejected'
@@ -2273,12 +2264,11 @@ async def payment_submit(body: PaymentSubmitIn, actor: dict = Depends(get_actor)
     if dup:
         return {"success": False, "message": "This transaction ID is already submitted"}
 
-    # Rate-limit: 3 pending submissions max
     pend = get_one("""
         SELECT COUNT(*) AS n FROM payments WHERE user_id = %s AND status = 'pending'
     """, (uid,))
     if pend and pend["n"] >= 3:
-        return {"success": False, "message": "You already have 3 pending payments. Wait for admin review."}
+        return {"success": False, "message": "You already have 3 pending payments."}
 
     row = get_one("""
         INSERT INTO payments
@@ -2296,7 +2286,6 @@ async def payment_submit(body: PaymentSubmitIn, actor: dict = Depends(get_actor)
         (body.user_note or "").strip()[:500],
     ))
 
-    # Admin ko notify (agar koi admin user id list me hai)
     try:
         for admin_id in ADMIN_USER_IDS:
             await notify(admin_id, "payment_submitted", uid)
@@ -2325,7 +2314,6 @@ async def my_payments(limit: int = 20, offset: int = 0, actor: dict = Depends(ge
 
 @router.get("/payments/status")
 async def my_payment_status(actor: dict = Depends(get_actor)):
-    """Frontend badge ke liye: pending count + latest status."""
     need_verified(actor)
     s = get_one("""
         SELECT
@@ -2341,18 +2329,19 @@ async def my_payment_status(actor: dict = Depends(get_actor)):
     return {"success": True, "counts": s or {}, "latest": latest}
 
 
-# ---------- SUPPORT CHAT (user side) ----------
+# ---------- SUPPORT CHAT ----------
 
 @router.post("/support/threads/create")
 async def support_create_thread(body: SupportThreadCreateIn,
                                 actor: dict = Depends(get_actor)):
     need_verified(actor)
+    if not rate_limit(f"supp:{actor['user_id']}", 5, 3600):
+        return {"success": False, "message": "Too many support threads. Try later."}
     msg = (body.message or "").strip()
     if not (1 <= len(msg) <= 2000):
         return {"success": False, "message": "Message must be 1-2000 characters"}
     subj = (body.subject or "Support").strip()[:200] or "Support"
 
-    # Max 5 open threads
     op = get_one("""
         SELECT COUNT(*) AS n FROM support_threads
         WHERE user_id = %s AND status = 'open'
@@ -2412,7 +2401,6 @@ async def support_get_thread(thread_id: int, actor: dict = Depends(get_actor)):
         LEFT JOIN channels c ON c.user_id = u.id
         WHERE m.thread_id = %s ORDER BY m.created_at ASC LIMIT 500
     """, (thread_id,), fetch=True) or []
-    # mark as read for user
     get_one("UPDATE support_threads SET unread_user = 0 WHERE id = %s RETURNING id",
             (thread_id,))
     get_one("""
@@ -2475,7 +2463,6 @@ async def support_user_close(thread_id: int, actor: dict = Depends(get_actor)):
 # =====================================================================
 #  ADMIN ENDPOINTS
 # =====================================================================
-
 def _need_admin(actor: dict):
     need_verified(actor)
     if actor["user_id"] not in ADMIN_USER_IDS:
@@ -2484,7 +2471,6 @@ def _need_admin(actor: dict):
 
 @router.get("/admin/dashboard")
 async def admin_dashboard(actor: dict = Depends(get_actor)):
-    """Admin overview: sab stats ek jagah."""
     _need_admin(actor)
     stats = get_one("""
         SELECT
@@ -2500,8 +2486,6 @@ async def admin_dashboard(actor: dict = Depends(get_actor)):
     """)
     return {"success": True, "stats": stats}
 
-
-# ----- PAYMENTS ADMIN -----
 
 @router.get("/admin/payments")
 async def admin_list_payments(status: str = "pending", limit: int = 30, offset: int = 0,
@@ -2546,10 +2530,6 @@ async def admin_get_payment(payment_id: int, actor: dict = Depends(get_actor)):
 @router.post("/admin/payments/{payment_id}/review")
 async def admin_review_payment(payment_id: int, body: PaymentReviewIn,
                                actor: dict = Depends(get_actor)):
-    """
-    Approve → user premium ho jata hai (plan ke duration ke liye).
-    Reject  → note save.
-    """
     _need_admin(actor)
     if body.action not in ("approve", "reject"):
         raise HTTPException(400, "action must be approve or reject")
@@ -2567,7 +2547,6 @@ async def admin_review_payment(payment_id: int, body: PaymentReviewIn,
     note = (body.admin_note or "").strip()[:1000]
 
     if body.action == "approve":
-        # User premium banao
         get_one("UPDATE mydata SET is_premium = true WHERE id = %s RETURNING id",
                 (p["user_id"],))
         get_one("""
@@ -2576,21 +2555,18 @@ async def admin_review_payment(payment_id: int, body: PaymentReviewIn,
             WHERE id = %s RETURNING id
         """, (note, actor["user_id"], payment_id))
 
-        # Notify user
         try:
             await notify(p["user_id"], "payment_approved", actor["user_id"])
             await manager.push(p["user_id"], {
                 "type": "payment_status",
                 "payment_id": payment_id,
                 "status": "approved",
-                "plan_name": p.get("plan_name"),
             })
         except Exception:
             logger.exception("notify payment approved")
 
         return {"success": True, "message": "Payment approved, user is now premium"}
 
-    # reject
     get_one("""
         UPDATE payments SET status='rejected', admin_note=%s,
                             reviewed_by=%s, reviewed_at=now()
@@ -2610,8 +2586,6 @@ async def admin_review_payment(payment_id: int, body: PaymentReviewIn,
 
     return {"success": True, "message": "Payment rejected"}
 
-
-# ----- SUPPORT ADMIN -----
 
 @router.get("/admin/support/threads")
 async def admin_list_threads(status: str = "open", limit: int = 40, offset: int = 0,
@@ -2732,8 +2706,6 @@ async def admin_thread_status(thread_id: int, body: SupportStatusIn,
     return {"success": True, "thread": row}
 
 
-# ----- USER MANAGEMENT (admin quick view) -----
-
 @router.get("/admin/users")
 async def admin_list_users(q: str = "", limit: int = 30, offset: int = 0,
                            actor: dict = Depends(get_actor)):
@@ -2753,7 +2725,6 @@ async def admin_list_users(q: str = "", limit: int = 30, offset: int = 0,
 
 @router.post("/admin/users/{user_id}/toggle-premium")
 async def admin_toggle_premium(user_id: int, actor: dict = Depends(get_actor)):
-    """Emergency: admin manually premium on/off kar sakta hai."""
     _need_admin(actor)
     u = get_one("SELECT id, is_premium FROM mydata WHERE id = %s", (user_id,))
     if not u:
@@ -2763,8 +2734,6 @@ async def admin_toggle_premium(user_id: int, actor: dict = Depends(get_actor)):
             (new_val, user_id))
     return {"success": True, "user_id": user_id, "is_premium": new_val}
 
-
-# ----- PRICING ADMIN (plans + ad pricing edit) -----
 
 class PlanEditIn(BaseModel):
     name: Optional[str] = None
@@ -2836,8 +2805,796 @@ async def admin_edit_ad_pricing(model: str, body: AdPricingEditIn,
     if not row:
         raise HTTPException(404, "Pricing not found")
     return {"success": True, "pricing": row}
-from fastapi.responses import HTMLResponse
 
+
+# =====================================================================
+#  AD CENTER — MODELS + HELPERS
+# =====================================================================
+from decimal import Decimal as _Dec
+
+
+class AdCampaignCreateIn(BaseModel):
+    name: str
+    model: str
+    budget_total: float
+    budget_daily: Optional[float] = 0
+    target_categories: Optional[List[str]] = []
+    target_tags: Optional[List[int]] = []
+    starts_at: Optional[str] = None
+    ends_at: Optional[str] = None
+
+
+class AdCampaignUpdateIn(BaseModel):
+    name: Optional[str] = None
+    budget_total: Optional[float] = None
+    budget_daily: Optional[float] = None
+    target_categories: Optional[List[str]] = None
+    target_tags: Optional[List[int]] = None
+    starts_at: Optional[str] = None
+    ends_at: Optional[str] = None
+
+
+class AdCreativeIn(BaseModel):
+    type: str
+    url: str
+    thumbnail: Optional[str] = None
+    title: str
+    description: Optional[str] = ""
+    cta_text: Optional[str] = "Learn More"
+    destination_url: str
+
+
+class AdTopupSubmitIn(BaseModel):
+    amount: float
+    method: str
+    transaction_id: str
+    sender_name: Optional[str] = None
+    sender_account: Optional[str] = None
+    screenshot_url: Optional[str] = None
+    user_note: Optional[str] = ""
+
+
+class AdReviewIn(BaseModel):
+    action: str
+    admin_note: Optional[str] = ""
+
+
+class AdWalletAdjustIn(BaseModel):
+    user_id: int
+    amount: float
+    note: Optional[str] = ""
+
+
+def _ad_get_wallet(uid: int) -> dict:
+    w = get_one("SELECT * FROM ad_wallets WHERE user_id = %s", (uid,))
+    if not w:
+        w = get_one("""
+            INSERT INTO ad_wallets (user_id, balance, total_spent, total_added)
+            VALUES (%s, 0, 0, 0) RETURNING *
+        """, (uid,))
+    return w
+
+
+def _ad_tx(uid: int, kind: str, amount: float, ref: str = None, note: str = ""):
+    amt = _Dec(str(amount))
+    w = _ad_get_wallet(uid)
+    new_balance = _Dec(str(w["balance"])) + amt
+    if new_balance < 0:
+        new_balance = _Dec("0")
+
+    if amt > 0:
+        get_one("""
+            UPDATE ad_wallets
+            SET balance = balance + %s, total_added = total_added + %s, updated_at = now()
+            WHERE user_id = %s RETURNING user_id
+        """, (float(amt), float(amt), uid))
+    else:
+        get_one("""
+            UPDATE ad_wallets
+            SET balance = balance + %s, total_spent = total_spent + %s, updated_at = now()
+            WHERE user_id = %s RETURNING user_id
+        """, (float(amt), float(-amt), uid))
+
+    get_one("""
+        INSERT INTO ad_transactions (user_id, kind, amount, balance_after, reference, note)
+        VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
+    """, (uid, kind, float(amt), float(new_balance), ref, note))
+
+
+def _ad_get_rate(model: str) -> Optional[dict]:
+    return get_one("""
+        SELECT model, price_pkr, price_usd, min_budget
+        FROM ad_pricing WHERE model = %s AND is_active = true
+    """, (model,))
+
+
+def _ad_campaign_owned(campaign_id: int, uid: int) -> Optional[dict]:
+    return get_one("SELECT * FROM ad_campaigns WHERE id = %s AND user_id = %s",
+                   (campaign_id, uid))
+
+
+# =====================================================================
+#  AD CENTER — USER WALLET
+# =====================================================================
+@router.get("/ads/wallet")
+async def ad_wallet(actor: dict = Depends(get_actor)):
+    need_verified(actor)
+    w = _ad_get_wallet(actor["user_id"])
+    return {"success": True, "wallet": w}
+
+
+@router.get("/ads/wallet/transactions")
+async def ad_wallet_tx(limit: int = 20, offset: int = 0,
+                       actor: dict = Depends(get_actor)):
+    need_verified(actor)
+    limit = max(1, min(limit, 50))
+    rows = execute_query("""
+        SELECT id, kind, amount, balance_after, reference, note, created_at
+        FROM ad_transactions WHERE user_id = %s
+        ORDER BY created_at DESC LIMIT %s OFFSET %s
+    """, (actor["user_id"], limit + 1, max(0, offset)), fetch=True) or []
+    return {"success": True, "has_more": len(rows) > limit, "transactions": rows[:limit]}
+
+
+@router.post("/ads/wallet/topup")
+async def ad_wallet_topup(body: AdTopupSubmitIn, actor: dict = Depends(get_actor)):
+    need_verified(actor)
+    uid = actor["user_id"]
+    if not rate_limit(f"adtopup:{uid}", 5, 3600):
+        return {"success": False, "message": "Too many topup requests. Try later."}
+
+    method = (body.method or "").strip().lower()
+    if method not in ("jazzcash", "easypaisa", "bank", "crypto", "other"):
+        return {"success": False, "message": "Invalid payment method"}
+    tid = (body.transaction_id or "").strip()
+    if not (4 <= len(tid) <= 120):
+        return {"success": False, "message": "Transaction ID must be 4-120 characters"}
+
+    try:
+        amount = float(body.amount)
+    except Exception:
+        return {"success": False, "message": "Invalid amount"}
+    if amount < 500 or amount > 10_000_000:
+        return {"success": False, "message": "Amount must be between 500 and 10,000,000"}
+
+    ss = (body.screenshot_url or "").strip()
+    if ss and not ss.startswith("https://res.cloudinary.com/"):
+        return {"success": False, "message": "Screenshot must be a Cloudinary URL"}
+
+    dup = get_one("""
+        SELECT id FROM payments
+        WHERE method = %s AND transaction_id = %s AND status <> 'rejected'
+    """, (method, tid))
+    if dup:
+        return {"success": False, "message": "This transaction ID is already submitted"}
+
+    pend = get_one("""
+        SELECT COUNT(*) AS n FROM payments
+        WHERE user_id = %s AND status = 'pending' AND purpose = 'ad_topup'
+    """, (uid,))
+    if pend and pend["n"] >= 3:
+        return {"success": False, "message": "You have 3 pending top-ups."}
+
+    row = get_one("""
+        INSERT INTO payments
+            (user_id, plan_id, amount, currency, method, transaction_id,
+             sender_name, sender_account, screenshot_url, user_note, purpose)
+        VALUES (%s, NULL, %s, %s, %s, %s, %s, %s, %s, %s, 'ad_topup')
+        RETURNING id, user_id, amount, currency, method, transaction_id, status, purpose, created_at
+    """, (
+        uid, amount, "PKR", method, tid,
+        (body.sender_name or "").strip()[:120] or None,
+        (body.sender_account or "").strip()[:120] or None,
+        ss or None,
+        (body.user_note or "").strip()[:500],
+    ))
+
+    try:
+        for admin_id in ADMIN_USER_IDS:
+            await notify(admin_id, "ad_topup_submitted", uid)
+    except Exception:
+        logger.exception("notify ad_topup")
+
+    return {"success": True, "message": "Top-up submitted. Admin will verify soon.",
+            "payment": row}
+
+
+# =====================================================================
+#  AD CENTER — USER CAMPAIGNS
+# =====================================================================
+@router.post("/ads/campaigns")
+async def ad_campaign_create(body: AdCampaignCreateIn, actor: dict = Depends(get_actor)):
+    need_verified(actor)
+    uid = actor["user_id"]
+    if not rate_limit(f"adcamp:{uid}", 10, 3600):
+        return {"success": False, "message": "Too many campaigns. Try later."}
+
+    name = (body.name or "").strip()
+    if not (2 <= len(name) <= 150):
+        return {"success": False, "message": "Name must be 2-150 characters"}
+    model = (body.model or "").strip().lower()
+    if model not in ("cpm", "cpc"):
+        return {"success": False, "message": "model must be cpm or cpc"}
+
+    rate = _ad_get_rate(model)
+    if not rate:
+        return {"success": False, "message": "Pricing not available"}
+
+    try:
+        budget_total = float(body.budget_total)
+        budget_daily = float(body.budget_daily or 0)
+    except Exception:
+        return {"success": False, "message": "Invalid budget"}
+
+    min_budget = float(rate["min_budget"] or 500)
+    if budget_total < min_budget:
+        return {"success": False, "message": f"Minimum budget is Rs. {min_budget:.0f}"}
+    if budget_daily < 0 or (budget_daily and budget_daily > budget_total):
+        return {"success": False, "message": "Daily budget invalid"}
+
+    w = _ad_get_wallet(uid)
+    if float(w["balance"]) < budget_total:
+        return {"success": False,
+                "message": f"Insufficient wallet. Need Rs. {budget_total:.0f}, have Rs. {float(w['balance']):.0f}"}
+
+    cats = [c.strip() for c in (body.target_categories or []) if c.strip()][:20]
+    tags = [int(t) for t in (body.target_tags or [])][:30]
+
+    row = get_one("""
+        INSERT INTO ad_campaigns
+            (user_id, name, model, rate_pkr, budget_total, budget_daily,
+             target_categories, target_tags, starts_at, ends_at, status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'draft')
+        RETURNING *
+    """, (
+        uid, name, model, float(rate["price_pkr"]), budget_total, budget_daily,
+        cats, tags,
+        body.starts_at or None, body.ends_at or None,
+    ))
+    return {"success": True, "campaign": row}
+
+
+@router.get("/ads/campaigns/my")
+async def ad_campaigns_my(limit: int = 50, offset: int = 0,
+                          actor: dict = Depends(get_actor)):
+    need_verified(actor)
+    limit = max(1, min(limit, 100))
+    rows = execute_query("""
+        SELECT c.*,
+               (SELECT COUNT(*) FROM ad_creatives cr WHERE cr.campaign_id = c.id) AS creative_count
+        FROM ad_campaigns c
+        WHERE c.user_id = %s
+        ORDER BY c.created_at DESC LIMIT %s OFFSET %s
+    """, (actor["user_id"], limit + 1, max(0, offset)), fetch=True) or []
+    return {"success": True, "has_more": len(rows) > limit, "campaigns": rows[:limit]}
+
+
+@router.get("/ads/campaigns/{campaign_id}")
+async def ad_campaign_get(campaign_id: int, actor: dict = Depends(get_actor)):
+    need_verified(actor)
+    c = _ad_campaign_owned(campaign_id, actor["user_id"])
+    if not c:
+        raise HTTPException(404, "Campaign not found")
+    crs = execute_query("SELECT * FROM ad_creatives WHERE campaign_id = %s ORDER BY id",
+                        (campaign_id,), fetch=True) or []
+    return {"success": True, "campaign": c, "creatives": crs}
+
+
+@router.put("/ads/campaigns/{campaign_id}")
+async def ad_campaign_update(campaign_id: int, body: AdCampaignUpdateIn,
+                             actor: dict = Depends(get_actor)):
+    need_verified(actor)
+    c = _ad_campaign_owned(campaign_id, actor["user_id"])
+    if not c:
+        raise HTTPException(404, "Campaign not found")
+    if c["status"] in ("active", "completed"):
+        return {"success": False, "message": f"Cannot edit a {c['status']} campaign"}
+
+    fields = {}
+    if body.name is not None:
+        n = body.name.strip()
+        if not (2 <= len(n) <= 150):
+            return {"success": False, "message": "Name must be 2-150 characters"}
+        fields["name"] = n
+    if body.budget_total is not None:
+        bt = float(body.budget_total)
+        if bt < float(c["spend_total"]):
+            return {"success": False, "message": "Budget cannot be less than spent"}
+        w = _ad_get_wallet(actor["user_id"])
+        if float(w["balance"]) < bt:
+            return {"success": False, "message": "Insufficient wallet balance"}
+        fields["budget_total"] = bt
+    if body.budget_daily is not None:
+        fields["budget_daily"] = float(body.budget_daily or 0)
+    if body.target_categories is not None:
+        fields["target_categories"] = [x.strip() for x in body.target_categories if x.strip()][:20]
+    if body.target_tags is not None:
+        fields["target_tags"] = [int(t) for t in body.target_tags][:30]
+    if body.starts_at is not None:
+        fields["starts_at"] = body.starts_at or None
+    if body.ends_at is not None:
+        fields["ends_at"] = body.ends_at or None
+
+    if not fields:
+        return {"success": False, "message": "Nothing to update"}
+    sets = ", ".join(f"{k} = %s" for k in fields)
+    row = get_one(f"""
+        UPDATE ad_campaigns SET {sets}, updated_at = now()
+        WHERE id = %s RETURNING *
+    """, (*fields.values(), campaign_id))
+    return {"success": True, "campaign": row}
+
+
+@router.delete("/ads/campaigns/{campaign_id}")
+async def ad_campaign_delete(campaign_id: int, actor: dict = Depends(get_actor)):
+    need_verified(actor)
+    c = _ad_campaign_owned(campaign_id, actor["user_id"])
+    if not c:
+        raise HTTPException(404, "Campaign not found")
+    if c["status"] == "active":
+        return {"success": False, "message": "Pause the campaign before deleting"}
+    get_one("DELETE FROM ad_campaigns WHERE id = %s RETURNING id", (campaign_id,))
+    return {"success": True}
+
+
+@router.post("/ads/campaigns/{campaign_id}/submit")
+async def ad_campaign_submit(campaign_id: int, actor: dict = Depends(get_actor)):
+    need_verified(actor)
+    c = _ad_campaign_owned(campaign_id, actor["user_id"])
+    if not c:
+        raise HTTPException(404, "Campaign not found")
+    if c["status"] != "draft":
+        return {"success": False, "message": f"Only draft campaigns can be submitted (current: {c['status']})"}
+
+    n = get_one("SELECT COUNT(*) AS n FROM ad_creatives WHERE campaign_id = %s", (campaign_id,))
+    if not n or n["n"] < 1:
+        return {"success": False, "message": "Add at least one creative before submitting"}
+
+    w = _ad_get_wallet(actor["user_id"])
+    if float(w["balance"]) < float(c["budget_total"]):
+        return {"success": False, "message": "Insufficient wallet balance for this budget"}
+
+    row = get_one("""
+        UPDATE ad_campaigns SET status = 'pending', updated_at = now()
+        WHERE id = %s RETURNING *
+    """, (campaign_id,))
+
+    try:
+        for admin_id in ADMIN_USER_IDS:
+            await notify(admin_id, "ad_campaign_submitted", actor["user_id"])
+    except Exception:
+        logger.exception("notify ad campaign submit")
+
+    return {"success": True, "campaign": row}
+
+
+@router.post("/ads/campaigns/{campaign_id}/pause")
+async def ad_campaign_pause(campaign_id: int, actor: dict = Depends(get_actor)):
+    need_verified(actor)
+    c = _ad_campaign_owned(campaign_id, actor["user_id"])
+    if not c:
+        raise HTTPException(404, "Campaign not found")
+    if c["status"] != "active":
+        return {"success": False, "message": f"Only active campaigns can be paused (current: {c['status']})"}
+    row = get_one("""
+        UPDATE ad_campaigns SET status = 'paused', updated_at = now()
+        WHERE id = %s RETURNING *
+    """, (campaign_id,))
+    return {"success": True, "campaign": row}
+
+
+@router.post("/ads/campaigns/{campaign_id}/resume")
+async def ad_campaign_resume(campaign_id: int, actor: dict = Depends(get_actor)):
+    need_verified(actor)
+    c = _ad_campaign_owned(campaign_id, actor["user_id"])
+    if not c:
+        raise HTTPException(404, "Campaign not found")
+    if c["status"] != "paused":
+        return {"success": False, "message": f"Only paused campaigns can be resumed (current: {c['status']})"}
+    w = _ad_get_wallet(actor["user_id"])
+    if float(w["balance"]) < float(c["budget_total"]) - float(c["spend_total"]):
+        return {"success": False, "message": "Insufficient wallet balance to resume"}
+    row = get_one("""
+        UPDATE ad_campaigns SET status = 'active', updated_at = now()
+        WHERE id = %s RETURNING *
+    """, (campaign_id,))
+    return {"success": True, "campaign": row}
+
+
+@router.get("/ads/campaigns/{campaign_id}/stats")
+async def ad_campaign_stats(campaign_id: int, days: int = 28,
+                            actor: dict = Depends(get_actor)):
+    need_verified(actor)
+    c = _ad_campaign_owned(campaign_id, actor["user_id"])
+    if not c:
+        raise HTTPException(404, "Campaign not found")
+
+    days = max(1, min(days, 90))
+    totals = get_one("""
+        SELECT
+          (SELECT COUNT(*) FROM ad_impressions WHERE campaign_id = %s) AS impressions,
+          (SELECT COUNT(*) FROM ad_clicks      WHERE campaign_id = %s) AS clicks,
+          (SELECT COALESCE(SUM(cost), 0) FROM ad_impressions WHERE campaign_id = %s) AS spend_imp,
+          (SELECT COALESCE(SUM(cost), 0) FROM ad_clicks      WHERE campaign_id = %s) AS spend_clk
+    """, (campaign_id, campaign_id, campaign_id, campaign_id)) or {}
+
+    imp = int(totals.get("impressions", 0) or 0)
+    clk = int(totals.get("clicks", 0) or 0)
+    ctr = (clk / imp * 100) if imp > 0 else 0
+    spend = float(totals.get("spend_imp", 0) or 0) + float(totals.get("spend_clk", 0) or 0)
+
+    daily = execute_query("""
+        SELECT to_char(d, 'Mon DD') AS day,
+               COALESCE((SELECT COUNT(*) FROM ad_impressions WHERE campaign_id = %s AND created_at::date = d), 0) AS impressions,
+               COALESCE((SELECT COUNT(*) FROM ad_clicks      WHERE campaign_id = %s AND created_at::date = d), 0) AS clicks
+        FROM generate_series(CURRENT_DATE - %s + 1, CURRENT_DATE, interval '1 day') d
+        ORDER BY d
+    """, (campaign_id, campaign_id, days), fetch=True) or []
+
+    return {
+        "success": True,
+        "totals": {"impressions": imp, "clicks": clk, "ctr": round(ctr, 2), "spend": round(spend, 2)},
+        "daily": daily,
+    }
+
+
+# =====================================================================
+#  AD CENTER — CREATIVES
+# =====================================================================
+@router.post("/ads/campaigns/{campaign_id}/creatives")
+async def ad_creative_add(campaign_id: int, body: AdCreativeIn,
+                          actor: dict = Depends(get_actor)):
+    need_verified(actor)
+    c = _ad_campaign_owned(campaign_id, actor["user_id"])
+    if not c:
+        raise HTTPException(404, "Campaign not found")
+    if c["status"] in ("active", "completed"):
+        return {"success": False, "message": f"Cannot add creative to a {c['status']} campaign"}
+
+    if body.type not in ("image", "video"):
+        return {"success": False, "message": "type must be image or video"}
+    if not body.url or not body.url.startswith("https://res.cloudinary.com/"):
+        return {"success": False, "message": "Creative must be a Cloudinary URL"}
+    if not body.destination_url or not body.destination_url.startswith(("http://", "https://")):
+        return {"success": False, "message": "Destination URL must be http(s)"}
+    if not (2 <= len((body.title or "").strip()) <= 150):
+        return {"success": False, "message": "Title must be 2-150 characters"}
+
+    row = get_one("""
+        INSERT INTO ad_creatives
+            (campaign_id, type, url, thumbnail, title, description, cta_text, destination_url)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING *
+    """, (
+        campaign_id, body.type, body.url.strip(), (body.thumbnail or "").strip() or None,
+        body.title.strip(), (body.description or "").strip()[:500],
+        (body.cta_text or "Learn More").strip()[:40], body.destination_url.strip(),
+    ))
+    return {"success": True, "creative": row}
+
+
+@router.delete("/ads/creatives/{creative_id}")
+async def ad_creative_delete(creative_id: int, actor: dict = Depends(get_actor)):
+    need_verified(actor)
+    cr = get_one("""
+        SELECT cr.*, c.user_id AS owner_id, c.status AS camp_status
+        FROM ad_creatives cr JOIN ad_campaigns c ON c.id = cr.campaign_id
+        WHERE cr.id = %s
+    """, (creative_id,))
+    if not cr or cr["owner_id"] != actor["user_id"]:
+        raise HTTPException(404, "Creative not found")
+    if cr["camp_status"] in ("active", "completed"):
+        return {"success": False, "message": "Cannot delete creative of an active campaign"}
+    get_one("DELETE FROM ad_creatives WHERE id = %s RETURNING id", (creative_id,))
+    return {"success": True}
+
+
+# =====================================================================
+#  AD CENTER — SERVING
+# =====================================================================
+def _ad_pick_for_video(video_id: int, video_category: str, video_tags: list):
+    rows = execute_query("""
+        SELECT c.id AS campaign_id, c.user_id, c.model, c.rate_pkr,
+               c.budget_total, c.budget_daily, c.spend_total, c.spend_today,
+               c.spend_today_date, c.target_categories, c.target_tags,
+               c.starts_at, c.ends_at
+        FROM ad_campaigns c
+        WHERE c.status = 'active'
+          AND (c.starts_at IS NULL OR c.starts_at <= now())
+          AND (c.ends_at   IS NULL OR c.ends_at   >= now())
+          AND c.spend_total < c.budget_total
+          AND (c.budget_daily = 0 OR
+               c.spend_today_date <> CURRENT_DATE OR
+               c.spend_today < c.budget_daily)
+        ORDER BY random()
+        LIMIT 20
+    """, fetch=True) or []
+
+    cat = (video_category or "").strip().lower()
+    tag_set = set(video_tags or [])
+
+    best = None
+    best_score = -1
+    for r in rows:
+        score = 0
+        tcats = [c.strip().lower() for c in (r.get("target_categories") or [])]
+        ttags = set(r.get("target_tags") or [])
+
+        if tcats:
+            if cat and cat in tcats:
+                score += 3
+            else:
+                continue
+        if ttags:
+            if tag_set & ttags:
+                score += 5
+            else:
+                if not tcats or (cat and cat in tcats):
+                    score += 1
+
+        if score > best_score:
+            best_score = score
+            best = r
+
+    return best
+
+
+def _ad_pick_creative(campaign_id: int) -> Optional[dict]:
+    return get_one("""
+        SELECT * FROM ad_creatives WHERE campaign_id = %s
+        ORDER BY random() LIMIT 1
+    """, (campaign_id,))
+
+
+def _ad_cost_for(model: str, rate_pkr: float) -> float:
+    if model == "cpm":
+        return float(_Dec(str(rate_pkr)) / _Dec("1000"))
+    return float(rate_pkr)
+
+
+def _ad_recent_served(creative_id: int, viewer_ip: str, minutes: int = 30) -> bool:
+    row = get_one("""
+        SELECT 1 FROM ad_impressions
+        WHERE creative_id = %s AND viewer_ip = %s
+          AND created_at >= now() - (%s || ' minutes')::interval
+        LIMIT 1
+    """, (creative_id, viewer_ip, str(minutes)))
+    return bool(row)
+
+
+@router.get("/ads/serve")
+async def ad_serve(viewkey: str, request: Request, actor: dict = Depends(get_actor)):
+    """Video page ke liye ek ad pick karo."""
+    v = get_one("""
+        SELECT v.id, v.category,
+               COALESCE((SELECT array_agg(tag_id) FROM video_tags WHERE video_id = v.id), '{}') AS tags
+        FROM videos v WHERE v.viewkey = %s
+    """, (viewkey,))
+    if not v:
+        return {"success": False, "message": "Video not found"}
+
+    camp = _ad_pick_for_video(v["id"], v["category"], v["tags"] or [])
+    if not camp:
+        return {"success": True, "ad": None}
+
+    cr = _ad_pick_creative(camp["campaign_id"])
+    if not cr:
+        return {"success": True, "ad": None}
+
+    ip = _ip(request)
+    if _ad_recent_served(cr["id"], ip, 30):
+        return {"success": True, "ad": None}
+
+    cost = _ad_cost_for(camp["model"], float(camp["rate_pkr"]))
+
+    imp = get_one("""
+        INSERT INTO ad_impressions
+            (campaign_id, creative_id, video_id, viewer_ip, viewer_id, cost)
+        VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
+    """, (camp["campaign_id"], cr["id"], v["id"], ip, actor["user_id"], cost))
+
+    get_one("""
+        UPDATE ad_campaigns
+        SET spend_total = spend_total + %s,
+            spend_today = CASE WHEN spend_today_date = CURRENT_DATE THEN spend_today + %s ELSE %s END,
+            spend_today_date = CURRENT_DATE,
+            status = CASE WHEN spend_total + %s >= budget_total THEN 'completed' ELSE status END,
+            updated_at = now()
+        WHERE id = %s RETURNING id
+    """, (cost, cost, cost, cost, camp["campaign_id"]))
+
+    _ad_tx(camp["user_id"], "spend", -cost, ref=f"camp:{camp['campaign_id']}",
+           note=f"impression ad:{imp['id']}")
+
+    return {
+        "success": True,
+        "ad": {
+            "impression_id": imp["id"],
+            "campaign_id": camp["campaign_id"],
+            "creative_id": cr["id"],
+            "type": cr["type"],
+            "url": cr["url"],
+            "thumbnail": cr["thumbnail"],
+            "title": cr["title"],
+            "description": cr["description"],
+            "cta_text": cr["cta_text"],
+            "destination_url": cr["destination_url"],
+        }
+    }
+
+
+@router.post("/ads/click/{impression_id}")
+async def ad_click(impression_id: int, request: Request, actor: dict = Depends(get_actor)):
+    imp = get_one("""
+        SELECT i.*, c.model, c.rate_pkr, c.user_id, c.destination_url
+        FROM ad_impressions i
+        JOIN ad_campaigns c ON c.id = i.campaign_id
+        WHERE i.id = %s
+    """, (impression_id,))
+    if not imp:
+        raise HTTPException(404, "Impression not found")
+
+    if imp["model"] != "cpc":
+        return {"success": True, "destination_url": imp.get("destination_url"), "charged": False}
+
+    cost = _ad_cost_for("cpc", float(imp["rate_pkr"]))
+
+    get_one("""
+        INSERT INTO ad_clicks
+            (campaign_id, creative_id, impression_id, video_id, viewer_ip, viewer_id, cost)
+        VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id
+    """, (imp["campaign_id"], imp["creative_id"], impression_id, imp["video_id"],
+          _ip(request), actor["user_id"], cost))
+
+    get_one("""
+        UPDATE ad_campaigns
+        SET spend_total = spend_total + %s,
+            spend_today = CASE WHEN spend_today_date = CURRENT_DATE THEN spend_today + %s ELSE %s END,
+            spend_today_date = CURRENT_DATE,
+            status = CASE WHEN spend_total + %s >= budget_total THEN 'completed' ELSE status END,
+            updated_at = now()
+        WHERE id = %s RETURNING id
+    """, (cost, cost, cost, cost, imp["campaign_id"]))
+
+    _ad_tx(imp["user_id"], "spend", -cost, ref=f"camp:{imp['campaign_id']}",
+           note=f"click imp:{impression_id}")
+
+    return {"success": True, "destination_url": imp.get("destination_url"), "charged": True}
+
+
+# =====================================================================
+#  AD CENTER — ADMIN
+# =====================================================================
+@router.get("/admin/ads/campaigns")
+async def admin_ad_campaigns(status: str = "all", limit: int = 30, offset: int = 0,
+                             actor: dict = Depends(get_actor)):
+    _need_admin(actor)
+    if status not in ("all", "draft", "pending", "active", "paused", "rejected", "completed"):
+        raise HTTPException(400, "Invalid status")
+    limit = max(1, min(limit, 100))
+    where = "" if status == "all" else "WHERE c.status = %s"
+    params = (limit + 1, max(0, offset)) if status == "all" else (status, limit + 1, max(0, offset))
+    rows = execute_query(f"""
+        SELECT c.*, u.name AS user_name, u.email AS user_email,
+               (SELECT COUNT(*) FROM ad_creatives cr WHERE cr.campaign_id = c.id) AS creative_count
+        FROM ad_campaigns c
+        JOIN mydata u ON u.id = c.user_id
+        {where}
+        ORDER BY c.created_at DESC LIMIT %s OFFSET %s
+    """, params, fetch=True) or []
+    return {"success": True, "has_more": len(rows) > limit, "campaigns": rows[:limit]}
+
+
+@router.get("/admin/ads/campaigns/{campaign_id}")
+async def admin_ad_campaign_get(campaign_id: int, actor: dict = Depends(get_actor)):
+    _need_admin(actor)
+    c = get_one("""
+        SELECT c.*, u.name AS user_name, u.email AS user_email
+        FROM ad_campaigns c JOIN mydata u ON u.id = c.user_id
+        WHERE c.id = %s
+    """, (campaign_id,))
+    if not c:
+        raise HTTPException(404, "Campaign not found")
+    crs = execute_query("SELECT * FROM ad_creatives WHERE campaign_id = %s ORDER BY id",
+                        (campaign_id,), fetch=True) or []
+    return {"success": True, "campaign": c, "creatives": crs}
+
+
+@router.post("/admin/ads/campaigns/{campaign_id}/review")
+async def admin_ad_campaign_review(campaign_id: int, body: AdReviewIn,
+                                   actor: dict = Depends(get_actor)):
+    _need_admin(actor)
+    if body.action not in ("approve", "reject"):
+        raise HTTPException(400, "action must be approve or reject")
+
+    c = get_one("SELECT * FROM ad_campaigns WHERE id = %s", (campaign_id,))
+    if not c:
+        raise HTTPException(404, "Campaign not found")
+    if c["status"] != "pending":
+        return {"success": False, "message": f"Campaign is {c['status']}, not pending"}
+
+    note = (body.admin_note or "").strip()[:1000]
+
+    if body.action == "approve":
+        row = get_one("""
+            UPDATE ad_campaigns SET status='active', admin_note=%s,
+                                    reviewed_by=%s, reviewed_at=now(),
+                                    updated_at=now()
+            WHERE id = %s RETURNING *
+        """, (note, actor["user_id"], campaign_id))
+        try:
+            await notify(c["user_id"], "ad_campaign_approved", actor["user_id"])
+            await manager.push(c["user_id"], {"type": "ad_campaign_status",
+                                              "campaign_id": campaign_id, "status": "active"})
+        except Exception:
+            logger.exception("notify ad approve")
+        return {"success": True, "message": "Campaign approved", "campaign": row}
+
+    row = get_one("""
+        UPDATE ad_campaigns SET status='rejected', admin_note=%s,
+                                reviewed_by=%s, reviewed_at=now(),
+                                updated_at=now()
+        WHERE id = %s RETURNING *
+    """, (note, actor["user_id"], campaign_id))
+    try:
+        await notify(c["user_id"], "ad_campaign_rejected", actor["user_id"])
+        await manager.push(c["user_id"], {"type": "ad_campaign_status",
+                                          "campaign_id": campaign_id, "status": "rejected"})
+    except Exception:
+        logger.exception("notify ad reject")
+    return {"success": True, "message": "Campaign rejected", "campaign": row}
+
+
+@router.get("/admin/ads/revenue")
+async def admin_ad_revenue(actor: dict = Depends(get_actor)):
+    _need_admin(actor)
+    stats = get_one("""
+        SELECT
+          (SELECT COALESCE(SUM(amount),0) FROM ad_transactions WHERE kind='topup') AS total_topfup,
+          (SELECT COALESCE(SUM(-amount),0) FROM ad_transactions WHERE kind='spend') AS total_spend,
+          (SELECT COUNT(*) FROM ad_campaigns WHERE status='pending') AS pending_campaigns,
+          (SELECT COUNT(*) FROM ad_campaigns WHERE status='active')  AS active_campaigns,
+          (SELECT COUNT(*) FROM ad_impressions) AS total_impressions,
+          (SELECT COUNT(*) FROM ad_clicks) AS total_clicks
+    """)
+    return {"success": True, "stats": stats}
+
+
+@router.post("/admin/ads/wallet/adjust")
+async def admin_ad_wallet_adjust(body: AdWalletAdjustIn, actor: dict = Depends(get_actor)):
+    _need_admin(actor)
+    u = get_one("SELECT id FROM mydata WHERE id = %s", (body.user_id,))
+    if not u:
+        raise HTTPException(404, "User not found")
+    try:
+        amount = float(body.amount)
+    except Exception:
+        raise HTTPException(400, "Invalid amount")
+    if amount == 0:
+        raise HTTPException(400, "Amount cannot be zero")
+
+    _ad_tx(body.user_id, "adjust", amount, ref=f"admin:{actor['user_id']}",
+           note=(body.note or "").strip()[:500])
+
+    w = _ad_get_wallet(body.user_id)
+    return {"success": True, "wallet": w}
+
+
+@router.get("/admin/ads/wallets")
+async def admin_ad_wallets(limit: int = 30, offset: int = 0, actor: dict = Depends(get_actor)):
+    _need_admin(actor)
+    limit = max(1, min(limit, 100))
+    rows = execute_query("""
+        SELECT w.user_id, u.name AS user_name, u.email AS user_email,
+               w.balance, w.total_spent, w.total_added, w.updated_at
+        FROM ad_wallets w JOIN mydata u ON u.id = w.user_id
+        ORDER BY w.updated_at DESC LIMIT %s OFFSET %s
+    """, (limit + 1, max(0, offset)), fetch=True) or []
+    return {"success": True, "has_more": len(rows) > limit, "wallets": rows[:limit]}
+
+
+# =====================================================================
+#  ADMIN PANEL HTML
+# =====================================================================
 @router.get("/admin", response_class=HTMLResponse)
 async def admin_panel():
     """Serve admin panel HTML."""
