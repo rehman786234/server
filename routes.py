@@ -21,6 +21,8 @@ from models import (
     User, UserCreate, UserLogin, APIKeyRequest, Video,
     TagOut, TagsForVideoIn,
     PlaylistCreateIn, PlaylistUpdateIn, PlaylistAddVideoIn, PlaylistReorderIn,
+    PaymentSubmitIn, PaymentReviewIn,
+    SupportThreadCreateIn, SupportMessageIn, SupportStatusIn,
 )
 
 logger = logging.getLogger(__name__)
@@ -2199,3 +2201,638 @@ async def ensure_watch_later(actor: dict = Depends(get_actor)):
                   created_at, updated_at
     """, (actor["user_id"],))
     return {"success": True, "playlist": row, "created": True}
+# =====================================================================
+#  PART 2: PLANS + PAYMENTS + SUPPORT CHAT + ADMIN
+#  Ye block routes.py ke bilkul end me paste karo
+# =====================================================================
+
+
+# ---------- PLANS (public) ----------
+
+@router.get("/plans")
+async def list_plans():
+    """Public pricing page ke liye."""
+    rows = execute_query("""
+        SELECT id, code, name, description, price_pkr, price_usd,
+               duration_days, features, sort_order
+        FROM plans WHERE is_active = true
+        ORDER BY sort_order ASC, id ASC
+    """, fetch=True) or []
+    return {"success": True, "plans": rows}
+
+
+@router.get("/ad-pricing")
+async def list_ad_pricing():
+    """Ad rates — advertiser dashboard ke liye."""
+    rows = execute_query("""
+        SELECT id, model, price_pkr, price_usd, min_budget
+        FROM ad_pricing WHERE is_active = true ORDER BY model ASC
+    """, fetch=True) or []
+    return {"success": True, "pricing": rows}
+
+
+# ---------- PAYMENTS (user side) ----------
+
+@router.post("/payments/submit")
+async def payment_submit(body: PaymentSubmitIn, actor: dict = Depends(get_actor)):
+    """
+    User payment submit karta hai. Admin manually verify karega.
+    Screenshot Cloudinary pe upload hoga (existing signed endpoint se).
+    """
+    need_verified(actor)
+    uid = actor["user_id"]
+
+    # Validation
+    method = (body.method or "").strip().lower()
+    if method not in ("jazzcash", "easypaisa", "bank", "crypto", "other"):
+        return {"success": False, "message": "Invalid payment method"}
+    tid = (body.transaction_id or "").strip()
+    if not (4 <= len(tid) <= 120):
+        return {"success": False, "message": "Transaction ID must be 4-120 characters"}
+    try:
+        amount = float(body.amount)
+    except Exception:
+        return {"success": False, "message": "Invalid amount"}
+    if amount <= 0 or amount > 10_000_000:
+        return {"success": False, "message": "Invalid amount"}
+
+    plan = get_one("SELECT id, price_pkr FROM plans WHERE id = %s AND is_active = true",
+                   (body.plan_id,))
+    if not plan:
+        return {"success": False, "message": "Plan not found"}
+
+    ss = (body.screenshot_url or "").strip()
+    if ss and not ss.startswith("https://res.cloudinary.com/"):
+        return {"success": False, "message": "Screenshot must be a Cloudinary URL"}
+
+    # Duplicate TID check (same method + TID ke saath pending/approved already hai?)
+    dup = get_one("""
+        SELECT id FROM payments
+        WHERE method = %s AND transaction_id = %s AND status <> 'rejected'
+    """, (method, tid))
+    if dup:
+        return {"success": False, "message": "This transaction ID is already submitted"}
+
+    # Rate-limit: 3 pending submissions max
+    pend = get_one("""
+        SELECT COUNT(*) AS n FROM payments WHERE user_id = %s AND status = 'pending'
+    """, (uid,))
+    if pend and pend["n"] >= 3:
+        return {"success": False, "message": "You already have 3 pending payments. Wait for admin review."}
+
+    row = get_one("""
+        INSERT INTO payments
+            (user_id, plan_id, amount, currency, method, transaction_id,
+             sender_name, sender_account, screenshot_url, user_note)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        RETURNING id, user_id, plan_id, amount, currency, method,
+                  transaction_id, status, created_at
+    """, (
+        uid, plan["id"], amount, (body.currency or "PKR").upper()[:10],
+        method, tid,
+        (body.sender_name or "").strip()[:120] or None,
+        (body.sender_account or "").strip()[:120] or None,
+        ss or None,
+        (body.user_note or "").strip()[:500],
+    ))
+
+    # Admin ko notify (agar koi admin user id list me hai)
+    try:
+        for admin_id in ADMIN_USER_IDS:
+            await notify(admin_id, "payment_submitted", uid)
+    except Exception:
+        logger.exception("notify payment_submitted")
+
+    return {"success": True, "message": "Payment submitted. Admin will verify soon.",
+            "payment": row}
+
+
+@router.get("/payments/my")
+async def my_payments(limit: int = 20, offset: int = 0, actor: dict = Depends(get_actor)):
+    need_verified(actor)
+    limit = max(1, min(limit, 50))
+    rows = execute_query("""
+        SELECT p.id, p.plan_id, pl.name AS plan_name,
+               p.amount, p.currency, p.method, p.transaction_id,
+               p.status, p.admin_note, p.created_at, p.reviewed_at
+        FROM payments p
+        LEFT JOIN plans pl ON pl.id = p.plan_id
+        WHERE p.user_id = %s
+        ORDER BY p.created_at DESC LIMIT %s OFFSET %s
+    """, (actor["user_id"], limit + 1, max(0, offset)), fetch=True) or []
+    return {"success": True, "has_more": len(rows) > limit, "payments": rows[:limit]}
+
+
+@router.get("/payments/status")
+async def my_payment_status(actor: dict = Depends(get_actor)):
+    """Frontend badge ke liye: pending count + latest status."""
+    need_verified(actor)
+    s = get_one("""
+        SELECT
+          COUNT(*) FILTER (WHERE status = 'pending')  AS pending,
+          COUNT(*) FILTER (WHERE status = 'approved') AS approved,
+          COUNT(*) FILTER (WHERE status = 'rejected') AS rejected
+        FROM payments WHERE user_id = %s
+    """, (actor["user_id"],))
+    latest = get_one("""
+        SELECT id, status, created_at FROM payments
+        WHERE user_id = %s ORDER BY created_at DESC LIMIT 1
+    """, (actor["user_id"],))
+    return {"success": True, "counts": s or {}, "latest": latest}
+
+
+# ---------- SUPPORT CHAT (user side) ----------
+
+@router.post("/support/threads/create")
+async def support_create_thread(body: SupportThreadCreateIn,
+                                actor: dict = Depends(get_actor)):
+    need_verified(actor)
+    msg = (body.message or "").strip()
+    if not (1 <= len(msg) <= 2000):
+        return {"success": False, "message": "Message must be 1-2000 characters"}
+    subj = (body.subject or "Support").strip()[:200] or "Support"
+
+    # Max 5 open threads
+    op = get_one("""
+        SELECT COUNT(*) AS n FROM support_threads
+        WHERE user_id = %s AND status = 'open'
+    """, (actor["user_id"],))
+    if op and op["n"] >= 5:
+        return {"success": False, "message": "You already have 5 open support threads"}
+
+    th = get_one("""
+        INSERT INTO support_threads (user_id, subject, unread_admin, unread_user)
+        VALUES (%s, %s, 1, 0) RETURNING id, user_id, subject, status, created_at
+    """, (actor["user_id"], subj))
+
+    get_one("""
+        INSERT INTO support_messages (thread_id, sender_id, is_admin, content, attachment)
+        VALUES (%s, %s, false, %s, %s) RETURNING id
+    """, (th["id"], actor["user_id"], msg, (body.attachment or None)))
+
+    try:
+        for admin_id in ADMIN_USER_IDS:
+            await notify(admin_id, "support_message", actor["user_id"])
+    except Exception:
+        logger.exception("notify support create")
+
+    return {"success": True, "thread": th}
+
+
+@router.get("/support/threads/my")
+async def support_my_threads(actor: dict = Depends(get_actor)):
+    need_verified(actor)
+    rows = execute_query("""
+        SELECT t.id, t.subject, t.status, t.priority,
+               t.unread_user, t.last_message_at, t.created_at,
+               (SELECT content FROM support_messages m
+                WHERE m.thread_id = t.id ORDER BY m.created_at DESC LIMIT 1) AS last_message,
+               (SELECT COUNT(*) FROM support_messages m WHERE m.thread_id = t.id) AS message_count
+        FROM support_threads t
+        WHERE t.user_id = %s
+        ORDER BY t.last_message_at DESC LIMIT 50
+    """, (actor["user_id"],), fetch=True) or []
+    return {"success": True, "threads": rows}
+
+
+@router.get("/support/threads/{thread_id}")
+async def support_get_thread(thread_id: int, actor: dict = Depends(get_actor)):
+    need_verified(actor)
+    t = get_one("SELECT * FROM support_threads WHERE id = %s AND user_id = %s",
+                (thread_id, actor["user_id"]))
+    if not t:
+        raise HTTPException(404, "Thread not found")
+    msgs = execute_query("""
+        SELECT m.id, m.sender_id, m.is_admin, m.content, m.attachment,
+               m.created_at,
+               COALESCE(c.channel_name, u.name) AS sender_name,
+               COALESCE(c.avatar_url, u.avatar_url) AS sender_avatar
+        FROM support_messages m
+        JOIN mydata u ON u.id = m.sender_id
+        LEFT JOIN channels c ON c.user_id = u.id
+        WHERE m.thread_id = %s ORDER BY m.created_at ASC LIMIT 500
+    """, (thread_id,), fetch=True) or []
+    # mark as read for user
+    get_one("UPDATE support_threads SET unread_user = 0 WHERE id = %s RETURNING id",
+            (thread_id,))
+    get_one("""
+        UPDATE support_messages SET is_read = true
+        WHERE thread_id = %s AND is_admin = true AND is_read = false RETURNING id
+    """, (thread_id,))
+    return {"success": True, "thread": t, "messages": msgs}
+
+
+@router.post("/support/threads/{thread_id}/reply")
+async def support_user_reply(thread_id: int, body: SupportMessageIn,
+                             actor: dict = Depends(get_actor)):
+    need_verified(actor)
+    t = get_one("SELECT id, user_id, status FROM support_threads WHERE id = %s",
+                (thread_id,))
+    if not t or t["user_id"] != actor["user_id"]:
+        raise HTTPException(404, "Thread not found")
+    if t["status"] == "closed":
+        return {"success": False, "message": "This thread is closed"}
+
+    content = (body.content or "").strip()
+    if not (1 <= len(content) <= 2000):
+        return {"success": False, "message": "Message must be 1-2000 characters"}
+
+    att = (body.attachment or "").strip()
+    if att and not att.startswith("https://res.cloudinary.com/"):
+        return {"success": False, "message": "Attachment must be a Cloudinary URL"}
+
+    m = get_one("""
+        INSERT INTO support_messages (thread_id, sender_id, is_admin, content, attachment)
+        VALUES (%s, %s, false, %s, %s)
+        RETURNING id, thread_id, sender_id, is_admin, content, attachment, created_at
+    """, (thread_id, actor["user_id"], content, att or None))
+
+    get_one("""
+        UPDATE support_threads SET last_message_at = now(), unread_admin = unread_admin + 1
+        WHERE id = %s RETURNING id
+    """, (thread_id,))
+
+    try:
+        for admin_id in ADMIN_USER_IDS:
+            await notify(admin_id, "support_message", actor["user_id"])
+    except Exception:
+        logger.exception("notify support reply")
+
+    return {"success": True, "message": m}
+
+
+@router.post("/support/threads/{thread_id}/close")
+async def support_user_close(thread_id: int, actor: dict = Depends(get_actor)):
+    need_verified(actor)
+    t = get_one("SELECT id, user_id FROM support_threads WHERE id = %s", (thread_id,))
+    if not t or t["user_id"] != actor["user_id"]:
+        raise HTTPException(404, "Thread not found")
+    get_one("UPDATE support_threads SET status = 'closed' WHERE id = %s RETURNING id",
+            (thread_id,))
+    return {"success": True}
+
+
+# =====================================================================
+#  ADMIN ENDPOINTS
+# =====================================================================
+
+def _need_admin(actor: dict):
+    need_verified(actor)
+    if actor["user_id"] not in ADMIN_USER_IDS:
+        raise HTTPException(403, "Admins only")
+
+
+@router.get("/admin/dashboard")
+async def admin_dashboard(actor: dict = Depends(get_actor)):
+    """Admin overview: sab stats ek jagah."""
+    _need_admin(actor)
+    stats = get_one("""
+        SELECT
+          (SELECT COUNT(*) FROM mydata)                                  AS total_users,
+          (SELECT COUNT(*) FROM mydata WHERE is_premium = true)          AS premium_users,
+          (SELECT COUNT(*) FROM payments WHERE status = 'pending')       AS pending_payments,
+          (SELECT COUNT(*) FROM payments WHERE status = 'approved')      AS approved_payments,
+          (SELECT COALESCE(SUM(amount),0) FROM payments WHERE status='approved') AS total_revenue,
+          (SELECT COUNT(*) FROM support_threads WHERE status = 'open')   AS open_threads,
+          (SELECT COUNT(*) FROM support_threads WHERE unread_admin > 0)  AS unread_threads,
+          (SELECT COUNT(*) FROM videos)                                  AS total_videos,
+          (SELECT COUNT(*) FROM channels)                                AS total_channels
+    """)
+    return {"success": True, "stats": stats}
+
+
+# ----- PAYMENTS ADMIN -----
+
+@router.get("/admin/payments")
+async def admin_list_payments(status: str = "pending", limit: int = 30, offset: int = 0,
+                              actor: dict = Depends(get_actor)):
+    _need_admin(actor)
+    if status not in ("pending", "approved", "rejected", "all"):
+        raise HTTPException(400, "Invalid status")
+    limit = max(1, min(limit, 100))
+    where = "" if status == "all" else "WHERE p.status = %s"
+    params = (limit + 1, max(0, offset)) if status == "all" else (status, limit + 1, max(0, offset))
+    rows = execute_query(f"""
+        SELECT p.id, p.user_id, u.name AS user_name, u.email AS user_email,
+               p.plan_id, pl.name AS plan_name,
+               p.amount, p.currency, p.method, p.transaction_id,
+               p.sender_name, p.sender_account, p.screenshot_url, p.user_note,
+               p.status, p.admin_note, p.reviewed_by, p.reviewed_at, p.created_at
+        FROM payments p
+        JOIN mydata u ON u.id = p.user_id
+        LEFT JOIN plans pl ON pl.id = p.plan_id
+        {where}
+        ORDER BY p.created_at DESC LIMIT %s OFFSET %s
+    """, params, fetch=True) or []
+    return {"success": True, "has_more": len(rows) > limit, "payments": rows[:limit]}
+
+
+@router.get("/admin/payments/{payment_id}")
+async def admin_get_payment(payment_id: int, actor: dict = Depends(get_actor)):
+    _need_admin(actor)
+    row = get_one("""
+        SELECT p.*, u.name AS user_name, u.email AS user_email,
+               pl.name AS plan_name, pl.duration_days
+        FROM payments p
+        JOIN mydata u ON u.id = p.user_id
+        LEFT JOIN plans pl ON pl.id = p.plan_id
+        WHERE p.id = %s
+    """, (payment_id,))
+    if not row:
+        raise HTTPException(404, "Payment not found")
+    return {"success": True, "payment": row}
+
+
+@router.post("/admin/payments/{payment_id}/review")
+async def admin_review_payment(payment_id: int, body: PaymentReviewIn,
+                               actor: dict = Depends(get_actor)):
+    """
+    Approve → user premium ho jata hai (plan ke duration ke liye).
+    Reject  → note save.
+    """
+    _need_admin(actor)
+    if body.action not in ("approve", "reject"):
+        raise HTTPException(400, "action must be approve or reject")
+
+    p = get_one("""
+        SELECT p.*, pl.duration_days
+        FROM payments p LEFT JOIN plans pl ON pl.id = p.plan_id
+        WHERE p.id = %s
+    """, (payment_id,))
+    if not p:
+        raise HTTPException(404, "Payment not found")
+    if p["status"] != "pending":
+        return {"success": False, "message": f"Payment already {p['status']}"}
+
+    note = (body.admin_note or "").strip()[:1000]
+
+    if body.action == "approve":
+        # User premium banao
+        get_one("UPDATE mydata SET is_premium = true WHERE id = %s RETURNING id",
+                (p["user_id"],))
+        get_one("""
+            UPDATE payments SET status='approved', admin_note=%s,
+                                reviewed_by=%s, reviewed_at=now()
+            WHERE id = %s RETURNING id
+        """, (note, actor["user_id"], payment_id))
+
+        # Notify user
+        try:
+            await notify(p["user_id"], "payment_approved", actor["user_id"])
+            await manager.push(p["user_id"], {
+                "type": "payment_status",
+                "payment_id": payment_id,
+                "status": "approved",
+                "plan_name": p.get("plan_name"),
+            })
+        except Exception:
+            logger.exception("notify payment approved")
+
+        return {"success": True, "message": "Payment approved, user is now premium"}
+
+    # reject
+    get_one("""
+        UPDATE payments SET status='rejected', admin_note=%s,
+                            reviewed_by=%s, reviewed_at=now()
+        WHERE id = %s RETURNING id
+    """, (note, actor["user_id"], payment_id))
+
+    try:
+        await notify(p["user_id"], "payment_rejected", actor["user_id"])
+        await manager.push(p["user_id"], {
+            "type": "payment_status",
+            "payment_id": payment_id,
+            "status": "rejected",
+            "admin_note": note,
+        })
+    except Exception:
+        logger.exception("notify payment rejected")
+
+    return {"success": True, "message": "Payment rejected"}
+
+
+# ----- SUPPORT ADMIN -----
+
+@router.get("/admin/support/threads")
+async def admin_list_threads(status: str = "open", limit: int = 40, offset: int = 0,
+                             actor: dict = Depends(get_actor)):
+    _need_admin(actor)
+    if status not in ("open", "closed", "all"):
+        raise HTTPException(400, "Invalid status")
+    limit = max(1, min(limit, 100))
+    where = "" if status == "all" else "WHERE t.status = %s"
+    params = (limit + 1, max(0, offset)) if status == "all" else (status, limit + 1, max(0, offset))
+    rows = execute_query(f"""
+        SELECT t.id, t.user_id, u.name AS user_name, u.email AS user_email,
+               t.subject, t.status, t.priority,
+               t.unread_admin, t.unread_user,
+               t.last_message_at, t.created_at,
+               (SELECT content FROM support_messages m
+                WHERE m.thread_id = t.id ORDER BY m.created_at DESC LIMIT 1) AS last_message
+        FROM support_threads t
+        JOIN mydata u ON u.id = t.user_id
+        {where}
+        ORDER BY t.unread_admin DESC, t.last_message_at DESC
+        LIMIT %s OFFSET %s
+    """, params, fetch=True) or []
+    return {"success": True, "has_more": len(rows) > limit, "threads": rows[:limit]}
+
+
+@router.get("/admin/support/threads/{thread_id}")
+async def admin_get_thread(thread_id: int, actor: dict = Depends(get_actor)):
+    _need_admin(actor)
+    t = get_one("""
+        SELECT t.*, u.name AS user_name, u.email AS user_email, u.is_premium
+        FROM support_threads t JOIN mydata u ON u.id = t.user_id
+        WHERE t.id = %s
+    """, (thread_id,))
+    if not t:
+        raise HTTPException(404, "Thread not found")
+    msgs = execute_query("""
+        SELECT m.id, m.sender_id, m.is_admin, m.content, m.attachment, m.created_at,
+               COALESCE(c.channel_name, u.name) AS sender_name,
+               COALESCE(c.avatar_url, u.avatar_url) AS sender_avatar
+        FROM support_messages m
+        JOIN mydata u ON u.id = m.sender_id
+        LEFT JOIN channels c ON c.user_id = u.id
+        WHERE m.thread_id = %s ORDER BY m.created_at ASC LIMIT 500
+    """, (thread_id,), fetch=True) or []
+    get_one("UPDATE support_threads SET unread_admin = 0 WHERE id = %s RETURNING id",
+            (thread_id,))
+    get_one("""
+        UPDATE support_messages SET is_read = true
+        WHERE thread_id = %s AND is_admin = false AND is_read = false RETURNING id
+    """, (thread_id,))
+    return {"success": True, "thread": t, "messages": msgs}
+
+
+@router.post("/admin/support/threads/{thread_id}/reply")
+async def admin_thread_reply(thread_id: int, body: SupportMessageIn,
+                             actor: dict = Depends(get_actor)):
+    _need_admin(actor)
+    t = get_one("SELECT id, user_id, status FROM support_threads WHERE id = %s",
+                (thread_id,))
+    if not t:
+        raise HTTPException(404, "Thread not found")
+    if t["status"] == "closed":
+        return {"success": False, "message": "Thread is closed"}
+
+    content = (body.content or "").strip()
+    if not (1 <= len(content) <= 2000):
+        return {"success": False, "message": "Message must be 1-2000 characters"}
+    att = (body.attachment or "").strip()
+    if att and not att.startswith("https://res.cloudinary.com/"):
+        return {"success": False, "message": "Attachment must be Cloudinary URL"}
+
+    m = get_one("""
+        INSERT INTO support_messages (thread_id, sender_id, is_admin, content, attachment)
+        VALUES (%s, %s, true, %s, %s)
+        RETURNING id, thread_id, sender_id, is_admin, content, attachment, created_at
+    """, (thread_id, actor["user_id"], content, att or None))
+
+    get_one("""
+        UPDATE support_threads SET last_message_at = now(), unread_user = unread_user + 1
+        WHERE id = %s RETURNING id
+    """, (thread_id,))
+
+    try:
+        await notify(t["user_id"], "support_reply", actor["user_id"])
+        await manager.push(t["user_id"], {
+            "type": "support_message",
+            "thread_id": thread_id,
+            "admin_message": content[:120],
+        })
+    except Exception:
+        logger.exception("notify admin reply")
+
+    return {"success": True, "message": m}
+
+
+@router.post("/admin/support/threads/{thread_id}/status")
+async def admin_thread_status(thread_id: int, body: SupportStatusIn,
+                              actor: dict = Depends(get_actor)):
+    _need_admin(actor)
+    if body.status not in ("open", "closed"):
+        raise HTTPException(400, "Invalid status")
+    prio = body.priority
+    if prio is not None and prio not in ("low", "normal", "high"):
+        raise HTTPException(400, "Invalid priority")
+
+    fields = {"status": body.status}
+    if prio:
+        fields["priority"] = prio
+
+    sets = ", ".join(f"{k} = %s" for k in fields)
+    row = get_one(f"""
+        UPDATE support_threads SET {sets} WHERE id = %s
+        RETURNING id, status, priority
+    """, (*fields.values(), thread_id))
+    if not row:
+        raise HTTPException(404, "Thread not found")
+    return {"success": True, "thread": row}
+
+
+# ----- USER MANAGEMENT (admin quick view) -----
+
+@router.get("/admin/users")
+async def admin_list_users(q: str = "", limit: int = 30, offset: int = 0,
+                           actor: dict = Depends(get_actor)):
+    _need_admin(actor)
+    limit = max(1, min(limit, 100))
+    like = f"%{q.strip()}%" if q.strip() else None
+    rows = execute_query("""
+        SELECT u.id, u.name, u.email, u.is_premium, u.created_at,
+               (SELECT COUNT(*) FROM payments WHERE user_id = u.id AND status='pending') AS pending_payments,
+               (SELECT COUNT(*) FROM support_threads WHERE user_id = u.id AND status='open') AS open_threads
+        FROM mydata u
+        WHERE (%s::text IS NULL OR u.name ILIKE %s OR u.email ILIKE %s)
+        ORDER BY u.id DESC LIMIT %s OFFSET %s
+    """, (like, like, like, limit + 1, max(0, offset)), fetch=True) or []
+    return {"success": True, "has_more": len(rows) > limit, "users": rows[:limit]}
+
+
+@router.post("/admin/users/{user_id}/toggle-premium")
+async def admin_toggle_premium(user_id: int, actor: dict = Depends(get_actor)):
+    """Emergency: admin manually premium on/off kar sakta hai."""
+    _need_admin(actor)
+    u = get_one("SELECT id, is_premium FROM mydata WHERE id = %s", (user_id,))
+    if not u:
+        raise HTTPException(404, "User not found")
+    new_val = not u["is_premium"]
+    get_one("UPDATE mydata SET is_premium = %s WHERE id = %s RETURNING id",
+            (new_val, user_id))
+    return {"success": True, "user_id": user_id, "is_premium": new_val}
+
+
+# ----- PRICING ADMIN (plans + ad pricing edit) -----
+
+class PlanEditIn(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    price_pkr: Optional[float] = None
+    price_usd: Optional[float] = None
+    duration_days: Optional[int] = None
+    features: Optional[list] = None
+    is_active: Optional[bool] = None
+    sort_order: Optional[int] = None
+
+
+@router.get("/admin/plans")
+async def admin_list_plans(actor: dict = Depends(get_actor)):
+    _need_admin(actor)
+    rows = execute_query("SELECT * FROM plans ORDER BY sort_order, id", fetch=True) or []
+    return {"success": True, "plans": rows}
+
+
+@router.put("/admin/plans/{plan_id}")
+async def admin_edit_plan(plan_id: int, body: PlanEditIn,
+                          actor: dict = Depends(get_actor)):
+    _need_admin(actor)
+    fields = {k: v for k, v in body.dict().items() if v is not None}
+    if not fields:
+        return {"success": False, "message": "Nothing to update"}
+    if "features" in fields:
+        import json as _json
+        fields["features"] = _json.dumps(fields["features"])
+        row = get_one(f"""
+            UPDATE plans SET {", ".join(f"{k} = %s" for k in fields)},
+                             updated_at = now(),
+                             features = %s::jsonb
+            WHERE id = %s RETURNING *
+        """, (*[v for k, v in fields.items() if k != "features"],
+              fields["features"], plan_id))
+    else:
+        sets = ", ".join(f"{k} = %s" for k in fields)
+        row = get_one(f"""
+            UPDATE plans SET {sets}, updated_at = now()
+            WHERE id = %s RETURNING *
+        """, (*fields.values(), plan_id))
+    if not row:
+        raise HTTPException(404, "Plan not found")
+    return {"success": True, "plan": row}
+
+
+class AdPricingEditIn(BaseModel):
+    price_pkr: Optional[float] = None
+    price_usd: Optional[float] = None
+    min_budget: Optional[float] = None
+    is_active: Optional[bool] = None
+
+
+@router.put("/admin/ad-pricing/{model}")
+async def admin_edit_ad_pricing(model: str, body: AdPricingEditIn,
+                                actor: dict = Depends(get_actor)):
+    _need_admin(actor)
+    if model not in ("cpm", "cpc"):
+        raise HTTPException(400, "model must be cpm or cpc")
+    fields = {k: v for k, v in body.dict().items() if v is not None}
+    if not fields:
+        return {"success": False, "message": "Nothing to update"}
+    sets = ", ".join(f"{k} = %s" for k in fields)
+    row = get_one(f"""
+        UPDATE ad_pricing SET {sets}, updated_at = now()
+        WHERE model = %s RETURNING *
+    """, (*fields.values(), model))
+    if not row:
+        raise HTTPException(404, "Pricing not found")
+    return {"success": True, "pricing": row}
