@@ -2203,8 +2203,8 @@ async def playlist_detail(pl_id: int, actor: dict = Depends(get_actor)):
     items = execute_query("""
         SELECT pi.id AS item_id, pi.position,
                v.id AS video_id, v.title, v.viewkey, v.thumbnail, v.category,
-               v.is_premium, v.views, v.duration, v.uploaded_at,
-               v.visibility,
+             v.is_premium, v.views, v.duration, v.uploaded_at, v.visibility,
+             v.user_id, v.stream_link,
                COALESCE(c.channel_name, u.name) AS channel_name,
                c.handle AS channel_handle,
                COALESCE(c.avatar_url, u.avatar_url) AS channel_avatar
@@ -2217,10 +2217,11 @@ async def playlist_detail(pl_id: int, actor: dict = Depends(get_actor)):
     """, (pl_id,), fetch=True) or []
 
     for it in items:
-        it["locked"] = bool(it["is_premium"] and not actor["is_premium"]
-                            and actor["user_id"] != pl["user_id"])
+        can_view = _can_view_video(it, actor)
+        it["locked"] = not can_view
         if it["locked"]:
-            it.pop("viewkey", None)
+            it["stream_link"] = ""
+        it.pop("user_id", None)
 
     pl["is_owner"] = bool(actor["user_id"] and actor["user_id"] == pl["user_id"])
     return {"success": True, "playlist": pl, "items": items}
