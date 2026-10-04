@@ -1036,11 +1036,13 @@ async def api_analytics(api_key: str = Header(...)):
 #  VIDEOS
 # =====================================================================
 @router.get("/videos")
-def get_videos(limit: int = 50, offset: int = 0):
+def get_videos(limit: int = 50, offset: int = 0, video_type: Optional[str] = None):
     """Page through free public videos; no login needed."""
+    if video_type is not None and video_type not in ("short", "long"):
+        raise HTTPException(400, "Video type must be short or long")
     limit = max(1, min(limit, 100))
     offset = max(0, offset)
-    ckey = f"videos:free:{limit}:{offset}"
+    ckey = f"videos:free:{video_type or 'all'}:{limit}:{offset}"
     cached = cache_get(ckey)
     if cached is not None:
         return cached
@@ -1054,9 +1056,10 @@ def get_videos(limit: int = 50, offset: int = 0):
             LEFT JOIN channels c ON c.user_id = v.user_id
             LEFT JOIN mydata u   ON u.id = v.user_id
             WHERE v.is_premium = false AND v.visibility = 'public'
+              AND (%s::text IS NULL OR v.video_type = %s)
             ORDER BY v.uploaded_at DESC, v.id DESC
             LIMIT %s OFFSET %s
-        """, (limit, offset), fetch=True)
+        """, (video_type, video_type, limit, offset), fetch=True)
         results = results if results else []
         cache_set(ckey, results, TTL_VIDEOS)
         return results
@@ -1066,17 +1069,20 @@ def get_videos(limit: int = 50, offset: int = 0):
 
 
 @router.get("/premium_videos")
-def get_premium_videos(api_key: str = Header(...), limit: int = 50, offset: int = 0):
+def get_premium_videos(api_key: str = Header(...), limit: int = 50, offset: int = 0,
+                       video_type: Optional[str] = None):
     # API key + premium check HAR request par hota hai (cache se pehle) — sirf video list cache hoti hai
     user_data = validate_api_key(api_key, "/premium_videos")
     if not user_data:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired API key")
     if not user_data.get("is_premium"):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Premium subscription required")
+    if video_type is not None and video_type not in ("short", "long"):
+        raise HTTPException(400, "Video type must be short or long")
     try:
         limit = max(1, min(limit, 100))
         offset = max(0, offset)
-        ckey = f"videos:premium:{limit}:{offset}"
+        ckey = f"videos:premium:{video_type or 'all'}:{limit}:{offset}"
         results = cache_get(ckey)
         if results is None:
             results = execute_query("""
@@ -1088,9 +1094,10 @@ def get_premium_videos(api_key: str = Header(...), limit: int = 50, offset: int 
                 LEFT JOIN channels c ON c.user_id = v.user_id
                 LEFT JOIN mydata u   ON u.id = v.user_id
                 WHERE v.is_premium = true AND v.visibility = 'public'
+                  AND (%s::text IS NULL OR v.video_type = %s)
                 ORDER BY v.uploaded_at DESC, v.id DESC
                 LIMIT %s OFFSET %s
-            """, (limit + 1, offset), fetch=True) or []
+            """, (video_type, video_type, limit + 1, offset), fetch=True) or []
             cache_set(ckey, results, TTL_VIDEOS)
         has_more = len(results) > limit
         results = results[:limit]
