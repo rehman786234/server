@@ -21,6 +21,24 @@ BEGIN
 END $$;
 CREATE INDEX IF NOT EXISTS idx_videos_user ON videos(user_id);
 
+-- API-key usage tracking is written by validate_api_key() before premium-feed access.
+ALTER TABLE apikeys
+  ADD COLUMN IF NOT EXISTS request_count BIGINT NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ;
+
+CREATE TABLE IF NOT EXISTS api_usage (
+  id         BIGSERIAL PRIMARY KEY,
+  api_key_id INT NOT NULL REFERENCES apikeys(id) ON DELETE CASCADE,
+  user_id    INT NOT NULL REFERENCES mydata(id) ON DELETE CASCADE,
+  endpoint   TEXT NOT NULL,
+  method     VARCHAR(10) NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_api_usage_user_created
+  ON api_usage(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_api_usage_key
+  ON api_usage(api_key_id);
+
 -- 2) channels: one per user (uploader profile)
 CREATE TABLE IF NOT EXISTS channels (
   id           SERIAL PRIMARY KEY,

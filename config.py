@@ -9,14 +9,15 @@ class Config:
     MAX_CONNECTIONS = max(2, int(os.getenv("DB_POOL_MAX", "10")))
     POOL_ACQUIRE_TIMEOUT = max(1, int(os.getenv("DB_POOL_ACQUIRE_TIMEOUT", "5")))
 
-    # CORS origins are exact browser origins, without paths or trailing slashes.
+    # Never combine wildcard origins with credentials; use explicit browser origins.
     ORIGINS = list(dict.fromkeys([
         origin.strip().rstrip("/")
-        for origin in (
-            os.getenv("ORIGINS", "*") + ",http://localhost:5173,http://127.0.0.1:5173"
-        ).split(",")
-        if origin.strip()
+        for origin in os.getenv("ORIGINS", "").split(",")
+        if origin.strip() and origin.strip() != "*"
     ]))
+    ORIGINS = list(dict.fromkeys(
+        ORIGINS + ["http://localhost:5173", "http://127.0.0.1:5173"]
+    ))
     GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
     RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
     RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "").strip()

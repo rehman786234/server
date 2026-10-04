@@ -2474,15 +2474,29 @@ def smart_search(
     sort: str = "relevance",
     limit: int = 20,
     offset: int = 0,
+    videotype: str = "all",
+    video_type: Optional[str] = None,
+    category: str = "",
     actor: dict = Depends(get_actor),
 ):
     q = (q or "").strip()[:200]
     if len(q) < 2:
         return {"success": True, "query": q, "total": 0, "has_more": False, "videos": []}
 
+    if videotype not in ("all", "free", "premium"):
+        raise HTTPException(400, "Video tier must be all, free, or premium")
+    if video_type is not None and video_type not in ("short", "long"):
+        raise HTTPException(400, "Video type must be short or long")
+    if videotype == "premium" and not actor["is_premium"]:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Premium subscription required")
+
     limit = max(1, min(limit, 50))
     offset = max(0, offset)
-    ckey = f"search:{q.lower()}:{sort}:{limit}:{offset}:{int(bool(actor['is_premium']))}"
+    category = (category or "").strip()[:100] or None
+    ckey = (
+        f"search:{q.lower()}:{sort}:{videotype}:{video_type or 'all'}:"
+        f"{category or 'all'}:{limit}:{offset}:{int(bool(actor['is_premium']))}"
+    )
     cached = cache_get(ckey)
     if cached is not None:
         return cached
@@ -2549,6 +2563,9 @@ def smart_search(
             LEFT JOIN mydata u   ON u.id = v.user_id
             WHERE v.visibility = 'public'
               AND (%s::boolean OR v.is_premium = false)
+              AND (%s = 'all' OR v.is_premium = (%s = 'premium'))
+              AND (%s::text IS NULL OR v.video_type = %s)
+              AND (%s::text IS NULL OR v.category = %s)
               AND (
                     ({title_conditions})
                  OR ({description_conditions})
@@ -2588,6 +2605,9 @@ def smart_search(
         f"%{escape_like(q_lower)}%",
         f"%{escape_like(q_lower)}%",
         actor["is_premium"] or False,
+        videotype, videotype,
+        video_type, video_type,
+        category, category,
         *patterns,
         *patterns,
         *patterns,
@@ -2604,6 +2624,77 @@ def smart_search(
         "has_more": len(rows) > limit,
         "videos": rows[:limit],
     }
+    cache_set(ckey, payload, TTL_SEARCH)
+    return payload
+
+
+@router.get("/search/suggestions")
+def search_suggestions(
+    q: str = "",
+    limit: int = 8,
+    actor: dict = Depends(get_actor),
+):
+    q = (q or "").strip()[:100]
+    if len(q) < 2:
+        return {"success": True, "query": q, "suggestions": []}
+
+    limit = max(1, min(limit, 10))
+    q_lower = q.lower()
+    escaped = q_lower.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    ckey = f"search:suggestions:{q_lower}:{limit}:{int(bool(actor['is_premium']))}"
+    cached = cache_get(ckey)
+    if cached is not None:
+        return cached
+
+    rows = execute_query("""
+        WITH candidates AS (
+            SELECT v.title AS text, 'video' AS kind,
+                   CASE WHEN LOWER(v.title) = %s THEN 100
+                        WHEN LOWER(v.title) LIKE %s THEN 80 ELSE 50 END AS score,
+                   NULL::text AS channel_handle
+            FROM videos v
+            WHERE v.visibility = 'public'
+              AND (%s::boolean OR v.is_premium = false)
+              AND LOWER(v.title) LIKE %s
+
+            UNION ALL
+
+            SELECT COALESCE(c.channel_name, u.name) AS text, 'channel' AS kind,
+                   CASE WHEN LOWER(COALESCE(c.channel_name, u.name)) = %s THEN 100
+                        WHEN LOWER(COALESCE(c.channel_name, u.name)) LIKE %s THEN 80 ELSE 50 END AS score,
+                   c.handle AS channel_handle
+            FROM channels c
+            JOIN mydata u ON u.id = c.user_id
+            WHERE LOWER(COALESCE(c.channel_name, u.name)) LIKE %s
+
+            UNION ALL
+
+            SELECT t.name AS text, 'tag' AS kind,
+                   CASE WHEN LOWER(t.name) = %s THEN 100
+                        WHEN LOWER(t.name) LIKE %s THEN 80 ELSE 50 END AS score,
+                   NULL::text AS channel_handle
+            FROM tags t
+            WHERE t.usage_count > 0
+              AND (LOWER(t.name) LIKE %s OR LOWER(t.slug) LIKE %s)
+        ),
+        unique_suggestions AS (
+            SELECT DISTINCT ON (LOWER(text)) text, kind, score, channel_handle
+            FROM candidates
+            WHERE text IS NOT NULL AND text <> ''
+            ORDER BY LOWER(text), score DESC, kind
+        )
+        SELECT text, kind
+        FROM unique_suggestions
+        ORDER BY score DESC, LOWER(text)
+        LIMIT %s
+    """, (
+        q_lower, f"{escaped}%", actor["is_premium"] or False, f"%{escaped}%",
+        q_lower, f"{escaped}%", f"%{escaped}%",
+        q_lower, f"{escaped}%", f"%{escaped}%", f"{escaped}%",
+        limit,
+    ), fetch=True) or []
+
+    payload = {"success": True, "query": q, "suggestions": rows}
     cache_set(ckey, payload, TTL_SEARCH)
     return payload
 
