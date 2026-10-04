@@ -11,6 +11,7 @@ import time
 import asyncio
 import urllib.error
 import urllib.request
+from urllib.parse import unquote, urlencode, urlsplit
 from collections import defaultdict, deque
 from threading import Lock, Thread
 from datetime import datetime, timedelta
@@ -3282,6 +3283,117 @@ async def _support_notify_and_broadcast(thread_id: int, message: dict,
         logger.exception("broadcast support message")
 
 
+def _support_cloudinary_asset(secure_url: str):
+    parts = urlsplit(secure_url)
+    path_parts = parts.path.strip("/").split("/")
+    if (parts.scheme != "https" or parts.netloc != "res.cloudinary.com"
+            or len(path_parts) < 6 or path_parts[0] != CLD2_CLOUD
+            or path_parts[1] not in ("image", "video", "raw")
+            or path_parts[2] != "upload"):
+        return None
+    resource_type = path_parts[1]
+    asset_parts = path_parts[3:]
+    version_index = next(
+        (index for index, part in enumerate(asset_parts) if re.fullmatch(r"v\d+", part)),
+        None,
+    )
+    if version_index is None:
+        return None
+    public_id = unquote("/".join(asset_parts[version_index + 1:]))
+    if resource_type != "raw" and "." in public_id.rsplit("/", 1)[-1]:
+        public_id = public_id.rsplit(".", 1)[0]
+    if not public_id.startswith(("support/attachments/", "support/voices/")):
+        return None
+    return resource_type, public_id
+
+
+def _cloudinary_delete_support_assets(resource_type: str, public_ids: list[str]):
+    body = urlencode([("public_ids[]", public_id) for public_id in public_ids]).encode("utf-8")
+    url = (
+        f"https://api.cloudinary.com/v1_1/{CLD2_CLOUD}/resources/"
+        f"{resource_type}/upload"
+    )
+    credentials = base64.b64encode(f"{CLD2_KEY}:{CLD2_SECRET}".encode()).decode("ascii")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Authorization": f"Basic {credentials}"},
+        method="DELETE",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+        raise RuntimeError("Cloudinary attachment deletion request failed") from error
+    if not isinstance(result, dict):
+        raise RuntimeError("Cloudinary returned an invalid deletion response")
+    return result
+
+
+async def _delete_support_thread_attachments(thread_id: int):
+    if not (CLD2_CLOUD and CLD2_KEY and CLD2_SECRET):
+        logger.error("Cannot delete support attachments: Cloudinary credentials are not configured")
+        return {"deleted": 0, "cleanup_warning": "Cloudinary cleanup is not configured"}
+
+    rows = execute_query("""
+        SELECT DISTINCT attachment FROM support_messages
+        WHERE thread_id = %s AND attachment IS NOT NULL
+    """, (thread_id,), fetch=True) or []
+    assets = {}
+    unsupported = []
+    for row in rows:
+        url = row["attachment"]
+        asset = _support_cloudinary_asset(url)
+        if asset is None:
+            unsupported.append(url)
+            continue
+        assets.setdefault(asset[0], {}).setdefault(asset[1], set()).add(url)
+
+    if unsupported:
+        logger.warning(
+            "Support ticket %s has %s attachment(s) outside the configured Cloudinary support folders",
+            thread_id,
+            len(unsupported),
+        )
+
+    removed_urls = []
+    failures = []
+    for resource_type, public_id_to_url in assets.items():
+        public_ids = list(public_id_to_url)
+        for offset in range(0, len(public_ids), 100):
+            batch = public_ids[offset:offset + 100]
+            try:
+                result = await asyncio.to_thread(
+                    _cloudinary_delete_support_assets, resource_type, batch
+                )
+            except Exception:
+                logger.exception("Cloudinary deletion failed for support ticket %s", thread_id)
+                failures.extend(batch)
+                continue
+            deleted = result.get("deleted") or {}
+            for public_id in batch:
+                status_value = deleted.get(public_id)
+                if status_value in ("deleted", "not_found"):
+                    removed_urls.extend(public_id_to_url[public_id])
+                else:
+                    failures.append(public_id)
+
+    for url in removed_urls:
+        execute_query(
+            "UPDATE support_messages SET attachment = NULL WHERE thread_id = %s AND attachment = %s",
+            (thread_id, url),
+        )
+
+    warning = None
+    if failures or unsupported:
+        warning = (
+            f"{len(failures)} attachment(s) could not be removed"
+            if failures else f"{len(unsupported)} attachment(s) were not in the support Cloudinary folders"
+        )
+        logger.error("Support ticket %s cleanup incomplete: %s", thread_id, warning)
+    return {"deleted": len(removed_urls), "cleanup_warning": warning}
+
+
 def _schedule_support_notify_and_broadcast(thread_id: int, message: dict,
                                            is_admin: bool, thread_owner_id: int,
                                            sender_id: int):
@@ -3602,7 +3714,8 @@ async def support_user_close(thread_id: int, actor: dict = Depends(get_actor)):
         raise HTTPException(404, "Thread not found")
     get_one("UPDATE support_threads SET status = 'closed' WHERE id = %s RETURNING id",
             (thread_id,))
-    return {"success": True}
+    cleanup = await _delete_support_thread_attachments(thread_id)
+    return {"success": True, **cleanup}
 
 
 # =====================================================================
@@ -3949,7 +4062,12 @@ async def admin_thread_status(thread_id: int, body: SupportStatusIn,
     """, (*fields.values(), thread_id))
     if not row:
         raise HTTPException(404, "Thread not found")
-    return {"success": True, "thread": row}
+    cleanup = (
+        await _delete_support_thread_attachments(thread_id)
+        if body.status == "closed"
+        else {"deleted": 0, "cleanup_warning": None}
+    )
+    return {"success": True, "thread": row, **cleanup}
 
 
 @router.get("/admin/users")
