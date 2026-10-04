@@ -71,7 +71,7 @@ app = FastAPI(
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=['http://localhost:5173','https://videoserver.kesug.com','https://watchly.42web.io'],
+    allow_origins=['*'] or ['http://localhost:5173','https://videoserver.kesug.com','https://watchly.42web.io'],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
