@@ -16,7 +16,7 @@ from threading import Lock, Thread
 from datetime import datetime, timedelta
 from typing import Optional, List
 
-from fastapi import (APIRouter, BackgroundTasks, HTTPException, status, Header, Request, Depends,
+from fastapi import (APIRouter, BackgroundTasks, HTTPException, status, Header, Request, Response, Depends,
                      WebSocket, WebSocketDisconnect)
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import HTMLResponse
@@ -84,6 +84,7 @@ def _invalidate_studio_cache(user_id: int):
 def _invalidate_video_caches():
     """Video / channel / profile change hone par saare video-related caches saaf."""
     cache_del("videos:free", "videos:premium")
+    cache_del("playlists:v2:public:raw")
     cache_del_prefix("videos:free:")
     cache_del_prefix("videos:premium:")
     cache_del_prefix("search:")
@@ -97,9 +98,12 @@ def _invalidate_video_caches():
 #  DB INDEXES (sirf NAYE / missing indexes — "IF NOT EXISTS" ki wajah se
 #  baar baar chalane se koi nuqsan nahi). Background thread me chalta hai
 #  taake server start hone me rukawat na ho.
-#  Band karne ke liye Render env me:  AUTO_CREATE_INDEXES=0
+#  Serverless cold starts me repeated DDL se bachne ke liye Vercel par default off.
+#  Explicitly enable with AUTO_CREATE_INDEXES=1 when indexes need provisioning.
 # =====================================================================
-AUTO_CREATE_INDEXES = os.getenv("AUTO_CREATE_INDEXES", "1") == "1"
+AUTO_CREATE_INDEXES = os.getenv(
+    "AUTO_CREATE_INDEXES", "0" if os.getenv("VERCEL") else "1"
+) == "1"
 
 _NEW_INDEXES = [
     # --- pg_trgm: LIKE '%text%' / ILIKE search ko index se tez karta hai ---
@@ -273,7 +277,7 @@ def verify_password(password: str, stored: Optional[str]) -> tuple[bool, bool]:
 def validate_api_key(api_key: str, endpoint: str = None, method: str = "GET"):
     if endpoint is None:
         return get_one("""
-            SELECT a.*, a.id AS key_id, u.id AS user_id, u.name, u.email, u.is_premium
+            SELECT a.*, a.id AS key_id, u.name, u.email, u.is_premium
             FROM apikeys a
             JOIN mydata u ON a.user_id = u.id
             WHERE a.api_key = %s AND a.expiry_date > NOW()
@@ -281,14 +285,14 @@ def validate_api_key(api_key: str, endpoint: str = None, method: str = "GET"):
 
     query = """
         WITH valid_key AS (
-            SELECT a.*, a.id AS key_id, u.id AS user_id, u.name, u.email, u.is_premium
+            SELECT a.*, a.id AS key_id, u.name, u.email, u.is_premium
             FROM apikeys a
             JOIN mydata u ON a.user_id = u.id
             WHERE a.api_key = %s AND a.expiry_date > NOW()
         ),
         usage_logged AS (
             INSERT INTO api_usage (api_key_id, user_id, endpoint, method)
-            SELECT key_id, user_id, %s, %s
+            SELECT valid_key.key_id, valid_key.user_id, %s, %s
             FROM valid_key
             WHERE %s::text IS NOT NULL
             RETURNING api_key_id
@@ -1036,8 +1040,11 @@ async def api_analytics(api_key: str = Header(...)):
 #  VIDEOS
 # =====================================================================
 @router.get("/videos")
-def get_videos(limit: int = 50, offset: int = 0, video_type: Optional[str] = None):
+def get_videos(limit: int = 50, offset: int = 0, video_type: Optional[str] = None,
+               response: Response = None):
     """Page through free public videos; no login needed."""
+    if response is not None:
+        response.headers["Cache-Control"] = "public, max-age=5, s-maxage=30, stale-while-revalidate=60"
     if video_type is not None and video_type not in ("short", "long"):
         raise HTTPException(400, "Video type must be short or long")
     limit = max(1, min(limit, 100))
@@ -1270,35 +1277,39 @@ async def get_playlists(actor: dict = Depends(get_actor)):
 
 @router.get("/playlists/public")
 async def get_public_playlists(actor: dict = Depends(get_actor)):
-    rows = execute_query("""
-        SELECT p.id AS playlist_id, p.title AS playlist_name,
-               'free' AS playlist_type, p.thumbnail AS playlist_thumbnail,
-               p.created_at,
-               COALESCE(
-                   json_agg(json_build_object(
-                       'video_id', v.id,
-                       'viewkey', v.viewkey,
-                       'stream_url', '',
-                       'video_title', v.title,
-                       'video_thumbnail', v.thumbnail,
-                       'video_duration', v.duration,
-                       'category', v.category,
-                       'is_premium', v.is_premium,
-                       'views', v.views,
-                       'uploaded_at', v.uploaded_at,
-                       'visibility', v.visibility,
-                       'user_id', v.user_id
-                   ) ORDER BY pi.position ASC, pi.added_at ASC)
-                   FILTER (WHERE v.id IS NOT NULL), '[]'::json
-               ) AS videos
-        FROM playlists_v2 p
-        LEFT JOIN playlist_items pi ON pi.playlist_id = p.id
-        LEFT JOIN videos v ON v.id = pi.video_id
-        WHERE p.visibility = 'public'
-        GROUP BY p.id, p.title, p.thumbnail, p.created_at, p.updated_at
-        ORDER BY p.updated_at DESC
-        LIMIT 100
-    """, fetch=True) or []
+    rows = cache_get("playlists:v2:public:raw")
+    if rows is None:
+        rows = execute_query("""
+            SELECT p.id AS playlist_id, p.title AS playlist_name,
+                   'free' AS playlist_type, p.thumbnail AS playlist_thumbnail,
+                   p.created_at,
+                   COALESCE(
+                       json_agg(json_build_object(
+                           'video_id', v.id,
+                           'viewkey', v.viewkey,
+                           'stream_url', '',
+                           'video_title', v.title,
+                           'video_thumbnail', v.thumbnail,
+                           'video_duration', v.duration,
+                           'category', v.category,
+                           'is_premium', v.is_premium,
+                           'views', v.views,
+                           'uploaded_at', v.uploaded_at,
+                           'visibility', v.visibility,
+                           'user_id', v.user_id
+                       ) ORDER BY pi.position ASC, pi.added_at ASC)
+                       FILTER (WHERE v.id IS NOT NULL), '[]'::json
+                   ) AS videos
+            FROM playlists_v2 p
+            LEFT JOIN playlist_items pi ON pi.playlist_id = p.id
+            LEFT JOIN videos v ON v.id = pi.video_id
+            WHERE p.visibility = 'public'
+            GROUP BY p.id, p.title, p.thumbnail, p.created_at, p.updated_at
+            ORDER BY p.updated_at DESC
+            LIMIT 100
+        """, fetch=True) or []
+        cache_set("playlists:v2:public:raw", rows, TTL_LEGACY_PLAYLIST)
+    rows = copy.deepcopy(rows)
 
     for playlist in rows:
         videos = playlist.get("videos") or []
@@ -2478,6 +2489,7 @@ def smart_search(
     video_type: Optional[str] = None,
     category: str = "",
     actor: dict = Depends(get_actor),
+    response: Response = None,
 ):
     q = (q or "").strip()[:200]
     if len(q) < 2:
@@ -2493,6 +2505,8 @@ def smart_search(
     limit = max(1, min(limit, 50))
     offset = max(0, offset)
     category = (category or "").strip()[:100] or None
+    if response is not None and videotype == "free":
+        response.headers["Cache-Control"] = "public, max-age=5, s-maxage=30, stale-while-revalidate=60"
     ckey = (
         f"search:{q.lower()}:{sort}:{videotype}:{video_type or 'all'}:"
         f"{category or 'all'}:{limit}:{offset}:{int(bool(actor['is_premium']))}"
@@ -2543,18 +2557,18 @@ def smart_search(
                     CASE WHEN LOWER(v.title) LIKE %s THEN 120 ELSE 0 END +
                     CASE WHEN LOWER(v.title) LIKE %s THEN 80 ELSE 0 END +
                     45 * (SELECT COUNT(*) FROM query_terms qt
-                          WHERE LOWER(v.title) LIKE '%' || qt.term || '%') +
+                          WHERE LOWER(v.title) LIKE '%%' || qt.term || '%%') +
                     60 * (SELECT COUNT(*) FROM query_terms qt
                           WHERE EXISTS (
                               SELECT 1 FROM video_tags vt JOIN tags t ON t.id = vt.tag_id
                               WHERE vt.video_id = v.id
-                                AND (LOWER(t.name) LIKE '%' || qt.term || '%'
-                                     OR LOWER(t.slug) LIKE '%' || qt.term || '%')
+                                AND (LOWER(t.name) LIKE '%%' || qt.term || '%%'
+                                     OR LOWER(t.slug) LIKE '%%' || qt.term || '%%')
                           )) +
                     40 * (SELECT COUNT(*) FROM query_terms qt
-                          WHERE LOWER(c.channel_name) LIKE '%' || qt.term || '%'
-                             OR LOWER(u.name) LIKE '%' || qt.term || '%'
-                             OR LOWER(c.handle) LIKE '%' || qt.term || '%') +
+                          WHERE LOWER(c.channel_name) LIKE '%%' || qt.term || '%%'
+                             OR LOWER(u.name) LIKE '%%' || qt.term || '%%'
+                             OR LOWER(c.handle) LIKE '%%' || qt.term || '%%') +
                     CASE WHEN LOWER(COALESCE(v.description,'')) LIKE %s THEN 15 ELSE 0 END +
                     LEAST(COALESCE(v.views,0) / 100.0, 20)
                 ) AS rank_score
@@ -2586,11 +2600,15 @@ def smart_search(
             COALESCE(c.avatar_url, u.avatar_url) AS channel_avatar,
             m.rank_score,
             COALESCE((
-                SELECT json_agg(json_build_object('name', t.name, 'slug', t.slug)
-                                ORDER BY t.usage_count DESC)
-                FROM video_tags vt JOIN tags t ON t.id = vt.tag_id
-                WHERE vt.video_id = v.id
-                LIMIT 3
+                SELECT json_agg(json_build_object('name', top_tag.name, 'slug', top_tag.slug))
+                FROM (
+                    SELECT t.name, t.slug
+                    FROM video_tags vt
+                    JOIN tags t ON t.id = vt.tag_id
+                    WHERE vt.video_id = v.id
+                    ORDER BY t.usage_count DESC, t.name
+                    LIMIT 3
+                ) top_tag
             ), '[]'::json) AS top_tags
         FROM matched m
         JOIN videos v        ON v.id = m.id
@@ -2632,7 +2650,7 @@ def smart_search(
 def search_suggestions(
     q: str = "",
     limit: int = 8,
-    actor: dict = Depends(get_actor),
+    response: Response = None,
 ):
     q = (q or "").strip()[:100]
     if len(q) < 2:
@@ -2641,7 +2659,9 @@ def search_suggestions(
     limit = max(1, min(limit, 10))
     q_lower = q.lower()
     escaped = q_lower.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    ckey = f"search:suggestions:{q_lower}:{limit}:{int(bool(actor['is_premium']))}"
+    if response is not None:
+        response.headers["Cache-Control"] = "public, max-age=5, s-maxage=30, stale-while-revalidate=60"
+    ckey = f"search:suggestions:{q_lower}:{limit}"
     cached = cache_get(ckey)
     if cached is not None:
         return cached
@@ -2654,7 +2674,7 @@ def search_suggestions(
                    NULL::text AS channel_handle
             FROM videos v
             WHERE v.visibility = 'public'
-              AND (%s::boolean OR v.is_premium = false)
+              AND v.is_premium = false
               AND LOWER(v.title) LIKE %s
 
             UNION ALL
@@ -2683,12 +2703,12 @@ def search_suggestions(
             WHERE text IS NOT NULL AND text <> ''
             ORDER BY LOWER(text), score DESC, kind
         )
-        SELECT text, kind
+        SELECT text, kind, channel_handle
         FROM unique_suggestions
         ORDER BY score DESC, LOWER(text)
         LIMIT %s
     """, (
-        q_lower, f"{escaped}%", actor["is_premium"] or False, f"%{escaped}%",
+        q_lower, f"{escaped}%", f"%{escaped}%",
         q_lower, f"{escaped}%", f"%{escaped}%",
         q_lower, f"{escaped}%", f"%{escaped}%", f"{escaped}%",
         limit,
@@ -2787,6 +2807,7 @@ async def playlist_create(body: PlaylistCreateIn, actor: dict = Depends(get_acto
         INSERT INTO playlists_v2 (user_id, title, description, thumbnail, visibility)
         VALUES (%s, %s, %s, %s, %s) RETURNING {_PL2_COLS}
     """, (actor["user_id"], title, desc, thumb or None, body.visibility))
+    cache_del("playlists:v2:public:raw")
     return {"success": True, "playlist": row}
 
 
@@ -2888,6 +2909,7 @@ async def playlist_update(pl_id: int, body: PlaylistUpdateIn,
         UPDATE playlists_v2 SET {sets}, updated_at = now()
         WHERE id = %s RETURNING {_PL2_COLS}
     """, (*fields.values(), pl_id))
+    cache_del("playlists:v2:public:raw")
     return {"success": True, "playlist": row}
 
 
@@ -2900,6 +2922,7 @@ async def playlist_delete(pl_id: int, actor: dict = Depends(get_actor)):
     if pl["is_system"]:
         return {"success": False, "message": "System playlist cannot be deleted"}
     get_one("DELETE FROM playlists_v2 WHERE id = %s RETURNING id", (pl_id,))
+    cache_del("playlists:v2:public:raw")
     return {"success": True}
 
 
@@ -2948,6 +2971,7 @@ async def playlist_add_video(pl_id: int, body: PlaylistAddVideoIn,
     except Exception:
         pass
 
+    cache_del("playlists:v2:public:raw")
     return {"success": True, "item_id": ins["id"], "position": ins["position"]}
 
 
@@ -2965,6 +2989,7 @@ async def playlist_remove_video(pl_id: int, video_id: int,
     if not row:
         raise HTTPException(404, "Video not in playlist")
     get_one("UPDATE playlists_v2 SET updated_at = now() WHERE id = %s RETURNING id", (pl_id,))
+    cache_del("playlists:v2:public:raw")
     return {"success": True}
 
 
@@ -2988,6 +3013,7 @@ async def playlist_reorder(pl_id: int, body: PlaylistReorderIn,
         get_one("UPDATE playlist_items SET position = %s WHERE playlist_id = %s AND video_id = %s RETURNING id",
                 (idx, pl_id, vid))
     get_one("UPDATE playlists_v2 SET updated_at = now() WHERE id = %s RETURNING id", (pl_id,))
+    cache_del("playlists:v2:public:raw")
     return {"success": True, "count": len(body.video_ids)}
 
 

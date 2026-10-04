@@ -2,7 +2,7 @@
 """
 Simple in-memory TTL cache.
 - Thread-safe
-- Per-worker (Render pe 1 worker hai, to perfect)
+- Per-process only; serverless instances do not share entries.
 - API: cache_get / cache_set / cache_del / cache_del_prefix / cache_stats
 """
 import time
