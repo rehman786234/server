@@ -835,6 +835,18 @@ UPLOAD_PURPOSES = {
     "ad_creative_video": {"folder": "ads/creatives", "type": "video", "formats": "mp4,webm,mov", "admin": False},
     "short_video": {"folder": "shorts", "type": "video", "formats": "mp4,webm,mov", "admin": False},
     "short_thumbnail": {"folder": "shorts/thumbnails", "type": "image", "formats": "jpg,jpeg,png,webp", "admin": False},
+    "support_attachment": {
+        "folder": "support/attachments",
+        "type": "auto",
+        "formats": "jpg,jpeg,png,gif,webp,pdf,txt,doc,docx,mp3,m4a,wav,ogg,webm,mp4,mov",
+        "admin": False,
+    },
+    "support_voice": {
+        "folder": "support/voices",
+        "type": "video",
+        "formats": "mp3,m4a,wav,ogg,webm,mp4",
+        "admin": False,
+    },
 }
 
 
@@ -1959,12 +1971,28 @@ NOTIF_SELECT = """
            COALESCE(ch.avatar_url, au.avatar_url)  AS actor_avatar,
            v.viewkey AS video_viewkey, v.title AS video_title,
            v.thumbnail AS video_thumbnail, v.is_premium AS video_is_premium,
-           LEFT(cm.content, 120) AS comment_text
+           LEFT(cm.content, 120) AS comment_text,
+           LEFT(support_msg.content, 160) AS support_message
     FROM notifications n
     LEFT JOIN mydata au   ON au.id = n.actor_id
     LEFT JOIN channels ch ON ch.user_id = n.actor_id
     LEFT JOIN videos v    ON v.id = n.video_id
     LEFT JOIN comments cm ON cm.id = n.comment_id
+    LEFT JOIN LATERAL (
+        SELECT m.content
+        FROM support_messages m
+        JOIN support_threads t ON t.id = m.thread_id
+        WHERE t.user_id = CASE
+                  WHEN n.type = 'support_reply' THEN n.user_id
+                  ELSE n.actor_id
+              END
+          AND m.sender_id = n.actor_id
+          AND m.is_admin = (n.type = 'support_reply')
+          AND m.created_at BETWEEN n.created_at - INTERVAL '5 seconds'
+                               AND n.created_at + INTERVAL '5 seconds'
+        ORDER BY ABS(EXTRACT(EPOCH FROM (m.created_at - n.created_at)))
+        LIMIT 1
+    ) support_msg ON n.type IN ('support_reply', 'support_message')
 """
 
 
@@ -1984,6 +2012,20 @@ def _ser_notification(r: dict) -> dict:
         text = f'{who} subscribed to your channel'
     elif t == "new_upload":
         text = f'{who} uploaded a new video: {title}'
+    elif t == "support_reply":
+        preview = (r.get("support_message") or "").strip()
+        text = f"Support replied: {preview}" if preview else "Watchly Support replied to your message"
+    elif t == "support_message":
+        preview = (r.get("support_message") or "").strip()
+        text = f'{who} sent a support message: "{preview}"' if preview else f"{who} opened or updated a support ticket"
+    elif t == "payment_approved":
+        text = "Your premium payment was verified. Premium access is now active."
+    elif t == "ad_topup_approved":
+        text = "Your ad-wallet top-up was verified and the balance has been credited."
+    elif t == "payment_rejected":
+        text = "Your premium payment was not approved. Check your payment details or contact support."
+    elif t == "ad_topup_rejected":
+        text = "Your ad-wallet top-up was not approved. Check your payment details or contact support."
     else:
         text = "New notification"
     url = None
@@ -3241,6 +3283,90 @@ async def ws_support(ws: WebSocket):
             if data.get("type") == "ping":
                 await ws.send_json({"type": "pong"})
                 continue
+            if data.get("type") == "support_send":
+                request_id = str(data.get("request_id") or "")[:80]
+                thread_id = data.get("thread_id")
+                content = str(data.get("content") or "").strip()
+                attachment = str(data.get("attachment") or "").strip()
+                is_admin = uid in ADMIN_USER_IDS
+
+                def send_error(message: str):
+                    return {
+                        "type": "support_send_ack",
+                        "request_id": request_id,
+                        "success": False,
+                        "message": message,
+                    }
+
+                if (not request_id or isinstance(thread_id, bool)
+                        or not isinstance(thread_id, int) or thread_id <= 0):
+                    await ws.send_json(send_error("Invalid support message request"))
+                    continue
+                if not (1 <= len(content) <= 2000):
+                    await ws.send_json(send_error("Message must be 1-2000 characters"))
+                    continue
+                if attachment and not attachment.startswith("https://res.cloudinary.com/"):
+                    await ws.send_json(send_error("Attachment must be a Cloudinary URL"))
+                    continue
+                if not rate_limit(f"support-msg:{uid}", 30, 60):
+                    await ws.send_json(send_error("Too many messages. Please wait a moment."))
+                    continue
+
+                try:
+                    thread = get_one(
+                        "SELECT id, user_id, status FROM support_threads WHERE id=%s",
+                        (thread_id,),
+                    )
+                except Exception:
+                    logger.exception("load websocket support thread")
+                    await ws.send_json(send_error("Could not load this conversation. Please retry."))
+                    continue
+                if not thread or (not is_admin and thread["user_id"] != uid):
+                    await ws.send_json(send_error("Thread not found"))
+                    continue
+                if thread["status"] == "closed":
+                    await ws.send_json(send_error("This thread is closed"))
+                    continue
+
+                try:
+                    message = get_one("""
+                        INSERT INTO support_messages (thread_id, sender_id, is_admin, content, attachment)
+                        VALUES (%s, %s, %s, %s, %s)
+                        RETURNING id, thread_id, sender_id, is_admin, content, attachment, created_at
+                    """, (thread_id, uid, is_admin, content, attachment or None))
+                    if not message:
+                        raise RuntimeError("Support message insert returned no row")
+                    unread_column = "unread_user" if is_admin else "unread_admin"
+                    get_one(
+                        f"UPDATE support_threads SET last_message_at=now(), {unread_column}={unread_column}+1 WHERE id=%s RETURNING id",
+                        (thread_id,),
+                    )
+                except Exception:
+                    logger.exception("persist websocket support message")
+                    await ws.send_json(send_error("Could not save your message. Please retry."))
+                    continue
+                try:
+                    if is_admin:
+                        await notify(thread["user_id"], "support_reply", uid)
+                    else:
+                        for admin_id in ADMIN_USER_IDS:
+                            await notify(admin_id, "support_message", uid)
+                    await _support_broadcast_new_message(
+                        thread_id=thread_id,
+                        message=message,
+                        is_admin=is_admin,
+                        thread_owner_id=thread["user_id"],
+                    )
+                except Exception:
+                    logger.exception("broadcast websocket support message")
+
+                await ws.send_json({
+                    "type": "support_send_ack",
+                    "request_id": request_id,
+                    "success": True,
+                    "message": {**message, "thread_id": thread_id},
+                })
+                continue
             if data.get("type") != "typing":
                 continue
 
@@ -3284,6 +3410,9 @@ async def support_create_thread(body: SupportThreadCreateIn,
     if not (1 <= len(msg) <= 2000):
         return {"success": False, "message": "Message must be 1-2000 characters"}
     subj = (body.subject or "Support").strip()[:200] or "Support"
+    att = (body.attachment or "").strip()
+    if att and not att.startswith("https://res.cloudinary.com/"):
+        raise HTTPException(400, "Attachment must be a Cloudinary URL")
 
     op = get_one("""
         SELECT COUNT(*) AS n FROM support_threads
@@ -3300,7 +3429,7 @@ async def support_create_thread(body: SupportThreadCreateIn,
     get_one("""
         INSERT INTO support_messages (thread_id, sender_id, is_admin, content, attachment)
         VALUES (%s, %s, false, %s, %s) RETURNING id
-    """, (th["id"], actor["user_id"], msg, (body.attachment or None)))
+    """, (th["id"], actor["user_id"], msg, att or None))
 
     try:
         for admin_id in ADMIN_USER_IDS:
@@ -3581,7 +3710,11 @@ async def admin_review_payment(payment_id: int, body: PaymentReviewIn,
             return {"success": False, "message": "Payment already reviewed"}
 
         try:
-            await notify(p["user_id"], "payment_approved", actor["user_id"])
+            await notify(
+                p["user_id"],
+                "ad_topup_approved" if is_topup else "payment_approved",
+                actor["user_id"],
+            )
             await manager.push(p["user_id"], {
                 "type": "payment_status",
                 "payment_id": payment_id,
@@ -3601,7 +3734,11 @@ async def admin_review_payment(payment_id: int, body: PaymentReviewIn,
         return {"success": False, "message": "Payment already reviewed"}
 
     try:
-        await notify(p["user_id"], "payment_rejected", actor["user_id"])
+        await notify(
+            p["user_id"],
+            "ad_topup_rejected" if is_topup else "payment_rejected",
+            actor["user_id"],
+        )
         await manager.push(p["user_id"], {
             "type": "payment_status",
             "payment_id": payment_id,
@@ -3758,6 +3895,80 @@ async def admin_list_users(q: str = "", limit: int = 30, offset: int = 0,
         ORDER BY u.id DESC LIMIT %s OFFSET %s
     """, (like, like, like, limit + 1, max(0, offset)), fetch=True) or []
     return {"success": True, "has_more": len(rows) > limit, "users": rows[:limit]}
+
+
+@router.get("/admin/users/{user_id}")
+async def admin_get_user(user_id: int, actor: dict = Depends(get_actor)):
+    _need_admin(actor)
+    user = get_one("""
+        SELECT u.id, u.name, u.email, u.is_premium, u.created_at,
+               c.channel_name, c.handle, c.description AS channel_description,
+               COALESCE(v.video_count, 0) AS video_count,
+               COALESCE(v.short_count, 0) AS short_count,
+               COALESCE(v.total_views, 0) AS total_views,
+               COALESCE(s.followers, 0) AS followers,
+               COALESCE(s.following, 0) AS following,
+               COALESCE(p.pending_count, 0) AS pending_payments,
+               COALESCE(p.approved_count, 0) AS approved_payments,
+               COALESCE(p.rejected_count, 0) AS rejected_payments,
+               COALESCE(w.balance, 0) AS ad_wallet_balance,
+               COALESCE(w.total_added, 0) AS ad_wallet_total_added,
+               COALESCE(w.total_spent, 0) AS ad_wallet_total_spent,
+               COALESCE(t.open_count, 0) AS open_threads,
+               COALESCE(t.closed_count, 0) AS closed_threads
+        FROM mydata u
+        LEFT JOIN channels c ON c.user_id = u.id
+        LEFT JOIN LATERAL (
+            SELECT COUNT(*) AS video_count,
+                   COUNT(*) FILTER (WHERE video_type = 'short') AS short_count,
+                   COALESCE(SUM(views), 0) AS total_views
+            FROM videos WHERE user_id = u.id
+        ) v ON true
+        LEFT JOIN LATERAL (
+            SELECT COUNT(*) FILTER (WHERE channel_user_id = u.id) AS followers,
+                   COUNT(*) FILTER (WHERE subscriber_id = u.id) AS following
+            FROM subscriptions
+            WHERE channel_user_id = u.id OR subscriber_id = u.id
+        ) s ON true
+        LEFT JOIN LATERAL (
+            SELECT COUNT(*) FILTER (WHERE status = 'pending') AS pending_count,
+                   COUNT(*) FILTER (WHERE status = 'approved') AS approved_count,
+                   COUNT(*) FILTER (WHERE status = 'rejected') AS rejected_count
+            FROM payments WHERE user_id = u.id
+        ) p ON true
+        LEFT JOIN ad_wallets w ON w.user_id = u.id
+        LEFT JOIN LATERAL (
+            SELECT COUNT(*) FILTER (WHERE status = 'open') AS open_count,
+                   COUNT(*) FILTER (WHERE status = 'closed') AS closed_count
+            FROM support_threads WHERE user_id = u.id
+        ) t ON true
+        WHERE u.id = %s
+    """, (user_id,))
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    recent_payments = execute_query("""
+        SELECT p.id, p.plan_id, p.amount, p.currency, p.status, p.purpose, p.created_at,
+               p.transaction_id, pl.name AS plan_name
+        FROM payments p
+        LEFT JOIN plans pl ON pl.id = p.plan_id
+        WHERE p.user_id = %s
+        ORDER BY p.created_at DESC
+        LIMIT 5
+    """, (user_id,), fetch=True) or []
+    recent_videos = execute_query("""
+        SELECT id, viewkey, title, video_type, visibility, is_premium, views, uploaded_at
+        FROM videos
+        WHERE user_id = %s
+        ORDER BY uploaded_at DESC
+        LIMIT 5
+    """, (user_id,), fetch=True) or []
+    return {
+        "success": True,
+        "user": user,
+        "recent_payments": recent_payments,
+        "recent_videos": recent_videos,
+    }
 
 
 @router.post("/admin/users/{user_id}/toggle-premium")
