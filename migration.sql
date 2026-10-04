@@ -8,6 +8,8 @@ ALTER TABLE videos
   ADD COLUMN IF NOT EXISTS file_size   BIGINT DEFAULT 0,
   ADD COLUMN IF NOT EXISTS views       INT NOT NULL DEFAULT 0,
   ADD COLUMN IF NOT EXISTS updated_at  TIMESTAMP DEFAULT NOW();
+ALTER TABLE mydata
+  ADD COLUMN IF NOT EXISTS account_status VARCHAR(12) NOT NULL DEFAULT 'active';
 DO $$
 BEGIN
   IF NOT EXISTS (
@@ -49,6 +51,30 @@ CREATE TABLE IF NOT EXISTS channels (
   description  TEXT DEFAULT '',
   created_at   TIMESTAMP DEFAULT NOW()
 );
+ALTER TABLE channels
+  ADD COLUMN IF NOT EXISTS moderation_status VARCHAR(12) NOT NULL DEFAULT 'active',
+  ADD COLUMN IF NOT EXISTS is_verified BOOLEAN NOT NULL DEFAULT FALSE;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'mydata_account_status_check'
+      AND conrelid = 'mydata'::regclass
+  ) THEN
+    ALTER TABLE mydata ADD CONSTRAINT mydata_account_status_check
+      CHECK (account_status IN ('active', 'suspended', 'banned'));
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'channels_moderation_status_check'
+      AND conrelid = 'channels'::regclass
+  ) THEN
+    ALTER TABLE channels ADD CONSTRAINT channels_moderation_status_check
+      CHECK (moderation_status IN ('active', 'suspended', 'banned'));
+  END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_channels_moderation_status
+  ON channels(moderation_status, id DESC);
 
 -- 3) video_views: for analytics (views per day)
 CREATE TABLE IF NOT EXISTS video_views (

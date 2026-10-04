@@ -9,8 +9,11 @@ import os
 import re
 import time
 import asyncio
+import smtplib
+import ssl
 import urllib.error
 import urllib.request
+from email.message import EmailMessage
 from urllib.parse import unquote, urlencode, urlsplit
 from collections import defaultdict, deque
 from threading import Lock, Thread
@@ -53,6 +56,9 @@ ADMIN_USER_IDS = {int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if 
 CLD2_CLOUD = os.getenv("CLOUDINARY2_CLOUD_NAME", "")
 CLD2_KEY = os.getenv("CLOUDINARY2_API_KEY", "")
 CLD2_SECRET = os.getenv("CLOUDINARY2_API_SECRET", "")
+CLD1_CLOUD = os.getenv("CLOUDINARY_CLOUD_NAME", "vjhhf9fh")
+CLD1_KEY = os.getenv("CLOUDINARY_API_KEY", "")
+CLD1_SECRET = os.getenv("CLOUDINARY_API_SECRET", "")
 
 SHOW_LOCKED_PREMIUM = False
 
@@ -282,6 +288,7 @@ def validate_api_key(api_key: str, endpoint: str = None, method: str = "GET"):
             FROM apikeys a
             JOIN mydata u ON a.user_id = u.id
             WHERE a.api_key = %s AND a.expiry_date > NOW()
+              AND u.account_status = 'active'
         """, (api_key,))
 
     query = """
@@ -290,6 +297,7 @@ def validate_api_key(api_key: str, endpoint: str = None, method: str = "GET"):
             FROM apikeys a
             JOIN mydata u ON a.user_id = u.id
             WHERE a.api_key = %s AND a.expiry_date > NOW()
+              AND u.account_status = 'active'
         ),
         usage_logged AS (
             INSERT INTO api_usage (api_key_id, user_id, endpoint, method)
@@ -335,11 +343,19 @@ def resolve_actor(authorization=None, api_key=None, x_user_id=None, x_visitor_id
         uid = int(x_user_id)
         actor["via"] = "legacy"
     if uid:
-        u = api_key_user or get_one("SELECT id, name, is_premium FROM mydata WHERE id=%s", (uid,))
+        u = api_key_user or get_one(
+            "SELECT id, name, is_premium, account_status FROM mydata WHERE id=%s",
+            (uid,),
+        )
         if u:
             actor["user_id"] = uid
             actor["name"] = u["name"] or ""
-            actor["is_premium"] = bool(u["is_premium"]) and actor["verified"]
+            actor["account_status"] = u.get("account_status", "active")
+            actor["is_premium"] = (
+                bool(u["is_premium"])
+                and actor["verified"]
+                and actor.get("account_status", "active") == "active"
+            )
         else:
             actor["verified"], actor["via"] = False, "anon"
     return actor
@@ -355,11 +371,15 @@ def get_actor(authorization: Optional[str] = Header(None),
 def need_login(actor: dict):
     if not actor["user_id"]:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Please sign in")
+    if actor.get("account_status", "active") != "active":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "This account is suspended or banned")
 
 
 def need_verified(actor: dict):
     if not (actor["user_id"] and actor["verified"]):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Please sign in again")
+    if actor.get("account_status", "active") != "active":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "This account is suspended or banned")
 
 
 def _is_owner(actor: dict, owner_id) -> bool:
@@ -443,6 +463,8 @@ async def login(user: UserLogin, request: Request):
         if not db_user or not password_ok:
             _login_fail(throttle_key)
             return {"success": False, "message": "Invalid email or password"}
+        if db_user.get("account_status", "active") != "active":
+            return {"success": False, "message": f"This account is {db_user['account_status']}"}
 
         _login_fails.pop(throttle_key, None)
         if needs_upgrade:
@@ -520,6 +542,7 @@ def _user_auth_payload(row: dict) -> dict:
         "email": row["email"],
         "is_premium": row["is_premium"],
         "created_at": row.get("created_at"),
+        "account_status": row.get("account_status", "active"),
     }
 
 
@@ -552,13 +575,13 @@ async def google_auth(body: GoogleAuthIn, request: Request):
         raise HTTPException(401, "Google account must have a verified email")
 
     row = get_one(
-        "SELECT id, name, email, is_premium, created_at, google_sub "
+        "SELECT id, name, email, is_premium, created_at, google_sub, account_status "
         "FROM mydata WHERE google_sub = %s",
         (google_sub,),
     )
     if not row:
         row = get_one(
-            "SELECT id, name, email, is_premium, created_at, google_sub "
+            "SELECT id, name, email, is_premium, created_at, google_sub, account_status "
             "FROM mydata WHERE LOWER(email) = %s",
             (email,),
         )
@@ -567,7 +590,7 @@ async def google_auth(body: GoogleAuthIn, request: Request):
                 raise HTTPException(409, "This account is linked to another Google account")
             row = get_one(
                 "UPDATE mydata SET google_sub=%s WHERE id=%s "
-                "RETURNING id, name, email, is_premium, created_at",
+                "RETURNING id, name, email, is_premium, created_at, account_status",
                 (google_sub, row["id"]),
             )
         else:
@@ -575,8 +598,10 @@ async def google_auth(body: GoogleAuthIn, request: Request):
             row = get_one("""
                 INSERT INTO mydata (name, email, password, is_premium, google_sub)
                 VALUES (%s, %s, %s, FALSE, %s)
-                RETURNING id, name, email, is_premium, created_at
+                RETURNING id, name, email, is_premium, created_at, account_status
             """, (name, email, hash_password(secrets.token_urlsafe(32)), google_sub))
+    if row.get("account_status", "active") != "active":
+        raise HTTPException(403, f"This account is {row['account_status']}")
     return {
         "success": True,
         "message": "Google sign-in successful",
@@ -593,11 +618,49 @@ def _otp_digest(email: str, otp: str) -> str:
     ).hexdigest()
 
 
-def _resend_ready() -> bool:
-    return bool(Config.RESEND_API_KEY and Config.RESEND_FROM_EMAIL)
+def _smtp_ready() -> bool:
+    return bool(
+        Config.SMTP_HOST
+        and Config.SMTP_FROM_EMAIL
+        and (bool(Config.SMTP_USERNAME) == bool(Config.SMTP_PASSWORD))
+    )
+
+
+def _email_ready() -> bool:
+    return bool(
+        (Config.RESEND_API_KEY and Config.RESEND_FROM_EMAIL)
+        or _smtp_ready()
+    )
+
+
+def _send_password_reset_email_smtp(email: str, otp: str) -> None:
+    message = EmailMessage()
+    message["From"] = Config.SMTP_FROM_EMAIL
+    message["To"] = email
+    message["Subject"] = "Your Watchly password reset code"
+    message.set_content(
+        f"Your password reset code is {otp}. It expires in 10 minutes. "
+        "If you did not request this, you can ignore this email."
+    )
+
+    smtp_factory = smtplib.SMTP_SSL if Config.SMTP_USE_SSL else smtplib.SMTP
+    with smtp_factory(Config.SMTP_HOST, Config.SMTP_PORT, timeout=15) as server:
+        if not Config.SMTP_USE_SSL:
+            server.starttls(context=ssl.create_default_context())
+        if Config.SMTP_USERNAME:
+            server.login(Config.SMTP_USERNAME, Config.SMTP_PASSWORD)
+        refused = server.send_message(message)
+        if refused:
+            raise smtplib.SMTPRecipientsRefused(refused)
 
 
 def _send_password_reset_email(email: str, otp: str) -> None:
+    if not (Config.RESEND_API_KEY and Config.RESEND_FROM_EMAIL):
+        if not _smtp_ready():
+            raise OSError("Password reset email is not configured")
+        _send_password_reset_email_smtp(email, otp)
+        return
+
     body = json.dumps({
         "from": Config.RESEND_FROM_EMAIL,
         "to": [email],
@@ -634,7 +697,7 @@ async def forgot_password(body: ForgotPasswordIn, request: Request):
         f"forgot-email:{email}", 3, 3600
     ):
         raise HTTPException(429, "Too many requests. Try again later.")
-    if not _resend_ready():
+    if not _email_ready():
         raise HTTPException(503, "Password reset email is not configured")
 
     user = get_one("SELECT id FROM mydata WHERE LOWER(email) = %s", (email,))
@@ -830,6 +893,7 @@ UPLOAD_PURPOSES = {
     "avatar":   {"folder": "profiles", "type": "image", "formats": "jpg,jpeg,png,webp", "admin": False},
     "channel":  {"folder": "channels", "type": "image", "formats": "jpg,jpeg,png,webp", "admin": False},
     "banner":   {"folder": "banners",  "type": "image", "formats": "jpg,jpeg,png,webp", "admin": False},
+    "video_thumbnail": {"folder": "thumbnails", "type": "image", "formats": "jpg,jpeg,png,webp", "admin": False},
     "ad_image": {"folder": "ads",      "type": "image", "formats": "jpg,jpeg,png,webp,gif", "admin": True},
     "ad_video": {"folder": "ads",      "type": "video", "formats": "mp4,webm,mov", "admin": True},
     "ad_creative_image": {"folder": "ads/creatives", "type": "image", "formats": "jpg,jpeg,png,webp,gif", "admin": False},
@@ -1071,11 +1135,14 @@ def get_videos(limit: int = 50, offset: int = 0, video_type: Optional[str] = Non
             SELECT v.*,
                    COALESCE(c.channel_name, u.name)     AS channel_name,
                    c.handle                             AS channel_handle,
-                   COALESCE(c.avatar_url, u.avatar_url) AS channel_avatar
+                   COALESCE(c.avatar_url, u.avatar_url) AS channel_avatar,
+                   COALESCE(c.is_verified, false) AS channel_verified
             FROM videos v
             LEFT JOIN channels c ON c.user_id = v.user_id
             LEFT JOIN mydata u   ON u.id = v.user_id
             WHERE v.is_premium = false AND v.visibility = 'public'
+              AND COALESCE(u.account_status, 'active') = 'active'
+              AND COALESCE(c.moderation_status, 'active') = 'active'
               AND (%s::text IS NULL OR v.video_type = %s)
             ORDER BY v.uploaded_at DESC, v.id DESC
             LIMIT %s OFFSET %s
@@ -1109,11 +1176,14 @@ def get_premium_videos(api_key: str = Header(...), limit: int = 50, offset: int 
                 SELECT v.*,
                        COALESCE(c.channel_name, u.name)     AS channel_name,
                        c.handle                             AS channel_handle,
-                       COALESCE(c.avatar_url, u.avatar_url) AS channel_avatar
+                       COALESCE(c.avatar_url, u.avatar_url) AS channel_avatar,
+                       COALESCE(c.is_verified, false) AS channel_verified
                 FROM videos v
                 LEFT JOIN channels c ON c.user_id = v.user_id
                 LEFT JOIN mydata u   ON u.id = v.user_id
                 WHERE v.is_premium = true AND v.visibility = 'public'
+                  AND COALESCE(u.account_status, 'active') = 'active'
+                  AND COALESCE(c.moderation_status, 'active') = 'active'
                   AND (%s::text IS NULL OR v.video_type = %s)
                 ORDER BY v.uploaded_at DESC, v.id DESC
                 LIMIT %s OFFSET %s
@@ -1142,6 +1212,12 @@ async def upload_video(video: Video, api_key: str = Header(...)):
     user_data = validate_api_key(api_key, "/upload_videos", "POST")
     if not user_data:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired API key")
+    channel = get_one(
+        "SELECT moderation_status FROM channels WHERE user_id=%s",
+        (user_data.get("user_id"),),
+    )
+    if channel and channel.get("moderation_status") != "active":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "This channel is suspended or banned")
     if video.video_type not in ("short", "long"):
         raise HTTPException(400, "Video type must be short or long")
     if video.video_type == "short" and not (1 <= (video.duration or 0) <= 180):
@@ -1185,6 +1261,7 @@ def get_video_by_key(viewkey: str, actor: dict = Depends(get_actor)):
                    COALESCE(c.channel_name, u.name) AS creator_name,
                    c.handle AS creator_handle,
                    COALESCE(c.avatar_url, u.avatar_url) AS creator_avatar,
+                   COALESCE(c.is_verified, false) AS creator_verified,
                    (SELECT COUNT(*) FROM video_likes vl WHERE vl.video_id = v.id) AS like_count,
                    EXISTS(SELECT 1 FROM video_likes vl2 WHERE vl2.video_id = v.id AND vl2.user_id = %s::int) AS liked,
                    (SELECT COUNT(*) FROM subscriptions s WHERE s.channel_user_id = v.user_id) AS subscriber_count,
@@ -1194,6 +1271,8 @@ def get_video_by_key(viewkey: str, actor: dict = Depends(get_actor)):
             LEFT JOIN mydata u ON u.id = v.user_id
             LEFT JOIN channels c ON c.user_id = v.user_id
             WHERE v.viewkey = %s
+              AND COALESCE(u.account_status, 'active') = 'active'
+              AND COALESCE(c.moderation_status, 'active') = 'active'
         """, (actor["user_id"], actor["user_id"], viewkey))
 
         if not row or (row["visibility"] == "private" and not _is_owner(actor, row.get("user_id"))):
@@ -1221,7 +1300,15 @@ async def toggle_video_like(viewkey: str, actor: dict = Depends(get_actor)):
     need_login(actor)
     if not rate_limit(f"like:{actor['user_id']}", 30, 60):
         raise HTTPException(429, "Too many likes. Slow down.")
-    v = get_one("SELECT id, user_id, is_premium, visibility FROM videos WHERE viewkey=%s", (viewkey,))
+    v = get_one("""
+        SELECT v.id, v.user_id, v.is_premium, v.visibility
+        FROM videos v
+        LEFT JOIN mydata u ON u.id = v.user_id
+        LEFT JOIN channels c ON c.user_id = v.user_id
+        WHERE v.viewkey = %s
+          AND COALESCE(u.account_status, 'active') = 'active'
+          AND COALESCE(c.moderation_status, 'active') = 'active'
+    """, (viewkey,))
     if not v or not _can_view_video(v, actor):
         raise HTTPException(404, "Video not found")
     uid = actor["user_id"]
@@ -1477,8 +1564,14 @@ def studio_create_video(
     api_key: str = Header(...),
 ):
     u = current_user(api_key, "/studio/create_video")
-    if not get_one("SELECT id FROM channels WHERE user_id=%s", (u["user_id"],)):
+    channel = get_one(
+        "SELECT id, moderation_status FROM channels WHERE user_id=%s",
+        (u["user_id"],),
+    )
+    if not channel:
         return {"success": False, "message": "Create your channel before uploading videos"}
+    if channel.get("moderation_status") != "active":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "This channel is suspended or banned")
     if v.visibility not in ("public", "unlisted", "private"):
         raise HTTPException(400, "Invalid visibility")
     if v.video_type not in ("short", "long"):
@@ -1544,12 +1637,24 @@ def studio_edit_video(video_id: int, v: StudioVideoEdit, api_key: str = Header(.
 @router.delete("/studio/videos/{video_id}")
 def studio_delete_video(video_id: int, api_key: str = Header(...)):
     u = current_user(api_key, "/studio/delete_video")
-    row = get_one("DELETE FROM videos WHERE id=%s AND user_id=%s RETURNING id", (video_id, u["user_id"]))
+    row = get_one(
+        "SELECT id, stream_link, thumbnail FROM videos WHERE id=%s AND user_id=%s",
+        (video_id, u["user_id"]),
+    )
     if not row:
+        raise HTTPException(404, "Video not found")
+    deleted_assets = _delete_creator_cloudinary_assets(
+        [row.get("stream_link"), row.get("thumbnail")]
+    )
+    removed = get_one(
+        "DELETE FROM videos WHERE id=%s AND user_id=%s RETURNING id",
+        (video_id, u["user_id"]),
+    )
+    if not removed:
         raise HTTPException(404, "Video not found")
     _invalidate_video_caches()
     _invalidate_studio_cache(u["user_id"])
-    return {"success": True}
+    return {"success": True, "cloudinary_assets_deleted": deleted_assets}
 
 
 @router.get("/studio/stats")
@@ -1792,13 +1897,17 @@ async def list_channels(q: str = "", sort: str = "popular", limit: int = 24, off
     order = "c.id DESC" if sort == "new" else "subscriber_count DESC, video_count DESC, c.id DESC"
     rows = execute_query(f"""
         SELECT c.user_id, c.channel_name, c.handle, c.avatar_url, c.description,
+               c.is_verified,
                (SELECT COUNT(*) FROM subscriptions s WHERE s.channel_user_id = c.user_id) AS subscriber_count,
                (SELECT COUNT(*) FROM videos v WHERE v.user_id = c.user_id AND v.visibility = 'public'
                        AND (%s::boolean OR v.is_premium = false)) AS video_count,
                EXISTS(SELECT 1 FROM subscriptions s2
                       WHERE s2.channel_user_id = c.user_id AND s2.subscriber_id = %s::int) AS is_subscribed
         FROM channels c
-        WHERE c.handle IS NOT NULL AND (%s::text IS NULL OR c.channel_name ILIKE %s OR c.handle ILIKE %s)
+        WHERE c.handle IS NOT NULL
+          AND c.moderation_status = 'active'
+          AND EXISTS (SELECT 1 FROM mydata u WHERE u.id = c.user_id AND u.account_status = 'active')
+          AND (%s::text IS NULL OR c.channel_name ILIKE %s OR c.handle ILIKE %s)
         ORDER BY {order} LIMIT %s OFFSET %s
     """, (actor["is_premium"] or False, actor["user_id"], like, like, like, limit + 1, offset), fetch=True) or []
     payload = {"success": True, "has_more": len(rows) > limit, "channels": rows[:limit]}
@@ -1817,7 +1926,9 @@ async def get_channel(handle: str, actor: dict = Depends(get_actor)):
                          WHERE v.user_id = c.user_id AND v.visibility = 'public'), 0) AS total_views,
                EXISTS(SELECT 1 FROM subscriptions s2
                       WHERE s2.channel_user_id = c.user_id AND s2.subscriber_id = %s::int) AS is_subscribed
-        FROM channels c WHERE c.handle = %s
+        FROM channels c
+        JOIN mydata u ON u.id = c.user_id AND u.account_status = 'active'
+        WHERE c.handle = %s AND c.moderation_status = 'active'
     """, (actor["is_premium"] or False, actor["user_id"], handle.lower()))
     if not row:
         raise HTTPException(404, "Channel not found")
@@ -1829,7 +1940,12 @@ async def get_channel(handle: str, actor: dict = Depends(get_actor)):
 @router.get("/channels/{handle}/videos")
 async def get_channel_videos(handle: str, sort: str = "latest", limit: int = 20, offset: int = 0,
                              actor: dict = Depends(get_actor)):
-    ch = get_one("SELECT user_id FROM channels WHERE handle=%s", (handle.lower(),))
+    ch = get_one("""
+        SELECT c.user_id
+        FROM channels c JOIN mydata u ON u.id = c.user_id
+        WHERE c.handle=%s AND c.moderation_status='active'
+          AND u.account_status='active'
+    """, (handle.lower(),))
     if not ch:
         raise HTTPException(404, "Channel not found")
     can_premium = actor["is_premium"] or _is_owner(actor, ch["user_id"])
@@ -1858,7 +1974,11 @@ async def get_channel_videos(handle: str, sort: str = "latest", limit: int = 20,
 @router.post("/channels/{handle}/subscribe")
 async def subscribe(handle: str, actor: dict = Depends(get_actor)):
     need_login(actor)
-    ch = get_one("SELECT user_id FROM channels WHERE handle=%s", (handle.lower(),))
+    ch = get_one("""
+        SELECT c.user_id FROM channels c
+        JOIN mydata u ON u.id = c.user_id
+        WHERE c.handle=%s AND c.moderation_status='active' AND u.account_status='active'
+    """, (handle.lower(),))
     if not ch:
         raise HTTPException(404, "Channel not found")
     if ch["user_id"] == actor["user_id"]:
@@ -1876,7 +1996,11 @@ async def subscribe(handle: str, actor: dict = Depends(get_actor)):
 @router.delete("/channels/{handle}/subscribe")
 async def unsubscribe(handle: str, actor: dict = Depends(get_actor)):
     need_login(actor)
-    ch = get_one("SELECT user_id FROM channels WHERE handle=%s", (handle.lower(),))
+    ch = get_one("""
+        SELECT c.user_id FROM channels c
+        JOIN mydata u ON u.id = c.user_id
+        WHERE c.handle=%s AND c.moderation_status='active' AND u.account_status='active'
+    """, (handle.lower(),))
     if not ch:
         raise HTTPException(404, "Channel not found")
     get_one("DELETE FROM subscriptions WHERE subscriber_id=%s AND channel_user_id=%s RETURNING subscriber_id",
@@ -2207,7 +2331,15 @@ def _cp(actor: dict, with_visitor: bool = True):
 
 
 def _comment_video(viewkey: str, actor: dict):
-    v = get_one("SELECT id, user_id, is_premium, visibility FROM videos WHERE viewkey=%s", (viewkey,))
+    v = get_one("""
+        SELECT v.id, v.user_id, v.is_premium, v.visibility
+        FROM videos v
+        LEFT JOIN mydata u ON u.id = v.user_id
+        LEFT JOIN channels c ON c.user_id = v.user_id
+        WHERE v.viewkey = %s
+          AND COALESCE(u.account_status, 'active') = 'active'
+          AND COALESCE(c.moderation_status, 'active') = 'active'
+    """, (viewkey,))
     if not v or (v["visibility"] == "private" and not _is_owner(actor, v["user_id"])):
         raise HTTPException(404, "Video not found")
     if not _can_view_video(v, actor):
@@ -2492,6 +2624,8 @@ async def videos_by_tag(slug: str, limit: int = 20, offset: int = 0,
         LEFT JOIN channels c ON c.user_id = v.user_id
         LEFT JOIN mydata u   ON u.id = v.user_id
         WHERE vt.tag_id = %s AND v.visibility = 'public'
+          AND COALESCE(u.account_status, 'active') = 'active'
+          AND COALESCE(c.moderation_status, 'active') = 'active'
           AND (%s::boolean OR v.is_premium = false)
         ORDER BY v.views DESC, v.uploaded_at DESC
         LIMIT %s OFFSET %s
@@ -2619,6 +2753,8 @@ def smart_search(
             LEFT JOIN channels c ON c.user_id = v.user_id
             LEFT JOIN mydata u   ON u.id = v.user_id
             WHERE v.visibility = 'public'
+              AND COALESCE(u.account_status, 'active') = 'active'
+              AND COALESCE(c.moderation_status, 'active') = 'active'
               AND (%s::boolean OR v.is_premium = false)
               AND (%s = 'all' OR v.is_premium = (%s = 'premium'))
               AND (%s::text IS NULL OR v.video_type = %s)
@@ -2641,6 +2777,7 @@ def smart_search(
             COALESCE(c.channel_name, u.name) AS channel_name,
             c.handle AS channel_handle,
             COALESCE(c.avatar_url, u.avatar_url) AS channel_avatar,
+            COALESCE(c.is_verified, false) AS channel_verified,
             m.rank_score,
             COALESCE((
                 SELECT json_agg(json_build_object('name', top_tag.name, 'slug', top_tag.slug))
@@ -2718,6 +2855,14 @@ def search_suggestions(
             FROM videos v
             WHERE v.visibility = 'public'
               AND v.is_premium = false
+              AND NOT EXISTS (
+                  SELECT 1 FROM mydata u
+                  WHERE u.id = v.user_id AND u.account_status <> 'active'
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM channels c
+                  WHERE c.user_id = v.user_id AND c.moderation_status <> 'active'
+              )
               AND LOWER(v.title) LIKE %s
 
             UNION ALL
@@ -2728,7 +2873,8 @@ def search_suggestions(
                    c.handle AS channel_handle
             FROM channels c
             JOIN mydata u ON u.id = c.user_id
-            WHERE LOWER(COALESCE(c.channel_name, u.name)) LIKE %s
+            WHERE c.moderation_status = 'active' AND u.account_status = 'active'
+              AND LOWER(COALESCE(c.channel_name, u.name)) LIKE %s
 
             UNION ALL
 
@@ -2787,6 +2933,8 @@ async def related_videos(viewkey: str, limit: int = 12,
                    + LEAST(COALESCE(v.views,0) / 200.0, 5) AS score
             FROM videos v
             WHERE v.id <> %s AND v.visibility = 'public'
+              AND COALESCE((SELECT u.account_status FROM mydata u WHERE u.id = v.user_id), 'active') = 'active'
+              AND COALESCE((SELECT c.moderation_status FROM channels c WHERE c.user_id = v.user_id), 'active') = 'active'
               AND (%s::boolean OR v.is_premium = false)
         )
         SELECT
@@ -2795,6 +2943,7 @@ async def related_videos(viewkey: str, limit: int = 12,
             COALESCE(c.channel_name, u.name) AS channel_name,
             c.handle AS channel_handle,
             COALESCE(c.avatar_url, u.avatar_url) AS channel_avatar,
+            COALESCE(c.is_verified, false) AS channel_verified,
             s.score
         FROM scored s
         JOIN videos v        ON v.id = s.id
@@ -3281,6 +3430,109 @@ async def _support_notify_and_broadcast(thread_id: int, message: dict,
         )
     except Exception:
         logger.exception("broadcast support message")
+
+
+def _creator_cloudinary_asset(secure_url: str):
+    try:
+        parts = urlsplit(secure_url)
+        path_parts = parts.path.strip("/").split("/")
+        if (parts.scheme != "https" or parts.netloc != "res.cloudinary.com"
+                or len(path_parts) < 4 or path_parts[1] not in ("image", "video", "raw")
+                or path_parts[2] != "upload"):
+            return None
+        cloud = path_parts[0]
+        credentials = {
+            CLD1_CLOUD: (CLD1_KEY, CLD1_SECRET),
+            CLD2_CLOUD: (CLD2_KEY, CLD2_SECRET),
+        }.get(cloud)
+        if not credentials:
+            return None
+        resource_type = path_parts[1]
+        asset_parts = path_parts[3:]
+        version_index = next(
+            (index for index, part in enumerate(asset_parts) if re.fullmatch(r"v\d+", part)),
+            None,
+        )
+        if version_index is not None:
+            asset_parts = asset_parts[version_index + 1:]
+        else:
+            while asset_parts and re.match(
+                r"^(?:a|ar|b|bo|c|d|e|f|fl|g|h|l|o|q|r|t|u|w|x|y|z|ac|af|br|cs|dl|dn|dpr|du|eo|fl|fps|ki|pg|s|sp|vc|vs)_[^/]+$",
+                asset_parts[0],
+            ):
+                asset_parts.pop(0)
+        if not asset_parts:
+            return None
+        public_id = unquote("/".join(asset_parts))
+        if resource_type != "raw" and "." in public_id.rsplit("/", 1)[-1]:
+            public_id = public_id.rsplit(".", 1)[0]
+        if not public_id:
+            return None
+        return cloud, resource_type, public_id, credentials
+    except (TypeError, ValueError):
+        return None
+
+
+def _delete_creator_cloudinary_assets(urls: list[Optional[str]]) -> int:
+    assets = {}
+    for url in urls:
+        asset = _creator_cloudinary_asset(url or "")
+        if asset:
+            cloud, resource_type, public_id, credentials = asset
+            if not (credentials[0] and credentials[1]):
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    f"Cloudinary deletion is not configured for cloud '{cloud}'",
+                )
+            assets.setdefault((cloud, resource_type, credentials), set()).add(public_id)
+
+    deleted_count = 0
+    for (cloud, resource_type, credentials), public_ids in assets.items():
+        url = f"https://api.cloudinary.com/v1_1/{cloud}/resources/{resource_type}/upload"
+        authorization = base64.b64encode(
+            f"{credentials[0]}:{credentials[1]}".encode()
+        ).decode("ascii")
+        ordered_ids = list(public_ids)
+        for offset in range(0, len(ordered_ids), 100):
+            batch = ordered_ids[offset:offset + 100]
+            body = urlencode([
+                *(("public_ids[]", public_id) for public_id in batch),
+                ("invalidate", "true"),
+            ]).encode("utf-8")
+            request = urllib.request.Request(
+                url,
+                data=body,
+                headers={"Authorization": f"Basic {authorization}"},
+                method="DELETE",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=20) as response:
+                    result = json.loads(response.read().decode("utf-8"))
+            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+                logger.exception("Cloudinary asset deletion request failed")
+                raise HTTPException(
+                    status.HTTP_502_BAD_GATEWAY,
+                    "Could not delete the uploaded media from Cloudinary; the database record was kept.",
+                ) from error
+            if not isinstance(result, dict):
+                raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Cloudinary returned an invalid deletion response")
+            outcomes = result.get("deleted") or {}
+            failed = [
+                public_id for public_id in batch
+                if outcomes.get(public_id) not in ("deleted", "not_found")
+            ]
+            if failed:
+                logger.error(
+                    "Cloudinary did not delete %s creator asset(s) from cloud %s",
+                    len(failed),
+                    cloud,
+                )
+                raise HTTPException(
+                    status.HTTP_502_BAD_GATEWAY,
+                    "Cloudinary could not confirm media deletion; the database record was kept.",
+                )
+            deleted_count += sum(outcomes.get(public_id) == "deleted" for public_id in batch)
+    return deleted_count
 
 
 def _support_cloudinary_asset(secure_url: str):
@@ -4078,9 +4330,12 @@ async def admin_list_users(q: str = "", limit: int = 30, offset: int = 0,
     like = f"%{q.strip()}%" if q.strip() else None
     rows = execute_query("""
         SELECT u.id, u.name, u.email, u.is_premium, u.created_at,
+               u.account_status, c.channel_name, c.handle,
+               c.moderation_status AS channel_status, c.is_verified AS channel_verified,
                (SELECT COUNT(*) FROM payments WHERE user_id = u.id AND status='pending') AS pending_payments,
                (SELECT COUNT(*) FROM support_threads WHERE user_id = u.id AND status='open') AS open_threads
         FROM mydata u
+        LEFT JOIN channels c ON c.user_id = u.id
         WHERE (%s::text IS NULL OR u.name ILIKE %s OR u.email ILIKE %s)
         ORDER BY u.id DESC LIMIT %s OFFSET %s
     """, (like, like, like, limit + 1, max(0, offset)), fetch=True) or []
@@ -4091,8 +4346,9 @@ async def admin_list_users(q: str = "", limit: int = 30, offset: int = 0,
 async def admin_get_user(user_id: int, actor: dict = Depends(get_actor)):
     _need_admin(actor)
     user = get_one("""
-        SELECT u.id, u.name, u.email, u.is_premium, u.created_at,
-               c.channel_name, c.handle, c.description AS channel_description,
+        SELECT u.id, u.name, u.email, u.is_premium, u.created_at, u.account_status,
+               c.id AS channel_id, c.channel_name, c.handle, c.description AS channel_description,
+               c.moderation_status AS channel_status, c.is_verified AS channel_verified,
                COALESCE(v.video_count, 0) AS video_count,
                COALESCE(v.short_count, 0) AS short_count,
                COALESCE(v.total_views, 0) AS total_views,
@@ -4158,6 +4414,116 @@ async def admin_get_user(user_id: int, actor: dict = Depends(get_actor)):
         "user": user,
         "recent_payments": recent_payments,
         "recent_videos": recent_videos,
+    }
+
+
+class AdminModerationStatusIn(BaseModel):
+    status: str
+
+
+class AdminChannelVerificationIn(BaseModel):
+    is_verified: bool
+
+
+@router.put("/admin/users/{user_id}/status")
+async def admin_set_user_status(user_id: int, body: AdminModerationStatusIn,
+                                actor: dict = Depends(get_actor)):
+    _need_admin(actor)
+    if body.status not in ("active", "suspended", "banned"):
+        raise HTTPException(400, "Status must be active, suspended, or banned")
+    if user_id in ADMIN_USER_IDS:
+        raise HTTPException(400, "Admin accounts cannot be moderated here")
+    row = get_one("""
+        UPDATE mydata SET account_status = %s
+        WHERE id = %s
+        RETURNING id, account_status
+    """, (body.status, user_id))
+    if not row:
+        raise HTTPException(404, "User not found")
+    _invalidate_video_caches()
+    return {"success": True, "user_id": row["id"], "account_status": row["account_status"]}
+
+
+@router.put("/admin/channels/{user_id}/status")
+async def admin_set_channel_status(user_id: int, body: AdminModerationStatusIn,
+                                  actor: dict = Depends(get_actor)):
+    _need_admin(actor)
+    if body.status not in ("active", "suspended", "banned"):
+        raise HTTPException(400, "Status must be active, suspended, or banned")
+    row = get_one("""
+        UPDATE channels SET moderation_status = %s
+        WHERE user_id = %s
+        RETURNING id, user_id, moderation_status
+    """, (body.status, user_id))
+    if not row:
+        raise HTTPException(404, "Channel not found")
+    _invalidate_video_caches()
+    _invalidate_studio_cache(user_id)
+    return {"success": True, "channel": row}
+
+
+@router.put("/admin/channels/{user_id}/verification")
+async def admin_set_channel_verification(
+    user_id: int,
+    body: AdminChannelVerificationIn,
+    actor: dict = Depends(get_actor),
+):
+    _need_admin(actor)
+    row = get_one("""
+        UPDATE channels SET is_verified = %s
+        WHERE user_id = %s
+        RETURNING id, user_id, is_verified
+    """, (body.is_verified, user_id))
+    if not row:
+        raise HTTPException(404, "Channel not found")
+    _invalidate_video_caches()
+    _invalidate_studio_cache(user_id)
+    return {"success": True, "channel": row}
+
+
+@router.delete("/admin/channels/{user_id}")
+async def admin_delete_channel(user_id: int, actor: dict = Depends(get_actor)):
+    _need_admin(actor)
+    channel = get_one(
+        "SELECT id, avatar_url, banner_url FROM channels WHERE user_id = %s",
+        (user_id,),
+    )
+    if not channel:
+        raise HTTPException(404, "Channel not found")
+    videos = execute_query(
+        "SELECT stream_link, thumbnail FROM videos WHERE user_id = %s",
+        (user_id,),
+        fetch=True,
+    ) or []
+    media_urls = [
+        url
+        for video in videos
+        for url in (video.get("stream_link"), video.get("thumbnail"))
+    ]
+    media_urls.extend((channel.get("avatar_url"), channel.get("banner_url")))
+    deleted_assets = _delete_creator_cloudinary_assets(media_urls)
+    counts = get_one("""
+        WITH deleted_channel AS (
+            DELETE FROM channels WHERE user_id = %s RETURNING id
+        ),
+        deleted_videos AS (
+            DELETE FROM videos WHERE user_id = %s RETURNING id
+        ),
+        deleted_subscriptions AS (
+            DELETE FROM subscriptions WHERE channel_user_id = %s RETURNING subscriber_id
+        )
+        SELECT (SELECT COUNT(*) FROM deleted_videos) AS deleted_videos,
+               (SELECT COUNT(*) FROM deleted_subscriptions) AS deleted_subscriptions,
+               (SELECT COUNT(*) FROM deleted_channel) AS deleted_channels
+    """, (user_id, user_id, user_id))
+    if not counts or not counts["deleted_channels"]:
+        raise HTTPException(409, "Channel changed during deletion; refresh and try again")
+    _invalidate_video_caches()
+    _invalidate_studio_cache(user_id)
+    return {
+        "success": True,
+        "deleted_videos": counts["deleted_videos"],
+        "cloudinary_assets_deleted": deleted_assets,
     }
 
 
