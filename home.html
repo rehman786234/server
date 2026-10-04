@@ -746,7 +746,11 @@ print(<span class="string">'Premium Videos:'</span>, data[<span class="string">'
                     </div>
                     <span class="auth-badge"><i class="fas fa-key"></i> Requires API Key</span>
                 </div>
-                <div class="endpoint-description">Upload a new video (requires API key in header)</div>
+                <div class="endpoint-description">
+                    Upload a video (requires API key). Omit <code>video_type</code> or use
+                    <code>long</code> for regular content. Use <code>short</code> with a Shorts
+                    Cloudinary video and thumbnail URL plus a duration from 1 to 180 seconds.
+                </div>
                 
                 <div class="code-example-section">
                     <div class="code-tabs">
@@ -785,6 +789,7 @@ response = requests.post(<span class="string">'http://localhost:8000/upload_vide
         <span class="string">'stream_link'</span>: <span class="string">'https://example.com/video.mp4'</span>,
         <span class="string">'thumbnail'</span>: <span class="string">'https://example.com/thumb.jpg'</span>,
         <span class="string">'category'</span>: <span class="string">'Education'</span>,
+        <span class="string">'video_type'</span>: <span class="string">'long'</span>,
         <span class="string">'is_premium'</span>: False
     })
 data = response.json()
@@ -799,6 +804,7 @@ print(<span class="string">'Uploaded:'</span>, data[<span class="string">'messag
     "stream_link": "https://example.com/video.mp4",
     "thumbnail": "https://example.com/thumb.jpg",
     "category": "Education",
+    "video_type": "long",
     "is_premium": false
   }'</span></pre>
                     </div>
@@ -909,7 +915,8 @@ print(<span class="string">'Database:'</span>, data[<span class="string">'databa
                     <span class="auth-badge"><i class="fas fa-globe"></i> Public</span>
                 </div>
                 <div class="endpoint-description">
-                    Free and premium video feeds return up to 50 videos per page by default
+                    Free and premium feeds include both Shorts and long videos, identified by
+                    <code>video_type</code>, and return up to 50 videos per page by default
                     (maximum 100). Request the next page by increasing <code>offset</code>.
                     Creator Studio video lists use the same pagination pattern.
                 </div>
@@ -923,9 +930,9 @@ print(<span class="string">'Database:'</span>, data[<span class="string">'databa
                     <span class="auth-badge"><i class="fas fa-globe"></i> Public</span>
                 </div>
                 <div class="endpoint-description">
-                    Returns eligible active campaign creatives together with legacy ads.
-                    Use <code>/ads/serve?viewkey=VIDEO_VIEWKEY</code> on a video page for
-                    budget-tracked campaign impressions.
+                    Returns rotating legacy ads only. Campaign ads must be requested through
+                    <code>/ads/serve?viewkey=VIDEO_VIEWKEY</code>; each CPM impression is recorded
+                    and charged to the campaign wallet, while CPC campaigns charge on click.
                 </div>
             </div>
             <div class="endpoint-card">

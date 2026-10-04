@@ -7,14 +7,13 @@ import hashlib
 import logging
 import os
 import re
-import smtplib
-import ssl
 import time
 import asyncio
+import urllib.error
+import urllib.request
 from collections import defaultdict, deque
 from threading import Lock, Thread
 from datetime import datetime, timedelta
-from email.message import EmailMessage
 from typing import Optional, List
 
 from fastapi import (APIRouter, BackgroundTasks, HTTPException, status, Header, Request, Depends,
@@ -143,8 +142,18 @@ _NEW_INDEXES = [
     "ON payments (user_id, status)",
     "CREATE INDEX IF NOT EXISTS idx_subscriptions_channel_user "
     "ON subscriptions (channel_user_id, subscriber_id)",
+    "CREATE INDEX IF NOT EXISTS idx_subscriptions_channel_created "
+    "ON subscriptions (channel_user_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_notifications_user_created "
     "ON notifications (user_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_api_usage_user_created "
+    "ON api_usage (user_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_comments_video_created "
+    "ON comments (video_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_video_likes_video "
+    "ON video_likes (video_id)",
+    "CREATE INDEX IF NOT EXISTS idx_videos_owner_public_type "
+    "ON videos (user_id, is_premium) WHERE visibility = 'public'",
     "CREATE INDEX IF NOT EXISTS idx_ad_campaigns_eligible "
     "ON ad_campaigns (starts_at, ends_at, id) WHERE status = 'active'",
     "CREATE INDEX IF NOT EXISTS idx_ad_creatives_campaign_type "
@@ -262,31 +271,39 @@ def verify_password(password: str, stored: Optional[str]) -> tuple[bool, bool]:
 
 
 def validate_api_key(api_key: str, endpoint: str = None, method: str = "GET"):
-    try:
-        query = """
-            SELECT a.*, a.id as key_id, u.id as user_id, u.name, u.email, u.is_premium
+    if endpoint is None:
+        return get_one("""
+            SELECT a.*, a.id AS key_id, u.id AS user_id, u.name, u.email, u.is_premium
             FROM apikeys a
             JOIN mydata u ON a.user_id = u.id
-            WHERE a.api_key = %s 
-            AND a.expiry_date > NOW()
-        """
-        result = get_one(query, (api_key,))
-        if result and endpoint:
-            track_usage(result, endpoint, method)
-        return result
-    except Exception as e:
-        logger.error(f"API key validation error: {e}")
-        return None
+            WHERE a.api_key = %s AND a.expiry_date > NOW()
+        """, (api_key,))
 
-
-def track_usage(key_row, endpoint: str, method: str = "GET"):
-    try:
-        get_one("INSERT INTO api_usage (api_key_id, user_id, endpoint, method) VALUES (%s,%s,%s,%s) RETURNING id",
-                (key_row["key_id"], key_row["user_id"], endpoint, method))
-        get_one("UPDATE apikeys SET request_count = request_count + 1, last_used_at = NOW() WHERE id=%s RETURNING id",
-                (key_row["key_id"],))
-    except Exception as e:
-        logger.error(f"Usage tracking error: {e}")
+    query = """
+        WITH valid_key AS (
+            SELECT a.*, a.id AS key_id, u.id AS user_id, u.name, u.email, u.is_premium
+            FROM apikeys a
+            JOIN mydata u ON a.user_id = u.id
+            WHERE a.api_key = %s AND a.expiry_date > NOW()
+        ),
+        usage_logged AS (
+            INSERT INTO api_usage (api_key_id, user_id, endpoint, method)
+            SELECT key_id, user_id, %s, %s
+            FROM valid_key
+            WHERE %s::text IS NOT NULL
+            RETURNING api_key_id
+        ),
+        updated_key AS (
+            UPDATE apikeys a
+            SET request_count = request_count + 1, last_used_at = NOW()
+            FROM usage_logged
+            WHERE a.id = usage_logged.api_key_id
+            RETURNING a.id
+        )
+        SELECT valid_key.*
+        FROM valid_key
+    """
+    return get_one(query, (api_key, endpoint, method, endpoint))
 
 
 def _clean_visitor(v: Optional[str]) -> Optional[str]:
@@ -298,6 +315,7 @@ def resolve_actor(authorization=None, api_key=None, x_user_id=None, x_visitor_id
     actor = {"user_id": None, "visitor_id": _clean_visitor(x_visitor_id),
              "verified": False, "is_premium": False, "name": "", "via": "anon"}
     uid = None
+    api_key_user = None
     if authorization and authorization.lower().startswith("bearer "):
         uid = read_token(authorization[7:].strip())
         if uid:
@@ -306,14 +324,15 @@ def resolve_actor(authorization=None, api_key=None, x_user_id=None, x_visitor_id
         k = validate_api_key(api_key)
         if k:
             uid = k["user_id"]
+            api_key_user = k
             actor["verified"], actor["via"] = True, "apikey"
     if not uid and ALLOW_LEGACY_USER_ID and x_user_id and str(x_user_id).isdigit():
         uid = int(x_user_id)
         actor["via"] = "legacy"
     if uid:
-        u = get_one("SELECT id, name, is_premium FROM mydata WHERE id=%s", (uid,))
+        u = api_key_user or get_one("SELECT id, name, is_premium FROM mydata WHERE id=%s", (uid,))
         if u:
-            actor["user_id"] = u["id"]
+            actor["user_id"] = uid
             actor["name"] = u["name"] or ""
             actor["is_premium"] = bool(u["is_premium"]) and actor["verified"]
         else:
@@ -354,6 +373,12 @@ def _can_view_video(v: dict, actor: dict) -> bool:
 def _check_url(u: Optional[str], what: str = "link"):
     if u and not re.match(r"^https?://\S+$", u.strip(), re.I):
         raise HTTPException(400, f"Invalid {what}")
+
+
+def _check_short_cloudinary_url(url: Optional[str], resource_type: str, what: str):
+    prefix = f"https://res.cloudinary.com/{CLD2_CLOUD}/{resource_type}/upload/"
+    if not CLD2_CLOUD or not url or not url.startswith(prefix):
+        raise HTTPException(400, f"{what} must be uploaded to the Shorts Cloudinary account")
 
 
 # Login brute-force guard (in-memory)
@@ -563,34 +588,36 @@ def _otp_digest(email: str, otp: str) -> str:
     ).hexdigest()
 
 
-def _smtp_ready() -> bool:
-    return bool(
-        Config.SMTP_HOST and Config.SMTP_PORT and Config.SMTP_USERNAME
-        and Config.SMTP_PASSWORD and Config.SMTP_FROM_EMAIL
-    )
+def _resend_ready() -> bool:
+    return bool(Config.RESEND_API_KEY and Config.RESEND_FROM_EMAIL)
 
 
 def _send_password_reset_email(email: str, otp: str) -> None:
-    message = EmailMessage()
-    message["Subject"] = "Your Watchly password reset code"
-    message["From"] = Config.SMTP_FROM_EMAIL
-    message["To"] = email
-    message.set_content(
-        f"Your password reset code is {otp}. It expires in 10 minutes. "
-        "If you did not request this, you can ignore this email."
+    body = json.dumps({
+        "from": Config.RESEND_FROM_EMAIL,
+        "to": [email],
+        "subject": "Your Watchly password reset code",
+        "text": (
+            f"Your password reset code is {otp}. It expires in 10 minutes. "
+            "If you did not request this, you can ignore this email."
+        ),
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {Config.RESEND_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
     )
-    context = ssl.create_default_context()
-    if Config.SMTP_USE_SSL:
-        with smtplib.SMTP_SSL(
-            Config.SMTP_HOST, Config.SMTP_PORT, context=context, timeout=15
-        ) as server:
-            server.login(Config.SMTP_USERNAME, Config.SMTP_PASSWORD)
-            server.send_message(message)
-    else:
-        with smtplib.SMTP(Config.SMTP_HOST, Config.SMTP_PORT, timeout=15) as server:
-            server.starttls(context=context)
-            server.login(Config.SMTP_USERNAME, Config.SMTP_PASSWORD)
-            server.send_message(message)
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            if not 200 <= response.status < 300:
+                raise OSError(f"Resend API returned HTTP {response.status}")
+    except urllib.error.HTTPError as error:
+        detail = error.read(500).decode("utf-8", errors="replace")
+        raise OSError(f"Resend API returned HTTP {error.code}: {detail}") from error
 
 
 @router.post("/auth/forgot-password")
@@ -602,7 +629,7 @@ async def forgot_password(body: ForgotPasswordIn, request: Request):
         f"forgot-email:{email}", 3, 3600
     ):
         raise HTTPException(429, "Too many requests. Try again later.")
-    if not _smtp_ready():
+    if not _resend_ready():
         raise HTTPException(503, "Password reset email is not configured")
 
     user = get_one("SELECT id FROM mydata WHERE LOWER(email) = %s", (email,))
@@ -618,7 +645,7 @@ async def forgot_password(body: ForgotPasswordIn, request: Request):
         """, (email, _otp_digest(email, otp)))
         try:
             await asyncio.to_thread(_send_password_reset_email, email, otp)
-        except (smtplib.SMTPException, OSError):
+        except OSError:
             get_one("DELETE FROM password_reset_otps WHERE email=%s RETURNING email", (email,))
             logger.exception("Could not deliver password reset email")
             raise HTTPException(502, "Could not deliver reset email. Please try again.")
@@ -802,6 +829,8 @@ UPLOAD_PURPOSES = {
     "ad_video": {"folder": "ads",      "type": "video", "formats": "mp4,webm,mov", "admin": True},
     "ad_creative_image": {"folder": "ads/creatives", "type": "image", "formats": "jpg,jpeg,png,webp,gif", "admin": False},
     "ad_creative_video": {"folder": "ads/creatives", "type": "video", "formats": "mp4,webm,mov", "admin": False},
+    "short_video": {"folder": "shorts", "type": "video", "formats": "mp4,webm,mov", "admin": False},
+    "short_thumbnail": {"folder": "shorts/thumbnails", "type": "image", "formats": "jpg,jpeg,png,webp", "admin": False},
 }
 
 
@@ -1086,14 +1115,26 @@ async def upload_video(video: Video, api_key: str = Header(...)):
     user_data = validate_api_key(api_key, "/upload_videos", "POST")
     if not user_data:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired API key")
+    if video.video_type not in ("short", "long"):
+        raise HTTPException(400, "Video type must be short or long")
+    if video.video_type == "short" and not (1 <= (video.duration or 0) <= 180):
+        raise HTTPException(400, "Short videos must be between 1 and 180 seconds")
+    if video.video_type == "short" and (video.file_size or 0) > 100 * 1024 * 1024:
+        raise HTTPException(400, "Short videos cannot exceed 100 MB")
+    if video.video_type == "short":
+        _check_short_cloudinary_url(video.stream_link, "video", "Short video")
+        _check_short_cloudinary_url(video.thumbnail, "image", "Short thumbnail")
     viewkey = secrets.token_hex(6)
     try:
         result = get_one("""
-            INSERT INTO videos (title, stream_link, viewkey, thumbnail, category, is_premium, user_id) 
-            VALUES (%s, %s, %s, %s, %s, %s, %s) 
-            RETURNING id, title, stream_link, viewkey, thumbnail, category, is_premium, uploaded_at
+            INSERT INTO videos (title, stream_link, viewkey, thumbnail, category, is_premium,
+                                user_id, video_type, duration, file_size)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id, title, stream_link, viewkey, thumbnail, category, is_premium,
+                      video_type, duration, file_size, uploaded_at
         """, (video.title, video.stream_link, viewkey, video.thumbnail,
-              video.category, video.is_premium, user_data.get('user_id')))
+              video.category, video.is_premium, user_data.get('user_id'),
+              video.video_type, video.duration or 0, video.file_size or 0))
         if result:
             _invalidate_video_caches()
             if user_data.get("user_id"):
@@ -1312,36 +1353,17 @@ async def health_check():
 
 @router.get("/ads")
 def get_ads():
-    """Return rotating legacy ads and currently eligible campaign creatives."""
+    """Return rotating legacy ads. Campaign ads must use the tracked serve endpoint."""
     try:
         ads = execute_query("""
-            WITH candidates AS (
-                SELECT id, ad_name, promotion_link, ad_type, link,
-                       NULL::text AS thumbnail, NULL::text AS description,
-                       NULL::text AS cta_text, NULL::integer AS campaign_id,
-                       FALSE AS is_campaign
+            WITH ranked AS (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY ad_type ORDER BY RANDOM()
+                ) AS ad_rank
                 FROM ads_table
                 WHERE ad_type IN ('image', 'video')
-                UNION ALL
-                SELECT cr.id, cr.title, cr.destination_url, cr.type, cr.url,
-                       cr.thumbnail, cr.description, cr.cta_text, c.id,
-                       TRUE AS is_campaign
-                FROM ad_creatives cr
-                JOIN ad_campaigns c ON c.id = cr.campaign_id
-                WHERE cr.type IN ('image', 'video') AND c.status = 'active'
-                  AND (c.starts_at IS NULL OR c.starts_at <= NOW())
-                  AND (c.ends_at IS NULL OR c.ends_at >= NOW())
-                  AND c.spend_total < c.budget_total
-                  AND (c.budget_daily = 0 OR c.spend_today_date <> CURRENT_DATE
-                       OR c.spend_today < c.budget_daily)
-            ), ranked AS (
-                SELECT *, ROW_NUMBER() OVER (
-                    PARTITION BY ad_type ORDER BY is_campaign DESC, RANDOM()
-                ) AS ad_rank
-                FROM candidates
             )
-            SELECT id, ad_name, promotion_link, ad_type, link, thumbnail,
-                   description, cta_text, campaign_id, is_campaign
+            SELECT id, ad_name, promotion_link, ad_type, link
             FROM ranked
             WHERE ad_rank <= CASE WHEN ad_type = 'image' THEN 2 ELSE 1 END
             ORDER BY ad_type, ad_rank
@@ -1364,6 +1386,7 @@ class StudioVideoIn(BaseModel):
     description: Optional[str] = ""
     visibility: Optional[str] = "public"
     is_premium: bool = False
+    video_type: str = "long"
     duration: Optional[int] = 0
     file_size: Optional[int] = 0
 
@@ -1375,6 +1398,7 @@ class StudioVideoEdit(BaseModel):
     description: Optional[str] = None
     visibility: Optional[str] = None
     is_premium: Optional[bool] = None
+    video_type: Optional[str] = None
 
 
 class ChannelIn(BaseModel):
@@ -1398,7 +1422,7 @@ def studio_my_videos(api_key: str = Header(...), limit: int = 50, offset: int = 
     limit = max(1, min(limit, 100))
     offset = max(0, offset)
     rows = execute_query("""
-        SELECT id, title, viewkey, thumbnail, category, is_premium, uploaded_at,
+        SELECT id, title, viewkey, thumbnail, category, is_premium, video_type, uploaded_at,
                description, visibility, duration, file_size, views, updated_at,
                (SELECT COUNT(*) FROM videos WHERE user_id=%s) AS total_count
         FROM videos WHERE user_id=%s
@@ -1426,16 +1450,25 @@ def studio_create_video(
         return {"success": False, "message": "Create your channel before uploading videos"}
     if v.visibility not in ("public", "unlisted", "private"):
         raise HTTPException(400, "Invalid visibility")
+    if v.video_type not in ("short", "long"):
+        raise HTTPException(400, "Video type must be short or long")
+    if v.video_type == "short" and not (1 <= (v.duration or 0) <= 180):
+        raise HTTPException(400, "Short videos must be between 1 and 180 seconds")
+    if v.video_type == "short" and (v.file_size or 0) > 100 * 1024 * 1024:
+        raise HTTPException(400, "Short videos cannot exceed 100 MB")
     _check_url(v.stream_link, "video link")
     _check_url(v.thumbnail, "thumbnail link")
+    if v.video_type == "short":
+        _check_short_cloudinary_url(v.stream_link, "video", "Short video")
+        _check_short_cloudinary_url(v.thumbnail, "image", "Short thumbnail")
     viewkey = secrets.token_hex(6)
     try:
         row = get_one("""
             INSERT INTO videos (title, stream_link, viewkey, thumbnail, category, is_premium,
-                                user_id, description, visibility, duration, file_size)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
+                                user_id, description, visibility, video_type, duration, file_size)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
             (v.title.strip(), v.stream_link.strip(), viewkey, v.thumbnail, v.category, v.is_premium,
-             u["user_id"], v.description, v.visibility, v.duration, v.file_size))
+             u["user_id"], v.description, v.visibility, v.video_type, v.duration, v.file_size))
     except Exception:
         logger.exception("studio_create_video")
         return {"success": False, "message": "Could not save video"}
@@ -1451,6 +1484,18 @@ def studio_edit_video(video_id: int, v: StudioVideoEdit, api_key: str = Header(.
     u = current_user(api_key, "/studio/edit_video")
     if v.visibility is not None and v.visibility not in ("public", "unlisted", "private"):
         raise HTTPException(400, "Invalid visibility")
+    if v.video_type is not None and v.video_type not in ("short", "long"):
+        raise HTTPException(400, "Video type must be short or long")
+    if v.video_type == "short":
+        existing = get_one(
+            "SELECT duration, stream_link, thumbnail FROM videos WHERE id=%s AND user_id=%s",
+            (video_id, u["user_id"]),
+        )
+        if existing and int(existing.get("duration") or 0) > 180:
+            raise HTTPException(400, "Videos longer than 180 seconds cannot be marked as Shorts")
+        if existing:
+            _check_short_cloudinary_url(existing.get("stream_link"), "video", "Short video")
+            _check_short_cloudinary_url(existing.get("thumbnail"), "image", "Short thumbnail")
     _check_url(v.thumbnail, "thumbnail link")
     fields = {k: val for k, val in v.dict().items() if val is not None}
     if not fields:
@@ -1532,14 +1577,27 @@ def studio_count_view(viewkey: str, request: Request):
     k = (ip, viewkey)
     if now - _recent_views.get(k, 0) < 1800:
         return {"success": True, "counted": False}
-    row = get_one("UPDATE videos SET views=views+1 WHERE viewkey=%s RETURNING id, views", (viewkey,))
+    row = get_one("""
+        WITH incremented AS (
+            UPDATE videos SET views = views + 1
+            WHERE viewkey = %s
+            RETURNING id, views
+        ),
+        logged_view AS (
+            INSERT INTO video_views (video_id)
+            SELECT id FROM incremented
+            RETURNING video_id
+        )
+        SELECT incremented.id, incremented.views
+        FROM incremented
+        JOIN logged_view ON logged_view.video_id = incremented.id
+    """, (viewkey,))
     if not row:
         return {"success": False, "counted": False}
     _recent_views[k] = now
     if len(_recent_views) > 5000:
         for old in [x for x, t in _recent_views.items() if now - t > 1800]:
             _recent_views.pop(old, None)
-    get_one("INSERT INTO video_views (video_id) VALUES (%s) RETURNING id", (row["id"],))
     return {"success": True, "counted": True, "views": row["views"]}
 
 
@@ -1550,61 +1608,97 @@ def _analytics_for(uid: int):
     if cached is not None:
         return cached
     try:
-        views_daily = execute_query("""
-            SELECT to_char(d, 'Mon DD') AS day, COALESCE(x.n, 0) AS n
-            FROM generate_series(CURRENT_DATE - 27, CURRENT_DATE, interval '1 day') d
-            LEFT JOIN (SELECT vv.created_at::date AS dd, COUNT(*) AS n
-                       FROM video_views vv JOIN videos v ON v.id = vv.video_id
-                       WHERE v.user_id = %s AND vv.created_at >= CURRENT_DATE - 27
-                       GROUP BY 1) x ON x.dd = d::date
-            ORDER BY d""", (uid,), fetch=True) or []
-
-        subs_daily = execute_query("""
-            SELECT to_char(d, 'Mon DD') AS day, COALESCE(x.n, 0) AS n
-            FROM generate_series(CURRENT_DATE - 27, CURRENT_DATE, interval '1 day') d
-            LEFT JOIN (SELECT created_at::date AS dd, COUNT(*) AS n
-                       FROM subscriptions
-                       WHERE channel_user_id = %s AND created_at >= CURRENT_DATE - 27
-                       GROUP BY 1) x ON x.dd = d::date
-            ORDER BY d""", (uid,), fetch=True) or []
-
-        top_videos = execute_query("""
-            SELECT v.id, v.title, v.viewkey, v.thumbnail, v.views, v.is_premium,
-                   (SELECT COUNT(*) FROM video_likes l WHERE l.video_id = v.id) AS likes,
-                   (SELECT COUNT(*) FROM comments c WHERE c.video_id = v.id)    AS comments
-            FROM videos v WHERE v.user_id = %s
-            ORDER BY v.views DESC NULLS LAST, v.uploaded_at DESC LIMIT 5""", (uid,), fetch=True) or []
-
-        recent_comments = execute_query("""
-            SELECT cm.id, LEFT(cm.content, 140) AS content, cm.created_at,
-                   COALESCE(ch.channel_name, mu.name) AS name,
-                   COALESCE(ch.avatar_url, mu.avatar_url) AS avatar,
-                   v.title AS video_title, v.viewkey, v.is_premium
-            FROM comments cm
-            JOIN videos v  ON v.id = cm.video_id
-            JOIN mydata mu ON mu.id = cm.user_id
-            LEFT JOIN channels ch ON ch.user_id = cm.user_id
-            WHERE v.user_id = %s AND cm.user_id <> %s
-            ORDER BY cm.created_at DESC LIMIT 5""", (uid, uid), fetch=True) or []
-
-        recent_subscribers = execute_query("""
-            SELECT s.created_at, COALESCE(c.channel_name, mu.name) AS name, c.handle,
-                   COALESCE(c.avatar_url, mu.avatar_url) AS avatar
-            FROM subscriptions s
-            JOIN mydata mu ON mu.id = s.subscriber_id
-            LEFT JOIN channels c ON c.user_id = mu.id
-            WHERE s.channel_user_id = %s
-            ORDER BY s.created_at DESC LIMIT 5""", (uid,), fetch=True) or []
-
-        result = {
-            "views_daily": views_daily,
-            "subs_daily": subs_daily,
-            "views_28d": sum(int(r["n"]) for r in views_daily),
-            "subs_28d": sum(int(r["n"]) for r in subs_daily),
-            "top_videos": top_videos,
-            "recent_comments": recent_comments,
-            "recent_subscribers": recent_subscribers,
-        }
+        result = get_one("""
+            WITH days AS (
+                SELECT d::date AS day
+                FROM generate_series(CURRENT_DATE - 27, CURRENT_DATE, interval '1 day') d
+            ),
+            views_by_day AS (
+                SELECT vv.viewed_at::date AS day, COUNT(*) AS count
+                FROM video_views vv
+                JOIN videos v ON v.id = vv.video_id
+                WHERE v.user_id = %s AND vv.viewed_at >= CURRENT_DATE - 27
+                GROUP BY vv.viewed_at::date
+            ),
+            subs_by_day AS (
+                SELECT created_at::date AS day, COUNT(*) AS count
+                FROM subscriptions
+                WHERE channel_user_id = %s AND created_at >= CURRENT_DATE - 27
+                GROUP BY created_at::date
+            ),
+            views_series AS (
+                SELECT COALESCE(json_agg(json_build_object(
+                    'day', to_char(days.day, 'Mon DD'), 'n', COALESCE(views_by_day.count, 0)
+                ) ORDER BY days.day), '[]'::json) AS data,
+                COALESCE(SUM(COALESCE(views_by_day.count, 0)), 0)::bigint AS total
+                FROM days LEFT JOIN views_by_day USING (day)
+            ),
+            subs_series AS (
+                SELECT COALESCE(json_agg(json_build_object(
+                    'day', to_char(days.day, 'Mon DD'), 'n', COALESCE(subs_by_day.count, 0)
+                ) ORDER BY days.day), '[]'::json) AS data,
+                COALESCE(SUM(COALESCE(subs_by_day.count, 0)), 0)::bigint AS total
+                FROM days LEFT JOIN subs_by_day USING (day)
+            ),
+            top_videos AS (
+                SELECT COALESCE(json_agg(json_build_object(
+                    'id', top_video.id, 'title', top_video.title, 'viewkey', top_video.viewkey,
+                    'thumbnail', top_video.thumbnail, 'views', top_video.views,
+                    'is_premium', top_video.is_premium, 'video_type', top_video.video_type,
+                    'likes', top_video.likes, 'comments', top_video.comments
+                ) ORDER BY top_video.views DESC NULLS LAST, top_video.uploaded_at DESC), '[]'::json) AS data
+                FROM (
+                    SELECT v.id, v.title, v.viewkey, v.thumbnail, v.views, v.is_premium, v.video_type,
+                           v.uploaded_at,
+                           (SELECT COUNT(*) FROM video_likes l WHERE l.video_id = v.id) AS likes,
+                           (SELECT COUNT(*) FROM comments c WHERE c.video_id = v.id) AS comments
+                    FROM videos v
+                    WHERE v.user_id = %s
+                    ORDER BY v.views DESC NULLS LAST, v.uploaded_at DESC
+                    LIMIT 5
+                ) top_video
+            ),
+            recent_comments AS (
+                SELECT COALESCE(json_agg(
+                    row_to_json(recent_comment) ORDER BY recent_comment.created_at DESC
+                ), '[]'::json) AS data
+                FROM (
+                    SELECT cm.id, LEFT(cm.content, 140) AS content, cm.created_at,
+                           COALESCE(ch.channel_name, mu.name) AS name,
+                           COALESCE(ch.avatar_url, mu.avatar_url) AS avatar,
+                           v.title AS video_title, v.viewkey, v.is_premium
+                    FROM comments cm
+                    JOIN videos v ON v.id = cm.video_id
+                    JOIN mydata mu ON mu.id = cm.user_id
+                    LEFT JOIN channels ch ON ch.user_id = cm.user_id
+                    WHERE v.user_id = %s AND cm.user_id <> %s
+                    ORDER BY cm.created_at DESC
+                    LIMIT 5
+                ) recent_comment
+            ),
+            recent_subscribers AS (
+                SELECT COALESCE(json_agg(
+                    row_to_json(recent_subscriber) ORDER BY recent_subscriber.created_at DESC
+                ), '[]'::json) AS data
+                FROM (
+                    SELECT s.created_at, COALESCE(c.channel_name, mu.name) AS name, c.handle,
+                           COALESCE(c.avatar_url, mu.avatar_url) AS avatar
+                    FROM subscriptions s
+                    JOIN mydata mu ON mu.id = s.subscriber_id
+                    LEFT JOIN channels c ON c.user_id = mu.id
+                    WHERE s.channel_user_id = %s
+                    ORDER BY s.created_at DESC
+                    LIMIT 5
+                ) recent_subscriber
+            )
+            SELECT views_series.data AS views_daily, subs_series.data AS subs_daily,
+                   views_series.total AS views_28d, subs_series.total AS subs_28d,
+                   top_videos.data AS top_videos, recent_comments.data AS recent_comments,
+                   recent_subscribers.data AS recent_subscribers
+            FROM views_series, subs_series, top_videos, recent_comments, recent_subscribers
+        """, (uid, uid, uid, uid, uid, uid))
+        if not result:
+            return None
         cache_set(ckey, result, TTL_STUDIO_ANALYTICS)
         return result
     except Exception:
@@ -1639,7 +1733,7 @@ def studio_init(api_key: str = Header(...)):
                (SELECT COUNT(*) FROM comments cm JOIN videos y ON y.id=cm.video_id WHERE y.user_id=%s) AS comments
         FROM videos WHERE user_id=%s""", (uid, uid, uid, uid))
     videos = execute_query("""
-        SELECT id, title, viewkey, thumbnail, category, description, visibility, is_premium,
+        SELECT id, title, viewkey, thumbnail, category, description, visibility, is_premium, video_type,
                views, duration, uploaded_at
         FROM videos WHERE user_id=%s ORDER BY uploaded_at DESC LIMIT 100""", (uid,), fetch=True) or []
     analytics = _analytics_for(uid) if channel else None
@@ -1719,7 +1813,7 @@ async def get_channel_videos(handle: str, sort: str = "latest", limit: int = 20,
         where += " AND v.is_premium = false"
     order = "v.views DESC, v.uploaded_at DESC" if sort == "popular" else "v.uploaded_at DESC"
     rows = execute_query(f"""
-        SELECT v.id, v.title, v.viewkey, v.thumbnail, v.category, v.description,
+        SELECT v.id, v.title, v.viewkey, v.thumbnail, v.category, v.description, v.video_type,
                v.is_premium, v.views, v.duration, v.uploaded_at
         FROM videos v WHERE {where} ORDER BY {order} LIMIT %s OFFSET %s
     """, (ch["user_id"], limit + 1, offset), fetch=True) or []
@@ -1801,7 +1895,7 @@ async def my_subscription_feed(limit: int = 20, offset: int = 0, actor: dict = D
     need_login(actor)
     limit = max(1, min(limit, 50))
     rows = execute_query("""
-        SELECT v.id, v.title, v.viewkey, v.thumbnail, v.category, v.is_premium, v.views, v.duration, v.uploaded_at,
+        SELECT v.id, v.title, v.viewkey, v.thumbnail, v.category, v.video_type, v.is_premium, v.views, v.duration, v.uploaded_at,
                c.channel_name, c.handle, c.avatar_url
         FROM subscriptions s
         JOIN videos v   ON v.user_id = s.channel_user_id
@@ -4119,13 +4213,18 @@ def _ad_pick_for_video(video_id: int, video_category: str, video_tags: list):
                c.spend_today_date, c.target_categories, c.target_tags,
                c.starts_at, c.ends_at
         FROM ad_campaigns c
+        JOIN ad_wallets w ON w.user_id = c.user_id
         WHERE c.status = 'active'
           AND (c.starts_at IS NULL OR c.starts_at <= now())
           AND (c.ends_at   IS NULL OR c.ends_at   >= now())
           AND c.spend_total < c.budget_total
           AND (c.budget_daily = 0 OR
-               c.spend_today_date <> CURRENT_DATE OR
+               c.spend_today_date IS DISTINCT FROM CURRENT_DATE OR
                c.spend_today < c.budget_daily)
+          AND w.balance >= CASE WHEN c.model = 'cpm' THEN c.rate_pkr / 1000 ELSE c.rate_pkr END
+          AND c.spend_total + CASE WHEN c.model = 'cpm' THEN c.rate_pkr / 1000 ELSE c.rate_pkr END <= c.budget_total
+          AND (c.budget_daily = 0 OR c.spend_today_date IS DISTINCT FROM CURRENT_DATE OR
+               c.spend_today + CASE WHEN c.model = 'cpm' THEN c.rate_pkr / 1000 ELSE c.rate_pkr END <= c.budget_daily)
         ORDER BY random()
         LIMIT 20
     """, fetch=True) or []
@@ -4172,6 +4271,72 @@ def _ad_cost_for(model: str, rate_pkr: float) -> float:
     return float(rate_pkr)
 
 
+def _ad_record_impression(campaign: dict, creative: dict, video_id: int,
+                          viewer_ip: str, viewer_id: Optional[int], cost: float):
+    """Atomically record a served impression and debit CPM spend from its wallet."""
+    charge = _Dec(str(cost))
+    return get_one("""
+        WITH locked AS MATERIALIZED (
+            SELECT c.id, c.user_id
+            FROM ad_campaigns c
+            JOIN ad_wallets w ON w.user_id = c.user_id
+            WHERE c.id = %s
+              AND c.status = 'active'
+              AND c.spend_total + %s <= c.budget_total
+              AND (c.budget_daily = 0 OR c.spend_today_date IS DISTINCT FROM CURRENT_DATE
+                   OR c.spend_today + %s <= c.budget_daily)
+              AND w.balance >= %s
+            FOR UPDATE OF c, w
+        ),
+        impression AS (
+            INSERT INTO ad_impressions
+                (campaign_id, creative_id, video_id, viewer_ip, viewer_id, cost)
+            SELECT id, %s, %s, %s, %s, %s FROM locked
+            RETURNING id
+        ),
+        campaign_charge AS (
+            UPDATE ad_campaigns c
+            SET spend_total = spend_total + %s,
+                spend_today = CASE WHEN spend_today_date = CURRENT_DATE
+                                   THEN spend_today + %s ELSE %s END,
+                spend_today_date = CURRENT_DATE,
+                status = CASE WHEN spend_total + %s >= budget_total
+                              THEN 'completed' ELSE status END,
+                updated_at = now()
+            FROM locked l
+            WHERE c.id = l.id
+            RETURNING c.id
+        ),
+        wallet_charge AS (
+            UPDATE ad_wallets w
+            SET balance = balance - %s,
+                total_spent = total_spent + %s,
+                updated_at = now()
+            FROM locked l
+            WHERE w.user_id = l.user_id
+            RETURNING w.user_id, w.balance
+        ),
+        ledger AS (
+            INSERT INTO ad_transactions (user_id, kind, amount, balance_after, reference, note)
+            SELECT wc.user_id, 'spend', -%s, wc.balance, %s,
+                   'impression ad:' || impression.id
+            FROM wallet_charge wc CROSS JOIN impression
+            RETURNING id
+        )
+        SELECT impression.id
+        FROM impression
+        CROSS JOIN campaign_charge
+        CROSS JOIN ledger
+    """, (
+        campaign["campaign_id"], charge, charge, charge,
+        creative["id"], video_id, viewer_ip, viewer_id, charge,
+        charge, charge, charge, charge,
+        charge, charge,
+        charge,
+        f"camp:{campaign['campaign_id']}",
+    ))
+
+
 def _ad_recent_served(creative_id: int, viewer_ip: str, minutes: int = 30) -> bool:
     row = get_one("""
         SELECT 1 FROM ad_impressions
@@ -4207,26 +4372,18 @@ def ad_serve(viewkey: str, request: Request, actor: dict = Depends(get_actor)):
     if _ad_recent_served(cr["id"], ip, 30):
         return {"success": True, "ad": None}
 
-    cost = _ad_cost_for(camp["model"], float(camp["rate_pkr"]))
-
-    imp = get_one("""
-        INSERT INTO ad_impressions
-            (campaign_id, creative_id, video_id, viewer_ip, viewer_id, cost)
-        VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
-    """, (camp["campaign_id"], cr["id"], v["id"], ip, actor["user_id"], cost))
-
-    get_one("""
-        UPDATE ad_campaigns
-        SET spend_total = spend_total + %s,
-            spend_today = CASE WHEN spend_today_date = CURRENT_DATE THEN spend_today + %s ELSE %s END,
-            spend_today_date = CURRENT_DATE,
-            status = CASE WHEN spend_total + %s >= budget_total THEN 'completed' ELSE status END,
-            updated_at = now()
-        WHERE id = %s RETURNING id
-    """, (cost, cost, cost, cost, camp["campaign_id"]))
-
-    _ad_tx(camp["user_id"], "spend", -cost, ref=f"camp:{camp['campaign_id']}",
-           note=f"impression ad:{imp['id']}")
+    # CPM is charged per impression; CPC campaigns are charged only after a click.
+    if camp["model"] == "cpm":
+        cost = _ad_cost_for("cpm", float(camp["rate_pkr"]))
+        imp = _ad_record_impression(camp, cr, v["id"], ip, actor["user_id"], cost)
+    else:
+        imp = get_one("""
+            INSERT INTO ad_impressions
+                (campaign_id, creative_id, video_id, viewer_ip, viewer_id, cost)
+            VALUES (%s, %s, %s, %s, %s, 0) RETURNING id
+        """, (camp["campaign_id"], cr["id"], v["id"], ip, actor["user_id"]))
+    if not imp:
+        return {"success": True, "ad": None}
 
     return {
         "success": True,
@@ -4248,9 +4405,10 @@ def ad_serve(viewkey: str, request: Request, actor: dict = Depends(get_actor)):
 @router.post("/ads/click/{impression_id}")
 def ad_click(impression_id: int, request: Request, actor: dict = Depends(get_actor)):
     imp = get_one("""
-        SELECT i.*, c.model, c.rate_pkr, c.user_id, c.destination_url
+        SELECT i.*, c.model, c.rate_pkr, c.user_id, cr.destination_url
         FROM ad_impressions i
         JOIN ad_campaigns c ON c.id = i.campaign_id
+        JOIN ad_creatives cr ON cr.id = i.creative_id
         WHERE i.id = %s
     """, (impression_id,))
     if not imp:

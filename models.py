@@ -49,6 +49,9 @@ class Video(BaseModel):
     thumbnail: Optional[str] = None
     category: Optional[str] = None
     is_premium: bool = False
+    video_type: str = "long"
+    duration: Optional[int] = 0
+    file_size: Optional[int] = 0
 
 
 class VideoResponse(BaseModel):

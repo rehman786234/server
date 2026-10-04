@@ -9,15 +9,15 @@ class Config:
     MAX_CONNECTIONS = max(2, int(os.getenv("DB_POOL_MAX", "10")))
     POOL_ACQUIRE_TIMEOUT = max(1, int(os.getenv("DB_POOL_ACQUIRE_TIMEOUT", "5")))
 
-    # CORS origins — comma separated env var se lo, ya default
-    ORIGINS = os.getenv("ORIGINS", "*").split(",")
-    GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "899282479040-socsqmvh7pdpg2on00eqlt1knfc31jrk.apps.googleusercontent.com").strip()
-    SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
-    SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-    SMTP_USERNAME = os.getenv("SMTP_USERNAME", "").strip()
-    SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-    SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL", "").strip()
-    SMTP_USE_SSL = os.getenv("SMTP_USE_SSL", "0") == "1"
+    # CORS origins are exact browser origins, without paths or trailing slashes.
+    ORIGINS = [
+        origin.strip().rstrip("/")
+        for origin in os.getenv("ORIGINS", "*").split(",")
+        if origin.strip()
+    ]
+    GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+    RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
+    RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "").strip()
 
     @classmethod
     def validate(cls):

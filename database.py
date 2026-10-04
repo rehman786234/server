@@ -5,12 +5,19 @@ from psycopg2.extras import RealDictCursor
 from contextlib import contextmanager
 from typing import Generator, Dict, List, Optional
 import logging
+import os
 import threading
+import time
 from config import Config
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+try:
+    SLOW_QUERY_MS = max(0.0, float(os.getenv("SLOW_QUERY_MS", "500")))
+except ValueError:
+    logger.warning("Invalid SLOW_QUERY_MS value; using the 500 ms default")
+    SLOW_QUERY_MS = 500.0
 
 # Global connection pool
 _connection_pool = None
@@ -88,8 +95,16 @@ def get_cursor(connection, cursor_factory=RealDictCursor) -> Generator:
         cursor.close()
 
 
+def _log_slow_query(query: str, started_at: float) -> None:
+    elapsed_ms = (time.perf_counter() - started_at) * 1000
+    if elapsed_ms >= SLOW_QUERY_MS:
+        normalized_query = " ".join(query.split())[:500]
+        logger.warning("Slow database operation (%.1f ms): %s", elapsed_ms, normalized_query)
+
+
 def execute_query(query: str, params: tuple = (), fetch: bool = False) -> Optional[List[Dict]]:
     """Execute a query with automatic connection management"""
+    started_at = time.perf_counter()
     try:
         with get_connection() as connection:
             with get_cursor(connection) as cursor:
@@ -109,10 +124,13 @@ def execute_query(query: str, params: tuple = (), fetch: bool = False) -> Option
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
         raise
+    finally:
+        _log_slow_query(query, started_at)
 
 
 def get_one(query: str, params: tuple = ()) -> Optional[Dict]:
     """Execute a query and return a single row"""
+    started_at = time.perf_counter()
     try:
         with get_connection() as connection:
             with get_cursor(connection) as cursor:
@@ -124,6 +142,8 @@ def get_one(query: str, params: tuple = ()) -> Optional[Dict]:
     except psycopg2.Error as e:
         logger.error(f"Database error in get_one: {e}")
         raise
+    finally:
+        _log_slow_query(query, started_at)
 
 
 def health_check() -> bool:

@@ -3,10 +3,22 @@ ALTER TABLE videos
   ADD COLUMN IF NOT EXISTS user_id     INT REFERENCES mydata(id) ON DELETE SET NULL,
   ADD COLUMN IF NOT EXISTS description TEXT DEFAULT '',
   ADD COLUMN IF NOT EXISTS visibility  VARCHAR(10) NOT NULL DEFAULT 'public', -- public | unlisted | private
+  ADD COLUMN IF NOT EXISTS video_type  VARCHAR(10) NOT NULL DEFAULT 'long',
   ADD COLUMN IF NOT EXISTS duration    INT DEFAULT 0,                          -- seconds
   ADD COLUMN IF NOT EXISTS file_size   BIGINT DEFAULT 0,
   ADD COLUMN IF NOT EXISTS views       INT NOT NULL DEFAULT 0,
   ADD COLUMN IF NOT EXISTS updated_at  TIMESTAMP DEFAULT NOW();
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'videos_video_type_check'
+      AND conrelid = 'videos'::regclass
+  ) THEN
+    ALTER TABLE videos
+      ADD CONSTRAINT videos_video_type_check CHECK (video_type IN ('short', 'long'));
+  END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS idx_videos_user ON videos(user_id);
 
 -- 2) channels: one per user (uploader profile)
