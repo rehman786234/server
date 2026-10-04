@@ -1,10 +1,11 @@
-import os
 import psycopg2
 from psycopg2 import pool
+from psycopg2.extensions import TRANSACTION_STATUS_IDLE
 from psycopg2.extras import RealDictCursor
 from contextlib import contextmanager
-from typing import Generator, Dict, Any, List, Optional
+from typing import Generator, Dict, List, Optional
 import logging
+import threading
 from config import Config
 
 # Configure logging
@@ -13,28 +14,34 @@ logger = logging.getLogger(__name__)
 
 # Global connection pool
 _connection_pool = None
+_pool_slots = None
+_pool_init_lock = threading.Lock()
 
 
 def init_connection_pool():
-    """Initialize the PostgreSQL connection pool"""
-    global _connection_pool
+    """Initialize the pool once; concurrent callers wait for a free slot."""
+    global _connection_pool, _pool_slots
     
     try:
-        Config.validate()
-        
-        # Log connection info (without password)
-        db_url = Config.DATABASE_URL
-        logger.info(f"Initializing database connection")
-        
-        # Create connection pool
-        _connection_pool = pool.SimpleConnectionPool(
-            minconn=Config.MIN_CONNECTIONS,
-            maxconn=Config.MAX_CONNECTIONS,
-            dsn=Config.DATABASE_URL,
-            cursor_factory=RealDictCursor
-        )
-        logger.info("Database connection pool initialized successfully")
-        return _connection_pool
+        with _pool_init_lock:
+            if _connection_pool is not None:
+                return _connection_pool
+            Config.validate()
+            logger.info("Initializing database connection pool")
+            _connection_pool = pool.ThreadedConnectionPool(
+                minconn=Config.MIN_CONNECTIONS,
+                maxconn=Config.MAX_CONNECTIONS,
+                dsn=Config.DATABASE_URL,
+                cursor_factory=RealDictCursor,
+                connect_timeout=10,
+                options="-c statement_timeout=15000 -c idle_in_transaction_session_timeout=30000",
+            )
+            _pool_slots = threading.BoundedSemaphore(Config.MAX_CONNECTIONS)
+            logger.info(
+                "Database connection pool initialized (max=%s)",
+                Config.MAX_CONNECTIONS,
+            )
+            return _connection_pool
         
     except Exception as e:
         logger.error(f"Failed to initialize connection pool: {e}")
@@ -44,23 +51,32 @@ def init_connection_pool():
 @contextmanager
 def get_connection() -> Generator:
     """Context manager for database connections"""
-    global _connection_pool
+    global _connection_pool, _pool_slots
     
     if _connection_pool is None:
         init_connection_pool()
-    
+
+    if not _pool_slots.acquire(timeout=Config.POOL_ACQUIRE_TIMEOUT):
+        raise psycopg2.OperationalError("Timed out waiting for an available database connection")
+
     connection = None
     try:
         connection = _connection_pool.getconn()
         yield connection
     except Exception as e:
-        if connection:
-            connection.rollback()
         logger.error(f"Database connection error: {e}")
         raise
     finally:
-        if connection:
-            _connection_pool.putconn(connection)
+        try:
+            if connection:
+                try:
+                    if (not connection.closed
+                            and connection.get_transaction_status() != TRANSACTION_STATUS_IDLE):
+                        connection.rollback()
+                finally:
+                    _connection_pool.putconn(connection, close=bool(connection.closed))
+        finally:
+            _pool_slots.release()
 
 
 @contextmanager
@@ -125,7 +141,9 @@ def health_check() -> bool:
 
 def close_all_connections():
     """Close all connections in the pool"""
-    global _connection_pool
+    global _connection_pool, _pool_slots
     if _connection_pool:
         _connection_pool.closeall()
+        _connection_pool = None
+        _pool_slots = None
         logger.info("All database connections closed")

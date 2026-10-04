@@ -1,5 +1,5 @@
 import logging
-import secrets
+from pathlib import Path
 from database import get_connection, get_cursor
 
 logger = logging.getLogger(__name__)
@@ -102,6 +102,11 @@ def init_database():
                     CREATE INDEX IF NOT EXISTS idx_videos_is_premium 
                     ON videos(is_premium)
                 """)
+
+                migration_sql = Path(__file__).with_name("migration.sql").read_text(
+                    encoding="utf-8"
+                )
+                cursor.execute(migration_sql)
                 
                 connection.commit()
                 logger.info("Database migration completed successfully!")

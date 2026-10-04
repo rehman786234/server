@@ -7,17 +7,24 @@ import hashlib
 import logging
 import os
 import re
+import smtplib
+import ssl
 import time
+import asyncio
 from collections import defaultdict, deque
 from threading import Lock, Thread
 from datetime import datetime, timedelta
+from email.message import EmailMessage
 from typing import Optional, List
 
-from fastapi import (APIRouter, HTTPException, status, Header, Request, Depends,
+from fastapi import (APIRouter, BackgroundTasks, HTTPException, status, Header, Request, Depends,
                      WebSocket, WebSocketDisconnect)
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from google.auth.transport.requests import Request as GoogleRequest
+from google.oauth2 import id_token
+from pydantic import BaseModel, Field
+from config import Config
 
 from database import execute_query, get_one
 from cache import cache_get, cache_set, cache_del, cache_del_prefix
@@ -68,11 +75,18 @@ TTL_TAG_VIDEOS = 60      # /tags/{slug}/videos
 TTL_PLANS = 300          # /plans, /ad-pricing
 TTL_LEGACY_PLAYLIST = 60 # /playlists (legacy)
 TTL_STUDIO_ANALYTICS = 60
+TTL_STUDIO_INIT = 15
+
+
+def _invalidate_studio_cache(user_id: int):
+    cache_del(f"studio:analytics:{user_id}", f"studio:init:{user_id}")
 
 
 def _invalidate_video_caches():
     """Video / channel / profile change hone par saare video-related caches saaf."""
     cache_del("videos:free", "videos:premium")
+    cache_del_prefix("videos:free:")
+    cache_del_prefix("videos:premium:")
     cache_del_prefix("search:")
     cache_del_prefix("related:")
     cache_del_prefix("chvideos:")
@@ -101,6 +115,16 @@ _NEW_INDEXES = [
     "ON channels USING gin (channel_name gin_trgm_ops)",
     "CREATE INDEX IF NOT EXISTS idx_channels_handle_trgm "
     "ON channels USING gin (handle gin_trgm_ops)",
+    "CREATE INDEX IF NOT EXISTS idx_channels_lower_name_trgm "
+    "ON channels USING gin (lower(channel_name) gin_trgm_ops)",
+    "CREATE INDEX IF NOT EXISTS idx_channels_lower_handle_trgm "
+    "ON channels USING gin (lower(handle) gin_trgm_ops)",
+    "CREATE INDEX IF NOT EXISTS idx_users_lower_name_trgm "
+    "ON mydata USING gin (lower(name) gin_trgm_ops)",
+    "CREATE INDEX IF NOT EXISTS idx_tags_slug_trgm "
+    "ON tags USING gin (lower(slug) gin_trgm_ops)",
+    "CREATE INDEX IF NOT EXISTS idx_video_tags_tag_video "
+    "ON video_tags (tag_id, video_id)",
 
     # --- partial indexes: public video lists (/videos, /premium_videos, popular, tags) ---
     "CREATE INDEX IF NOT EXISTS idx_videos_public_free "
@@ -117,6 +141,16 @@ _NEW_INDEXES = [
     # --- payments: pending count (user_id + status) ---
     "CREATE INDEX IF NOT EXISTS idx_pay_user_status "
     "ON payments (user_id, status)",
+    "CREATE INDEX IF NOT EXISTS idx_subscriptions_channel_user "
+    "ON subscriptions (channel_user_id, subscriber_id)",
+    "CREATE INDEX IF NOT EXISTS idx_notifications_user_created "
+    "ON notifications (user_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_ad_campaigns_eligible "
+    "ON ad_campaigns (starts_at, ends_at, id) WHERE status = 'active'",
+    "CREATE INDEX IF NOT EXISTS idx_ad_creatives_campaign_type "
+    "ON ad_creatives (campaign_id, type)",
+    "CREATE INDEX IF NOT EXISTS idx_ad_impressions_creative_viewer_time "
+    "ON ad_impressions (creative_id, viewer_ip, created_at DESC)",
 ]
 
 
@@ -136,9 +170,6 @@ def ensure_db_indexes():
     if not AUTO_CREATE_INDEXES:
         return
     Thread(target=_create_indexes_worker, daemon=True, name="index-builder").start()
-
-
-ensure_db_indexes()
 
 
 # =====================================================================
@@ -205,7 +236,29 @@ def read_token(token: Optional[str]) -> Optional[int]:
 
 
 def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 310_000)
+    return f"pbkdf2_sha256$310000${_b64(salt)}${_b64(digest)}"
+
+
+def verify_password(password: str, stored: Optional[str]) -> tuple[bool, bool]:
+    """Verify current PBKDF2 hashes and upgrade legacy SHA-256 hashes on login."""
+    if not stored or len(password) > 1024:
+        return False, False
+    try:
+        if stored.startswith("pbkdf2_sha256$"):
+            _, iterations, salt, expected = stored.split("$", 3)
+            rounds = int(iterations)
+            if not 100_000 <= rounds <= 2_000_000:
+                return False, False
+            actual = hashlib.pbkdf2_hmac(
+                "sha256", password.encode("utf-8"), _unb64(salt), rounds
+            )
+            return hmac.compare_digest(_b64(actual), expected), False
+        legacy_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        return hmac.compare_digest(legacy_hash, stored), True
+    except (ValueError, TypeError):
+        return False, False
 
 
 def validate_api_key(api_key: str, endpoint: str = None, method: str = "GET"):
@@ -268,10 +321,10 @@ def resolve_actor(authorization=None, api_key=None, x_user_id=None, x_visitor_id
     return actor
 
 
-async def get_actor(authorization: Optional[str] = Header(None),
-                    api_key: Optional[str] = Header(None),
-                    x_user_id: Optional[str] = Header(None),
-                    x_visitor_id: Optional[str] = Header(None)) -> dict:
+def get_actor(authorization: Optional[str] = Header(None),
+              api_key: Optional[str] = Header(None),
+              x_user_id: Optional[str] = Header(None),
+              x_visitor_id: Optional[str] = Header(None)) -> dict:
     return resolve_actor(authorization, api_key, x_user_id, x_visitor_id)
 
 
@@ -352,12 +405,19 @@ async def login(user: UserLogin, request: Request):
         if _login_blocked(throttle_key):
             return {"success": False, "message": "Too many attempts. Please try again in a few minutes."}
 
-        db_user = get_one("SELECT * FROM mydata WHERE email = %s", (user.email,))
-        if not db_user or db_user['password'] != hash_password(user.password):
+        email = (user.email or "").strip().lower()
+        db_user = get_one("SELECT * FROM mydata WHERE LOWER(email) = %s", (email,))
+        password_ok, needs_upgrade = verify_password(
+            user.password or "", db_user["password"] if db_user else None
+        )
+        if not db_user or not password_ok:
             _login_fail(throttle_key)
             return {"success": False, "message": "Invalid email or password"}
 
         _login_fails.pop(throttle_key, None)
+        if needs_upgrade:
+            get_one("UPDATE mydata SET password=%s WHERE id=%s RETURNING id",
+                    (hash_password(user.password), db_user["id"]))
         db_user.pop('password', None)
         return {
             "success": True,
@@ -386,14 +446,19 @@ async def register(user: UserCreate, request: Request):
         if not rate_limit(f"register:{ip}", 5, 3600):
             return {"success": False, "message": "Too many registrations. Try again later."}
 
-        if get_one("SELECT id FROM mydata WHERE email = %s", (user.email,)):
+        email = (user.email or "").strip().lower()
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+            return {"success": False, "message": "Enter a valid email address"}
+        if len(user.password or "") < 8 or len(user.password or "") > 1024:
+            return {"success": False, "message": "Password must be 8-1024 characters"}
+        if get_one("SELECT id FROM mydata WHERE LOWER(email) = %s", (email,)):
             return {"success": False, "message": "User with this email already exists"}
 
         result = get_one("""
             INSERT INTO mydata (name, email, password, is_premium, created_at) 
             VALUES (%s, %s, %s, %s, %s) 
             RETURNING id, name, email, is_premium, created_at
-        """, (user.name, user.email, hash_password(user.password), False, datetime.now()))
+        """, (user.name.strip(), email, hash_password(user.password), False, datetime.now()))
 
         if result:
             return {"success": True, "message": "User registered successfully",
@@ -402,6 +467,191 @@ async def register(user: UserCreate, request: Request):
     except Exception as e:
         logger.error(f"Error in register: {e}")
         return {"success": False, "message": "Registration error. Please try again."}
+
+
+class GoogleAuthIn(BaseModel):
+    id_token: str = Field(min_length=20, max_length=8192)
+
+
+class ForgotPasswordIn(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+
+
+class ResetPasswordIn(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    otp: str = Field(pattern=r"^\d{6}$")
+    new_password: str = Field(min_length=8, max_length=1024)
+
+
+def _user_auth_payload(row: dict) -> dict:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "email": row["email"],
+        "is_premium": row["is_premium"],
+        "created_at": row.get("created_at"),
+    }
+
+
+@router.post("/auth/google")
+async def google_auth(body: GoogleAuthIn, request: Request):
+    if not rate_limit(f"google-auth:{_ip(request)}", 20, 60):
+        raise HTTPException(429, "Too many sign-in attempts. Try again shortly.")
+    if not Config.GOOGLE_CLIENT_ID:
+        raise HTTPException(503, "Google sign-in is not configured")
+    try:
+        claims = id_token.verify_oauth2_token(
+            body.id_token, GoogleRequest(), Config.GOOGLE_CLIENT_ID
+        )
+    except ValueError:
+        raise HTTPException(401, "Invalid Google identity token")
+    email = str(claims.get("email", "")).strip().lower()
+    google_sub = str(claims.get("sub", "")).strip()
+    if claims.get("email_verified") is not True or not google_sub or not re.fullmatch(
+        r"[^@\s]+@[^@\s]+\.[^@\s]+", email
+    ):
+        raise HTTPException(401, "Google account must have a verified email")
+
+    row = get_one(
+        "SELECT id, name, email, is_premium, created_at, google_sub "
+        "FROM mydata WHERE google_sub = %s",
+        (google_sub,),
+    )
+    if not row:
+        row = get_one(
+            "SELECT id, name, email, is_premium, created_at, google_sub "
+            "FROM mydata WHERE LOWER(email) = %s",
+            (email,),
+        )
+        if row:
+            if row["google_sub"] and row["google_sub"] != google_sub:
+                raise HTTPException(409, "This account is linked to another Google account")
+            row = get_one(
+                "UPDATE mydata SET google_sub=%s WHERE id=%s "
+                "RETURNING id, name, email, is_premium, created_at",
+                (google_sub, row["id"]),
+            )
+        else:
+            name = str(claims.get("name") or email.split("@", 1)[0]).strip()[:100]
+            row = get_one("""
+                INSERT INTO mydata (name, email, password, is_premium, google_sub)
+                VALUES (%s, %s, %s, FALSE, %s)
+                RETURNING id, name, email, is_premium, created_at
+            """, (name, email, hash_password(secrets.token_urlsafe(32)), google_sub))
+    return {
+        "success": True,
+        "message": "Google sign-in successful",
+        "token": make_token(row["id"]),
+        "user": _user_auth_payload(row),
+    }
+
+
+def _otp_digest(email: str, otp: str) -> str:
+    return hmac.new(
+        AUTH_SECRET.encode("utf-8"),
+        f"{email}:{otp}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _smtp_ready() -> bool:
+    return bool(
+        Config.SMTP_HOST and Config.SMTP_PORT and Config.SMTP_USERNAME
+        and Config.SMTP_PASSWORD and Config.SMTP_FROM_EMAIL
+    )
+
+
+def _send_password_reset_email(email: str, otp: str) -> None:
+    message = EmailMessage()
+    message["Subject"] = "Your Watchly password reset code"
+    message["From"] = Config.SMTP_FROM_EMAIL
+    message["To"] = email
+    message.set_content(
+        f"Your password reset code is {otp}. It expires in 10 minutes. "
+        "If you did not request this, you can ignore this email."
+    )
+    context = ssl.create_default_context()
+    if Config.SMTP_USE_SSL:
+        with smtplib.SMTP_SSL(
+            Config.SMTP_HOST, Config.SMTP_PORT, context=context, timeout=15
+        ) as server:
+            server.login(Config.SMTP_USERNAME, Config.SMTP_PASSWORD)
+            server.send_message(message)
+    else:
+        with smtplib.SMTP(Config.SMTP_HOST, Config.SMTP_PORT, timeout=15) as server:
+            server.starttls(context=context)
+            server.login(Config.SMTP_USERNAME, Config.SMTP_PASSWORD)
+            server.send_message(message)
+
+
+@router.post("/auth/forgot-password")
+async def forgot_password(body: ForgotPasswordIn, request: Request):
+    email = body.email.strip().lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(422, "Enter a valid email address")
+    if not rate_limit(f"forgot-ip:{_ip(request)}", 5, 3600) or not rate_limit(
+        f"forgot-email:{email}", 3, 3600
+    ):
+        raise HTTPException(429, "Too many requests. Try again later.")
+    if not _smtp_ready():
+        raise HTTPException(503, "Password reset email is not configured")
+
+    user = get_one("SELECT id FROM mydata WHERE LOWER(email) = %s", (email,))
+    if user:
+        otp = f"{secrets.randbelow(1_000_000):06d}"
+        get_one("""
+            INSERT INTO password_reset_otps (email, otp_hash, expires_at, attempts)
+            VALUES (%s, %s, NOW() + INTERVAL '10 minutes', 0)
+            ON CONFLICT (email) DO UPDATE
+            SET otp_hash=EXCLUDED.otp_hash, expires_at=EXCLUDED.expires_at,
+                attempts=0, created_at=NOW()
+            RETURNING email
+        """, (email, _otp_digest(email, otp)))
+        try:
+            await asyncio.to_thread(_send_password_reset_email, email, otp)
+        except (smtplib.SMTPException, OSError):
+            get_one("DELETE FROM password_reset_otps WHERE email=%s RETURNING email", (email,))
+            logger.exception("Could not deliver password reset email")
+            raise HTTPException(502, "Could not deliver reset email. Please try again.")
+    return {
+        "success": True,
+        "message": "If an account exists for this email, a reset code has been sent.",
+    }
+
+
+@router.post("/auth/reset-password")
+async def reset_password(body: ResetPasswordIn, request: Request):
+    email = body.email.strip().lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(400, "Invalid email or reset code")
+    if not rate_limit(f"reset-ip:{_ip(request)}", 10, 3600):
+        raise HTTPException(429, "Too many attempts. Try again later.")
+
+    result = get_one("""
+        WITH bumped AS (
+            UPDATE password_reset_otps
+            SET attempts = attempts + 1
+            WHERE email=%s AND expires_at > NOW() AND attempts < 5
+            RETURNING email, otp_hash
+        ), changed AS (
+            UPDATE mydata u
+            SET password=%s
+            FROM bumped b
+            WHERE LOWER(u.email)=b.email AND b.otp_hash=%s
+            RETURNING u.id
+        ), removed AS (
+            DELETE FROM password_reset_otps o
+            USING changed c
+            WHERE o.email=%s
+            RETURNING o.email
+        )
+        SELECT id FROM changed
+    """, (
+        email, hash_password(body.new_password), _otp_digest(email, body.otp), email,
+    ))
+    if not result:
+        raise HTTPException(400, "Invalid or expired reset code")
+    return {"success": True, "message": "Password reset successfully"}
 
 
 @router.get("/me")
@@ -460,10 +710,14 @@ def _verify_password(user_id: int, password: str, request: Request):
     if _login_blocked(key):
         raise HTTPException(429, "Too many attempts. Please try again in a few minutes.")
     u = get_one("SELECT * FROM mydata WHERE id=%s", (user_id,))
-    if not u or u["password"] != hash_password(password or ""):
+    password_ok, needs_upgrade = verify_password(password or "", u["password"] if u else None)
+    if not u or not password_ok:
         _login_fail(key)
         return None
     _login_fails.pop(key, None)
+    if needs_upgrade:
+        get_one("UPDATE mydata SET password=%s WHERE id=%s RETURNING id",
+                (hash_password(password), user_id))
     return u
 
 
@@ -744,9 +998,12 @@ async def api_analytics(api_key: str = Header(...)):
 #  VIDEOS
 # =====================================================================
 @router.get("/videos")
-async def get_videos():
-    """Free PUBLIC videos. No login needed. (cached)"""
-    cached = cache_get("videos:free")
+def get_videos(limit: int = 50, offset: int = 0):
+    """Page through free public videos; no login needed."""
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+    ckey = f"videos:free:{limit}:{offset}"
+    cached = cache_get(ckey)
     if cached is not None:
         return cached
     try:
@@ -759,10 +1016,11 @@ async def get_videos():
             LEFT JOIN channels c ON c.user_id = v.user_id
             LEFT JOIN mydata u   ON u.id = v.user_id
             WHERE v.is_premium = false AND v.visibility = 'public'
-            ORDER BY v.uploaded_at DESC
-        """, fetch=True)
+            ORDER BY v.uploaded_at DESC, v.id DESC
+            LIMIT %s OFFSET %s
+        """, (limit, offset), fetch=True)
         results = results if results else []
-        cache_set("videos:free", results, TTL_VIDEOS)
+        cache_set(ckey, results, TTL_VIDEOS)
         return results
     except Exception as e:
         logger.error(f"Error in get_videos: {e}")
@@ -770,7 +1028,7 @@ async def get_videos():
 
 
 @router.get("/premium_videos")
-async def get_premium_videos(api_key: str = Header(...)):
+def get_premium_videos(api_key: str = Header(...), limit: int = 50, offset: int = 0):
     # API key + premium check HAR request par hota hai (cache se pehle) — sirf video list cache hoti hai
     user_data = validate_api_key(api_key, "/premium_videos")
     if not user_data:
@@ -778,7 +1036,10 @@ async def get_premium_videos(api_key: str = Header(...)):
     if not user_data.get("is_premium"):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Premium subscription required")
     try:
-        results = cache_get("videos:premium")
+        limit = max(1, min(limit, 100))
+        offset = max(0, offset)
+        ckey = f"videos:premium:{limit}:{offset}"
+        results = cache_get(ckey)
         if results is None:
             results = execute_query("""
                 SELECT v.*,
@@ -789,13 +1050,19 @@ async def get_premium_videos(api_key: str = Header(...)):
                 LEFT JOIN channels c ON c.user_id = v.user_id
                 LEFT JOIN mydata u   ON u.id = v.user_id
                 WHERE v.is_premium = true AND v.visibility = 'public'
-                ORDER BY v.uploaded_at DESC
-            """, fetch=True) or []
-            cache_set("videos:premium", results, TTL_VIDEOS)
+                ORDER BY v.uploaded_at DESC, v.id DESC
+                LIMIT %s OFFSET %s
+            """, (limit + 1, offset), fetch=True) or []
+            cache_set(ckey, results, TTL_VIDEOS)
+        has_more = len(results) > limit
+        results = results[:limit]
         return {
             "success": True,
             "message": "Premium videos retrieved successfully",
             "total": len(results) if results else 0,
+            "has_more": has_more,
+            "limit": limit,
+            "offset": offset,
             "videos": results or [],
             "user": {"id": user_data['user_id'], "name": user_data['name'],
                      "email": user_data['email'], "is_premium": user_data['is_premium']}
@@ -820,7 +1087,8 @@ async def upload_video(video: Video, api_key: str = Header(...)):
               video.category, video.is_premium, user_data.get('user_id')))
         if result:
             _invalidate_video_caches()
-            cache_del(f"studio:analytics:{user_data.get('user_id')}")
+            if user_data.get("user_id"):
+                _invalidate_studio_cache(user_data["user_id"])
             return {"success": True, "message": "Video uploaded successfully", "viewkey": viewkey,
                     "video": result, "uploaded_by": user_data.get('name', 'Unknown'),
                     "user_id": user_data.get('user_id')}
@@ -833,7 +1101,7 @@ async def upload_video(video: Video, api_key: str = Header(...)):
 
 
 @router.get("/videos/{viewkey}")
-async def get_video_by_key(viewkey: str, actor: dict = Depends(get_actor)):
+def get_video_by_key(viewkey: str, actor: dict = Depends(get_actor)):
     try:
         row = get_one("""
             SELECT v.*,
@@ -1034,17 +1302,43 @@ async def health_check():
 
 
 @router.get("/ads")
-async def get_ads():
-    """Legacy random ads: 2 image + 1 video. (NOT cached — random rotation chahiye)"""
+def get_ads():
+    """Return rotating legacy ads and currently eligible campaign creatives."""
     try:
-        image_ads = execute_query("""
-            SELECT id, ad_name, promotion_link, ad_type, link
-            FROM ads_table WHERE ad_type = 'image' ORDER BY RANDOM() LIMIT 2
+        ads = execute_query("""
+            WITH candidates AS (
+                SELECT id, ad_name, promotion_link, ad_type, link,
+                       NULL::text AS thumbnail, NULL::text AS description,
+                       NULL::text AS cta_text, NULL::integer AS campaign_id,
+                       FALSE AS is_campaign
+                FROM ads_table
+                WHERE ad_type IN ('image', 'video')
+                UNION ALL
+                SELECT cr.id, cr.title, cr.destination_url, cr.type, cr.url,
+                       cr.thumbnail, cr.description, cr.cta_text, c.id,
+                       TRUE AS is_campaign
+                FROM ad_creatives cr
+                JOIN ad_campaigns c ON c.id = cr.campaign_id
+                WHERE cr.type IN ('image', 'video') AND c.status = 'active'
+                  AND (c.starts_at IS NULL OR c.starts_at <= NOW())
+                  AND (c.ends_at IS NULL OR c.ends_at >= NOW())
+                  AND c.spend_total < c.budget_total
+                  AND (c.budget_daily = 0 OR c.spend_today_date <> CURRENT_DATE
+                       OR c.spend_today < c.budget_daily)
+            ), ranked AS (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY ad_type ORDER BY is_campaign DESC, RANDOM()
+                ) AS ad_rank
+                FROM candidates
+            )
+            SELECT id, ad_name, promotion_link, ad_type, link, thumbnail,
+                   description, cta_text, campaign_id, is_campaign
+            FROM ranked
+            WHERE ad_rank <= CASE WHEN ad_type = 'image' THEN 2 ELSE 1 END
+            ORDER BY ad_type, ad_rank
         """, fetch=True) or []
-        video_ads = execute_query("""
-            SELECT id, ad_name, promotion_link, ad_type, link
-            FROM ads_table WHERE ad_type = 'video' ORDER BY RANDOM() LIMIT 1
-        """, fetch=True) or []
+        image_ads = [ad for ad in ads if ad["ad_type"] == "image"]
+        video_ads = [ad for ad in ads if ad["ad_type"] == "video"]
         return {"success": True, "total": len(image_ads) + len(video_ads),
                 "image_ads": image_ads, "video_ads": video_ads}
     except Exception:
@@ -1090,15 +1384,34 @@ def current_user(api_key: str, endpoint: str = None, method: str = "GET"):
 
 
 @router.get("/studio/my_videos")
-async def studio_my_videos(api_key: str = Header(...)):
+def studio_my_videos(api_key: str = Header(...), limit: int = 50, offset: int = 0):
     u = current_user(api_key, "/studio/my_videos")
-    rows = execute_query("SELECT * FROM videos WHERE user_id=%s ORDER BY uploaded_at DESC",
-                         (u["user_id"],), fetch=True) or []
-    return {"success": True, "total": len(rows), "videos": rows}
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+    rows = execute_query("""
+        SELECT id, title, viewkey, thumbnail, category, is_premium, uploaded_at,
+               description, visibility, duration, file_size, views, updated_at,
+               (SELECT COUNT(*) FROM videos WHERE user_id=%s) AS total_count
+        FROM videos WHERE user_id=%s
+        ORDER BY uploaded_at DESC, id DESC LIMIT %s OFFSET %s
+    """, (u["user_id"], u["user_id"], limit + 1, offset), fetch=True) or []
+    total = rows[0]["total_count"] if rows else 0
+    for row in rows:
+        row.pop("total_count", None)
+    return {
+        "success": True,
+        "total": total,
+        "has_more": len(rows) > limit,
+        "videos": rows[:limit],
+    }
 
 
 @router.post("/studio/videos")
-async def studio_create_video(v: StudioVideoIn, api_key: str = Header(...)):
+def studio_create_video(
+    v: StudioVideoIn,
+    background_tasks: BackgroundTasks,
+    api_key: str = Header(...),
+):
     u = current_user(api_key, "/studio/create_video")
     if not get_one("SELECT id FROM channels WHERE user_id=%s", (u["user_id"],)):
         return {"success": False, "message": "Create your channel before uploading videos"}
@@ -1118,14 +1431,14 @@ async def studio_create_video(v: StudioVideoIn, api_key: str = Header(...)):
         logger.exception("studio_create_video")
         return {"success": False, "message": "Could not save video"}
     _invalidate_video_caches()
-    cache_del(f"studio:analytics:{u['user_id']}")
+    _invalidate_studio_cache(u["user_id"])
     if v.visibility == "public":
-        await _notify_new_upload(u["user_id"], row["id"], v.is_premium)
+        background_tasks.add_task(_notify_new_upload, u["user_id"], row["id"], v.is_premium)
     return {"success": True, "viewkey": viewkey, "video": row}
 
 
 @router.put("/studio/videos/{video_id}")
-async def studio_edit_video(video_id: int, v: StudioVideoEdit, api_key: str = Header(...)):
+def studio_edit_video(video_id: int, v: StudioVideoEdit, api_key: str = Header(...)):
     u = current_user(api_key, "/studio/edit_video")
     if v.visibility is not None and v.visibility not in ("public", "unlisted", "private"):
         raise HTTPException(400, "Invalid visibility")
@@ -1139,23 +1452,23 @@ async def studio_edit_video(video_id: int, v: StudioVideoEdit, api_key: str = He
     if not row:
         raise HTTPException(404, "Video not found")
     _invalidate_video_caches()
-    cache_del(f"studio:analytics:{u['user_id']}")
+    _invalidate_studio_cache(u["user_id"])
     return {"success": True, "video": row}
 
 
 @router.delete("/studio/videos/{video_id}")
-async def studio_delete_video(video_id: int, api_key: str = Header(...)):
+def studio_delete_video(video_id: int, api_key: str = Header(...)):
     u = current_user(api_key, "/studio/delete_video")
     row = get_one("DELETE FROM videos WHERE id=%s AND user_id=%s RETURNING id", (video_id, u["user_id"]))
     if not row:
         raise HTTPException(404, "Video not found")
     _invalidate_video_caches()
-    cache_del(f"studio:analytics:{u['user_id']}")
+    _invalidate_studio_cache(u["user_id"])
     return {"success": True}
 
 
 @router.get("/studio/stats")
-async def studio_stats(api_key: str = Header(...)):
+def studio_stats(api_key: str = Header(...)):
     u = current_user(api_key, "/studio/stats")
     uid = u["user_id"]
     s = get_one("""
@@ -1170,13 +1483,13 @@ async def studio_stats(api_key: str = Header(...)):
 
 
 @router.get("/studio/channel")
-async def studio_get_channel(api_key: str = Header(...)):
+def studio_get_channel(api_key: str = Header(...)):
     u = current_user(api_key, "/studio/get_channel")
     return {"success": True, "channel": get_one("SELECT * FROM channels WHERE user_id=%s", (u["user_id"],))}
 
 
 @router.put("/studio/channel")
-async def studio_save_channel(c: ChannelIn, api_key: str = Header(...)):
+def studio_save_channel(c: ChannelIn, api_key: str = Header(...)):
     u = current_user(api_key, "/studio/save_channel")
     name = (c.channel_name or "").strip()
     handle = (c.handle or "").strip().lower()
@@ -1195,7 +1508,7 @@ async def studio_save_channel(c: ChannelIn, api_key: str = Header(...)):
             description=EXCLUDED.description RETURNING *""",
         (u["user_id"], name, handle, c.avatar_url, c.banner_url, c.description))
     _invalidate_video_caches()
-    cache_del(f"studio:analytics:{u['user_id']}")
+    _invalidate_studio_cache(u["user_id"])
     return {"success": True, "channel": row}
 
 
@@ -1203,7 +1516,7 @@ _recent_views = {}
 
 
 @router.post("/studio/view/{viewkey}")
-async def studio_count_view(viewkey: str, request: Request):
+def studio_count_view(viewkey: str, request: Request):
     """Viewer page 5 second playback ke baad call karta hai. Same IP + video 30 min me ek dafa count hota hai."""
     ip = _ip(request)
     now = time.time()
@@ -1291,7 +1604,7 @@ def _analytics_for(uid: int):
 
 
 @router.get("/studio/analytics")
-async def studio_analytics(api_key: str = Header(...)):
+def studio_analytics(api_key: str = Header(...)):
     u = current_user(api_key)
     a = _analytics_for(u["user_id"])
     if a:
@@ -1300,9 +1613,13 @@ async def studio_analytics(api_key: str = Header(...)):
 
 
 @router.get("/studio/init")
-async def studio_init(api_key: str = Header(...)):
+def studio_init(api_key: str = Header(...)):
     u = current_user(api_key)
     uid = u["user_id"]
+    ckey = f"studio:init:{uid}"
+    cached = cache_get(ckey)
+    if cached is not None:
+        return cached
     channel = get_one("SELECT * FROM channels WHERE user_id=%s", (uid,))
     stats = get_one("""
         SELECT COUNT(*) AS videos,
@@ -1317,7 +1634,10 @@ async def studio_init(api_key: str = Header(...)):
                views, duration, uploaded_at
         FROM videos WHERE user_id=%s ORDER BY uploaded_at DESC LIMIT 100""", (uid,), fetch=True) or []
     analytics = _analytics_for(uid) if channel else None
-    return {"success": True, "channel": channel, "stats": stats, "videos": videos, "analytics": analytics}
+    payload = {"success": True, "channel": channel, "stats": stats,
+               "videos": videos, "analytics": analytics}
+    cache_set(ckey, payload, TTL_STUDIO_INIT)
+    return payload
 
 
 # =====================================================================
@@ -1414,7 +1734,7 @@ async def subscribe(handle: str, actor: dict = Depends(get_actor)):
     if ins:
         await notify(ch["user_id"], "new_subscriber", actor["user_id"])
     cache_del_prefix("channels:list:")
-    cache_del(f"studio:analytics:{ch['user_id']}")
+    _invalidate_studio_cache(ch["user_id"])
     cnt = get_one("SELECT COUNT(*) AS n FROM subscriptions WHERE channel_user_id=%s", (ch["user_id"],))
     return {"success": True, "subscribed": True, "subscriber_count": cnt["n"] if cnt else 0}
 
@@ -1428,7 +1748,7 @@ async def unsubscribe(handle: str, actor: dict = Depends(get_actor)):
     get_one("DELETE FROM subscriptions WHERE subscriber_id=%s AND channel_user_id=%s RETURNING subscriber_id",
             (actor["user_id"], ch["user_id"]))
     cache_del_prefix("channels:list:")
-    cache_del(f"studio:analytics:{ch['user_id']}")
+    _invalidate_studio_cache(ch["user_id"])
     cnt = get_one("SELECT COUNT(*) AS n FROM subscriptions WHERE channel_user_id=%s", (ch["user_id"],))
     return {"success": True, "subscribed": False, "subscriber_count": cnt["n"] if cnt else 0}
 
@@ -1590,22 +1910,29 @@ def _drop_notification(user_id, ntype, actor_id, video_id=None, comment_id=None)
         logger.exception("drop notification failed")
 
 
+def _create_upload_notifications(owner_id: int, video_id: int, is_premium: bool) -> list[int]:
+    subs = execute_query("""
+        SELECT s.subscriber_id FROM subscriptions s JOIN mydata m ON m.id = s.subscriber_id
+        WHERE s.channel_user_id = %s AND (%s::boolean = false OR m.is_premium = true) LIMIT 2000
+    """, (owner_id, is_premium), fetch=True) or []
+    if not subs:
+        return []
+    execute_query("""
+        INSERT INTO notifications (user_id, actor_id, type, video_id)
+        SELECT s.subscriber_id, %s, 'new_upload', %s
+        FROM subscriptions s JOIN mydata m ON m.id = s.subscriber_id
+        WHERE s.channel_user_id = %s AND (%s::boolean = false OR m.is_premium = true)
+    """, (owner_id, video_id, owner_id, is_premium))
+    return [s["subscriber_id"] for s in subs]
+
+
 async def _notify_new_upload(owner_id: int, video_id: int, is_premium: bool):
     try:
-        subs = execute_query("""
-            SELECT s.subscriber_id FROM subscriptions s JOIN mydata m ON m.id = s.subscriber_id
-            WHERE s.channel_user_id = %s AND (%s::boolean = false OR m.is_premium = true) LIMIT 2000
-        """, (owner_id, is_premium), fetch=True) or []
-        if not subs:
-            return
-        get_one("""
-            INSERT INTO notifications (user_id, actor_id, type, video_id)
-            SELECT s.subscriber_id, %s, 'new_upload', %s
-            FROM subscriptions s JOIN mydata m ON m.id = s.subscriber_id
-            WHERE s.channel_user_id = %s AND (%s::boolean = false OR m.is_premium = true)
-            RETURNING id""", (owner_id, video_id, owner_id, is_premium))
-        for s in subs:
-            await manager.push(s["subscriber_id"], {"type": "refresh"})
+        subscriber_ids = await asyncio.to_thread(
+            _create_upload_notifications, owner_id, video_id, is_premium
+        )
+        for subscriber_id in subscriber_ids:
+            await manager.push(subscriber_id, {"type": "refresh"})
     except Exception:
         logger.exception("_notify_new_upload failed")
 
@@ -2032,14 +2359,14 @@ async def video_tags_set(viewkey: str, body: TagsForVideoIn,
 
 
 @router.get("/search")
-async def smart_search(
+def smart_search(
     q: str = "",
     sort: str = "relevance",
     limit: int = 20,
     offset: int = 0,
     actor: dict = Depends(get_actor),
 ):
-    q = (q or "").strip()
+    q = (q or "").strip()[:200]
     if len(q) < 2:
         return {"success": True, "query": q, "total": 0, "has_more": False, "videos": []}
 
@@ -2049,8 +2376,31 @@ async def smart_search(
     cached = cache_get(ckey)
     if cached is not None:
         return cached
-    like = f"%{q.lower()}%"
-    prefix = f"{q.lower()}%"
+    q_lower = q.lower()
+    words = list(dict.fromkeys(re.findall(r"[^\W_]+(?:-[^\W_]+)*", q_lower, flags=re.UNICODE)))[:8]
+    if not words:
+        words = [q_lower]
+
+    def escape_like(value: str) -> str:
+        return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    patterns = list(dict.fromkeys(
+        [f"%{escape_like(q_lower)}%"]
+        + [f"%{escape_like(word)}%" for word in words]
+    ))
+    title_conditions = " OR ".join("LOWER(v.title) LIKE %s" for _ in patterns)
+    description_conditions = " OR ".join(
+        "LOWER(COALESCE(v.description,'')) LIKE %s" for _ in patterns
+    )
+    channel_name_conditions = " OR ".join(
+        ["LOWER(c.channel_name) LIKE %s" for _ in patterns]
+        + ["LOWER(u.name) LIKE %s" for _ in patterns]
+    )
+    channel_handle_conditions = " OR ".join(
+        "LOWER(c.handle) LIKE %s" for _ in patterns
+    )
+    tag_name_conditions = " OR ".join("LOWER(t.name) LIKE %s" for _ in patterns)
+    tag_slug_conditions = " OR ".join("LOWER(t.slug) LIKE %s" for _ in patterns)
 
     order_sql = {
         "latest":  "v.uploaded_at DESC",
@@ -2058,18 +2408,30 @@ async def smart_search(
     }.get(sort, "rank_score DESC, v.views DESC")
 
     rows = execute_query(f"""
-        WITH matched AS (
+        WITH query_terms AS (
+            SELECT unnest(%s::text[]) AS term
+        ),
+        matched AS (
             SELECT
                 v.id,
                 (
-                    CASE WHEN LOWER(v.title) LIKE %s THEN 100 ELSE 0 END +
-                    CASE WHEN LOWER(v.title) LIKE %s THEN 40  ELSE 0 END +
-                    CASE WHEN EXISTS (
-                        SELECT 1 FROM video_tags vt JOIN tags t ON t.id = vt.tag_id
-                        WHERE vt.video_id = v.id AND (LOWER(t.name) LIKE %s OR t.slug LIKE %s)
-                    ) THEN 60 ELSE 0 END +
-                    CASE WHEN LOWER(COALESCE(v.description,'')) LIKE %s THEN 20 ELSE 0 END +
-                    CASE WHEN LOWER(COALESCE(c.channel_name, u.name, '')) LIKE %s THEN 15 ELSE 0 END +
+                    CASE WHEN LOWER(v.title) = %s THEN 250 ELSE 0 END +
+                    CASE WHEN LOWER(v.title) LIKE %s THEN 120 ELSE 0 END +
+                    CASE WHEN LOWER(v.title) LIKE %s THEN 80 ELSE 0 END +
+                    45 * (SELECT COUNT(*) FROM query_terms qt
+                          WHERE LOWER(v.title) LIKE '%' || qt.term || '%') +
+                    60 * (SELECT COUNT(*) FROM query_terms qt
+                          WHERE EXISTS (
+                              SELECT 1 FROM video_tags vt JOIN tags t ON t.id = vt.tag_id
+                              WHERE vt.video_id = v.id
+                                AND (LOWER(t.name) LIKE '%' || qt.term || '%'
+                                     OR LOWER(t.slug) LIKE '%' || qt.term || '%')
+                          )) +
+                    40 * (SELECT COUNT(*) FROM query_terms qt
+                          WHERE LOWER(c.channel_name) LIKE '%' || qt.term || '%'
+                             OR LOWER(u.name) LIKE '%' || qt.term || '%'
+                             OR LOWER(c.handle) LIKE '%' || qt.term || '%') +
+                    CASE WHEN LOWER(COALESCE(v.description,'')) LIKE %s THEN 15 ELSE 0 END +
                     LEAST(COALESCE(v.views,0) / 100.0, 20)
                 ) AS rank_score
             FROM videos v
@@ -2078,12 +2440,14 @@ async def smart_search(
             WHERE v.visibility = 'public'
               AND (%s::boolean OR v.is_premium = false)
               AND (
-                    LOWER(v.title) LIKE %s
-                 OR LOWER(COALESCE(v.description,'')) LIKE %s
-                 OR LOWER(COALESCE(c.channel_name, u.name, '')) LIKE %s
+                    ({title_conditions})
+                 OR ({description_conditions})
+                 OR ({channel_name_conditions})
+                 OR ({channel_handle_conditions})
                  OR EXISTS (
                         SELECT 1 FROM video_tags vt JOIN tags t ON t.id = vt.tag_id
-                        WHERE vt.video_id = v.id AND (LOWER(t.name) LIKE %s OR t.slug LIKE %s)
+                        WHERE vt.video_id = v.id
+                          AND (({tag_name_conditions}) OR ({tag_slug_conditions}))
                     )
               )
         )
@@ -2108,13 +2472,19 @@ async def smart_search(
         ORDER BY {order_sql}
         LIMIT %s OFFSET %s
     """, (
-        prefix, like,
-        like, prefix,
-        like,
-        like,
+        words,
+        q_lower,
+        f"{escape_like(q_lower)}%",
+        f"%{escape_like(q_lower)}%",
+        f"%{escape_like(q_lower)}%",
         actor["is_premium"] or False,
-        like, like, like,
-        like, prefix,
+        *patterns,
+        *patterns,
+        *patterns,
+        *patterns,
+        *patterns,
+        *patterns,
+        *patterns,
         limit + 1, offset,
     ), fetch=True) or []
 
@@ -3804,7 +4174,7 @@ def _ad_recent_served(creative_id: int, viewer_ip: str, minutes: int = 30) -> bo
 
 
 @router.get("/ads/serve")
-async def ad_serve(viewkey: str, request: Request, actor: dict = Depends(get_actor)):
+def ad_serve(viewkey: str, request: Request, actor: dict = Depends(get_actor)):
     """Video page ke liye ek ad pick karo."""
     v = get_one("""
         SELECT v.id, v.user_id, v.visibility, v.is_premium, v.category,
@@ -3867,7 +4237,7 @@ async def ad_serve(viewkey: str, request: Request, actor: dict = Depends(get_act
 
 
 @router.post("/ads/click/{impression_id}")
-async def ad_click(impression_id: int, request: Request, actor: dict = Depends(get_actor)):
+def ad_click(impression_id: int, request: Request, actor: dict = Depends(get_actor)):
     imp = get_one("""
         SELECT i.*, c.model, c.rate_pkr, c.user_id, c.destination_url
         FROM ad_impressions i

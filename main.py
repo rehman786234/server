@@ -8,7 +8,7 @@ import sys
 
 from config import Config
 from database import init_connection_pool, close_all_connections, health_check
-from routes import router
+from routes import ensure_db_indexes, router
 from init_db import init_database
 
 # Configure logging
@@ -40,6 +40,7 @@ async def lifespan(app: FastAPI):
         # Initialize database tables (safe migration)
         init_database()
         logger.info("Database initialization completed")
+        ensure_db_indexes()
         
         # Health check
         if health_check():

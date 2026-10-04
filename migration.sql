@@ -28,3 +28,19 @@ CREATE TABLE IF NOT EXISTS video_views (
   viewed_at TIMESTAMP DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_views_video ON video_views(video_id, viewed_at);
+
+-- Google sign-in and short-lived, single-use password reset codes.
+ALTER TABLE mydata ADD COLUMN IF NOT EXISTS google_sub TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mydata_google_sub
+  ON mydata(google_sub) WHERE google_sub IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_mydata_lower_email ON mydata(LOWER(email));
+
+CREATE TABLE IF NOT EXISTS password_reset_otps (
+  email       TEXT PRIMARY KEY,
+  otp_hash    TEXT NOT NULL,
+  expires_at  TIMESTAMPTZ NOT NULL,
+  attempts    SMALLINT NOT NULL DEFAULT 0 CHECK (attempts >= 0 AND attempts <= 5),
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_password_reset_otps_expiry
+  ON password_reset_otps(expires_at);

@@ -882,6 +882,94 @@ print(<span class="string">'Database:'</span>, data[<span class="string">'databa
             </div>
         </div>
 
+        <h2 class="section-title">
+            <i class="fas fa-magnifying-glass"></i> Search, Campaign Ads & Account Access
+        </h2>
+        <div class="endpoints-grid">
+            <div class="endpoint-card">
+                <div class="endpoint-header">
+                    <div class="endpoint-left">
+                        <span class="method-badge method-get">GET</span>
+                        <span class="endpoint-path">/search?q=space%20cats</span>
+                    </div>
+                    <span class="auth-badge"><i class="fas fa-globe"></i> Public</span>
+                </div>
+                <div class="endpoint-description">
+                    Search terms are matched across video titles, descriptions, tags, channel names,
+                    and channel handles. Results rank title matches first, then tags and channels.
+                    PostgreSQL trigram indexes support substring matching.
+                </div>
+            </div>
+            <div class="endpoint-card">
+                <div class="endpoint-header">
+                    <div class="endpoint-left">
+                        <span class="method-badge method-get">GET</span>
+                        <span class="endpoint-path">/videos?limit=50&amp;offset=0</span>
+                    </div>
+                    <span class="auth-badge"><i class="fas fa-globe"></i> Public</span>
+                </div>
+                <div class="endpoint-description">
+                    Free and premium video feeds return up to 50 videos per page by default
+                    (maximum 100). Request the next page by increasing <code>offset</code>.
+                    Creator Studio video lists use the same pagination pattern.
+                </div>
+            </div>
+            <div class="endpoint-card">
+                <div class="endpoint-header">
+                    <div class="endpoint-left">
+                        <span class="method-badge method-get">GET</span>
+                        <span class="endpoint-path">/ads</span>
+                    </div>
+                    <span class="auth-badge"><i class="fas fa-globe"></i> Public</span>
+                </div>
+                <div class="endpoint-description">
+                    Returns eligible active campaign creatives together with legacy ads.
+                    Use <code>/ads/serve?viewkey=VIDEO_VIEWKEY</code> on a video page for
+                    budget-tracked campaign impressions.
+                </div>
+            </div>
+            <div class="endpoint-card">
+                <div class="endpoint-header">
+                    <div class="endpoint-left">
+                        <span class="method-badge method-post">POST</span>
+                        <span class="endpoint-path">/auth/google</span>
+                    </div>
+                    <span class="auth-badge"><i class="fas fa-globe"></i> Public</span>
+                </div>
+                <div class="endpoint-description">
+                    Send a verified Google Identity Services ID token as
+                    <code>{"id_token":"GOOGLE_ID_TOKEN"}</code>. The response includes the usual
+                    Watchly bearer token. Configure <code>GOOGLE_CLIENT_ID</code> on the server.
+                </div>
+            </div>
+            <div class="endpoint-card">
+                <div class="endpoint-header">
+                    <div class="endpoint-left">
+                        <span class="method-badge method-post">POST</span>
+                        <span class="endpoint-path">/auth/forgot-password</span>
+                    </div>
+                    <span class="auth-badge"><i class="fas fa-globe"></i> Public</span>
+                </div>
+                <div class="endpoint-description">
+                    Send <code>{"email":"user@example.com"}</code> to email a short-lived,
+                    single-use OTP. Configure the server's <code>SMTP_*</code> environment variables.
+                </div>
+            </div>
+            <div class="endpoint-card">
+                <div class="endpoint-header">
+                    <div class="endpoint-left">
+                        <span class="method-badge method-post">POST</span>
+                        <span class="endpoint-path">/auth/reset-password</span>
+                    </div>
+                    <span class="auth-badge"><i class="fas fa-globe"></i> Public</span>
+                </div>
+                <div class="endpoint-description">
+                    Send <code>{"email":"user@example.com","otp":"123456","new_password":"new-password"}</code>.
+                    Codes expire in 10 minutes and are limited to five attempts.
+                </div>
+            </div>
+        </div>
+
         <!-- Footer -->
         <div class="footer">
             <p>
