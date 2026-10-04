@@ -618,24 +618,31 @@ def _otp_digest(email: str, otp: str) -> str:
     ).hexdigest()
 
 
+def _mail_setting(name: str, default: str = "") -> str:
+    return str(getattr(Config, name, os.getenv(name, default)))
+
+
 def _smtp_ready() -> bool:
+    smtp_username = _mail_setting("SMTP_USERNAME")
+    smtp_password = _mail_setting("SMTP_PASSWORD")
     return bool(
-        Config.SMTP_HOST
-        and Config.SMTP_FROM_EMAIL
-        and (bool(Config.SMTP_USERNAME) == bool(Config.SMTP_PASSWORD))
+        _mail_setting("SMTP_HOST")
+        and _mail_setting("SMTP_FROM_EMAIL")
+        and (bool(smtp_username) == bool(smtp_password))
     )
 
 
 def _email_ready() -> bool:
     return bool(
-        (Config.RESEND_API_KEY and Config.RESEND_FROM_EMAIL)
+        (_mail_setting("RESEND_API_KEY") and _mail_setting("RESEND_FROM_EMAIL"))
         or _smtp_ready()
     )
 
 
 def _send_password_reset_email_smtp(email: str, otp: str) -> None:
+    use_ssl = _mail_setting("SMTP_USE_SSL", "0").lower() in {"1", "true", "yes"}
     message = EmailMessage()
-    message["From"] = Config.SMTP_FROM_EMAIL
+    message["From"] = _mail_setting("SMTP_FROM_EMAIL")
     message["To"] = email
     message["Subject"] = "Your Watchly password reset code"
     message.set_content(
@@ -643,26 +650,31 @@ def _send_password_reset_email_smtp(email: str, otp: str) -> None:
         "If you did not request this, you can ignore this email."
     )
 
-    smtp_factory = smtplib.SMTP_SSL if Config.SMTP_USE_SSL else smtplib.SMTP
-    with smtp_factory(Config.SMTP_HOST, Config.SMTP_PORT, timeout=15) as server:
-        if not Config.SMTP_USE_SSL:
+    smtp_factory = smtplib.SMTP_SSL if use_ssl else smtplib.SMTP
+    smtp_port = int(_mail_setting("SMTP_PORT", "587"))
+    with smtp_factory(_mail_setting("SMTP_HOST"), smtp_port, timeout=15) as server:
+        if not use_ssl:
             server.starttls(context=ssl.create_default_context())
-        if Config.SMTP_USERNAME:
-            server.login(Config.SMTP_USERNAME, Config.SMTP_PASSWORD)
+        smtp_username = _mail_setting("SMTP_USERNAME")
+        smtp_password = _mail_setting("SMTP_PASSWORD")
+        if smtp_username:
+            server.login(smtp_username, smtp_password)
         refused = server.send_message(message)
         if refused:
             raise smtplib.SMTPRecipientsRefused(refused)
 
 
 def _send_password_reset_email(email: str, otp: str) -> None:
-    if not (Config.RESEND_API_KEY and Config.RESEND_FROM_EMAIL):
+    resend_api_key = _mail_setting("RESEND_API_KEY")
+    resend_from_email = _mail_setting("RESEND_FROM_EMAIL")
+    if not (resend_api_key and resend_from_email):
         if not _smtp_ready():
             raise OSError("Password reset email is not configured")
         _send_password_reset_email_smtp(email, otp)
         return
 
     body = json.dumps({
-        "from": Config.RESEND_FROM_EMAIL,
+        "from": resend_from_email,
         "to": [email],
         "subject": "Your Watchly password reset code",
         "text": (
@@ -674,7 +686,7 @@ def _send_password_reset_email(email: str, otp: str) -> None:
         "https://api.resend.com/emails",
         data=body,
         headers={
-            "Authorization": f"Bearer {Config.RESEND_API_KEY}",
+            "Authorization": f"Bearer {resend_api_key}",
             "Content-Type": "application/json",
         },
         method="POST",
