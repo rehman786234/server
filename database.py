@@ -34,7 +34,6 @@ def init_connection_pool():
                 dsn=Config.DATABASE_URL,
                 cursor_factory=RealDictCursor,
                 connect_timeout=10,
-                options="-c statement_timeout=15000 -c idle_in_transaction_session_timeout=30000",
             )
             _pool_slots = threading.BoundedSemaphore(Config.MAX_CONNECTIONS)
             logger.info(
