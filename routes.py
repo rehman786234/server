@@ -493,6 +493,15 @@ def _user_auth_payload(row: dict) -> dict:
     }
 
 
+@router.get("/auth/google/config")
+async def google_auth_config():
+    return {
+        "success": True,
+        "enabled": bool(Config.GOOGLE_CLIENT_ID),
+        "client_id": Config.GOOGLE_CLIENT_ID or None,
+    }
+
+
 @router.post("/auth/google")
 async def google_auth(body: GoogleAuthIn, request: Request):
     if not rate_limit(f"google-auth:{_ip(request)}", 20, 60):
