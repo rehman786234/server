@@ -11,7 +11,7 @@ class Config:
 
     # CORS origins — comma separated env var se lo, ya default
     ORIGINS = os.getenv("ORIGINS", "*").split(",")
-    GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+    GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "899282479040-socsqmvh7pdpg2on00eqlt1knfc31jrk.apps.googleusercontent.com").strip()
     SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
     SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
     SMTP_USERNAME = os.getenv("SMTP_USERNAME", "").strip()
