@@ -3216,6 +3216,7 @@ async def my_payment_status(actor: dict = Depends(get_actor)):
 
 _support_conns: dict = {}
 _support_lock = Lock()
+_support_background_tasks: set = set()
 
 
 async def _support_push(uid: int, payload: dict):
@@ -3257,6 +3258,38 @@ async def _support_broadcast_new_message(thread_id: int, message: dict,
         "type": "support_thread_update",
         "thread_id": thread_id,
     })
+
+
+async def _support_notify_and_broadcast(thread_id: int, message: dict,
+                                        is_admin: bool, thread_owner_id: int,
+                                        sender_id: int):
+    try:
+        if is_admin:
+            await notify(thread_owner_id, "support_reply", sender_id)
+        else:
+            for admin_id in ADMIN_USER_IDS:
+                await notify(admin_id, "support_message", sender_id)
+    except Exception:
+        logger.exception("notify support message")
+    try:
+        await _support_broadcast_new_message(
+            thread_id=thread_id,
+            message=message,
+            is_admin=is_admin,
+            thread_owner_id=thread_owner_id,
+        )
+    except Exception:
+        logger.exception("broadcast support message")
+
+
+def _schedule_support_notify_and_broadcast(thread_id: int, message: dict,
+                                           is_admin: bool, thread_owner_id: int,
+                                           sender_id: int):
+    task = asyncio.create_task(_support_notify_and_broadcast(
+        thread_id, message, is_admin, thread_owner_id, sender_id
+    ))
+    _support_background_tasks.add(task)
+    task.add_done_callback(_support_background_tasks.discard)
 
 
 @router.websocket("/ws/support")
@@ -3345,27 +3378,19 @@ async def ws_support(ws: WebSocket):
                     logger.exception("persist websocket support message")
                     await ws.send_json(send_error("Could not save your message. Please retry."))
                     continue
-                try:
-                    if is_admin:
-                        await notify(thread["user_id"], "support_reply", uid)
-                    else:
-                        for admin_id in ADMIN_USER_IDS:
-                            await notify(admin_id, "support_message", uid)
-                    await _support_broadcast_new_message(
-                        thread_id=thread_id,
-                        message=message,
-                        is_admin=is_admin,
-                        thread_owner_id=thread["user_id"],
-                    )
-                except Exception:
-                    logger.exception("broadcast websocket support message")
-
                 await ws.send_json({
                     "type": "support_send_ack",
                     "request_id": request_id,
                     "success": True,
                     "message": {**message, "thread_id": thread_id},
                 })
+                _schedule_support_notify_and_broadcast(
+                    thread_id,
+                    message,
+                    is_admin,
+                    thread["user_id"],
+                    uid,
+                )
                 continue
             if data.get("type") != "typing":
                 continue
@@ -3490,8 +3515,45 @@ async def support_get_thread(thread_id: int, actor: dict = Depends(get_actor)):
     return {"success": True, "thread": t, "messages": msgs}
 
 
+@router.get("/support/threads/{thread_id}/messages")
+async def support_get_thread_messages(thread_id: int, after_id: int = 0,
+                                     mark: bool = False,
+                                     actor: dict = Depends(get_actor)):
+    need_verified(actor)
+    thread = get_one(
+        "SELECT id, user_id, status FROM support_threads WHERE id = %s AND user_id = %s",
+        (thread_id, actor["user_id"]),
+    )
+    if not thread:
+        raise HTTPException(404, "Thread not found")
+    msgs = execute_query("""
+        SELECT m.id, m.thread_id, m.sender_id, m.is_admin, m.content, m.attachment,
+               m.created_at,
+               COALESCE(c.channel_name, u.name) AS sender_name,
+               COALESCE(c.avatar_url, u.avatar_url) AS sender_avatar
+        FROM support_messages m
+        JOIN mydata u ON u.id = m.sender_id
+        LEFT JOIN channels c ON c.user_id = u.id
+        WHERE m.thread_id = %s AND m.id > %s
+        ORDER BY m.id ASC LIMIT 500
+    """, (thread_id, max(0, after_id)), fetch=True) or []
+    if mark:
+        get_one("UPDATE support_threads SET unread_user = 0 WHERE id = %s RETURNING id",
+                (thread_id,))
+        get_one("""
+            UPDATE support_messages SET is_read = true
+            WHERE thread_id = %s AND is_admin = true AND is_read = false RETURNING id
+        """, (thread_id,))
+    return {
+        "success": True,
+        "status": thread["status"],
+        "messages": msgs,
+    }
+
+
 @router.post("/support/threads/{thread_id}/reply")
 async def support_user_reply(thread_id: int, body: SupportMessageIn,
+                             background_tasks: BackgroundTasks,
                              actor: dict = Depends(get_actor)):
     need_verified(actor)
     t = get_one("SELECT id, user_id, status FROM support_threads WHERE id = %s",
@@ -3520,21 +3582,14 @@ async def support_user_reply(thread_id: int, body: SupportMessageIn,
         WHERE id = %s RETURNING id
     """, (thread_id,))
 
-    try:
-        for admin_id in ADMIN_USER_IDS:
-            await notify(admin_id, "support_message", actor["user_id"])
-    except Exception:
-        logger.exception("notify support reply")
-
-    try:
-        await _support_broadcast_new_message(
-            thread_id=thread_id,
-            message=m,
-            is_admin=False,
-            thread_owner_id=actor["user_id"],
-        )
-    except Exception:
-        logger.exception("broadcast support_user_reply")
+    background_tasks.add_task(
+        _support_notify_and_broadcast,
+        thread_id,
+        m,
+        False,
+        actor["user_id"],
+        actor["user_id"],
+    )
 
     return {"success": True, "message": m}
 
@@ -3804,8 +3859,36 @@ async def admin_get_thread(thread_id: int, actor: dict = Depends(get_actor)):
     return {"success": True, "thread": t, "messages": msgs}
 
 
+@router.get("/admin/support/threads/{thread_id}/messages")
+async def admin_get_thread_messages(thread_id: int, after_id: int = 0,
+                                    actor: dict = Depends(get_actor)):
+    _need_admin(actor)
+    thread = get_one("SELECT id FROM support_threads WHERE id = %s", (thread_id,))
+    if not thread:
+        raise HTTPException(404, "Thread not found")
+    msgs = execute_query("""
+        SELECT m.id, m.thread_id, m.sender_id, m.is_admin, m.content, m.attachment,
+               m.created_at,
+               COALESCE(c.channel_name, u.name) AS sender_name,
+               COALESCE(c.avatar_url, u.avatar_url) AS sender_avatar
+        FROM support_messages m
+        JOIN mydata u ON u.id = m.sender_id
+        LEFT JOIN channels c ON c.user_id = u.id
+        WHERE m.thread_id = %s AND m.id > %s
+        ORDER BY m.id ASC LIMIT 500
+    """, (thread_id, max(0, after_id)), fetch=True) or []
+    get_one("UPDATE support_threads SET unread_admin = 0 WHERE id = %s RETURNING id",
+            (thread_id,))
+    get_one("""
+        UPDATE support_messages SET is_read = true
+        WHERE thread_id = %s AND is_admin = false AND is_read = false RETURNING id
+    """, (thread_id,))
+    return {"success": True, "messages": msgs}
+
+
 @router.post("/admin/support/threads/{thread_id}/reply")
 async def admin_thread_reply(thread_id: int, body: SupportMessageIn,
+                             background_tasks: BackgroundTasks,
                              actor: dict = Depends(get_actor)):
     _need_admin(actor)
     t = get_one("SELECT id, user_id, status FROM support_threads WHERE id = %s",
@@ -3833,25 +3916,14 @@ async def admin_thread_reply(thread_id: int, body: SupportMessageIn,
         WHERE id = %s RETURNING id
     """, (thread_id,))
 
-    try:
-        await notify(t["user_id"], "support_reply", actor["user_id"])
-        await manager.push(t["user_id"], {
-            "type": "support_message",
-            "thread_id": thread_id,
-            "admin_message": content[:120],
-        })
-    except Exception:
-        logger.exception("notify admin reply")
-
-    try:
-        await _support_broadcast_new_message(
-            thread_id=thread_id,
-            message=m,
-            is_admin=True,
-            thread_owner_id=t["user_id"],
-        )
-    except Exception:
-        logger.exception("broadcast admin_thread_reply")
+    background_tasks.add_task(
+        _support_notify_and_broadcast,
+        thread_id,
+        m,
+        True,
+        t["user_id"],
+        actor["user_id"],
+    )
 
     return {"success": True, "message": m}
 
