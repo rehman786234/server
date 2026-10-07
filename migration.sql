@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS channels (
   created_at   TIMESTAMP DEFAULT NOW()
 );
 ALTER TABLE channels
+  ADD COLUMN IF NOT EXISTS banner_url TEXT,
   ADD COLUMN IF NOT EXISTS moderation_status VARCHAR(12) NOT NULL DEFAULT 'active',
   ADD COLUMN IF NOT EXISTS is_verified BOOLEAN NOT NULL DEFAULT FALSE;
 DO $$
@@ -100,3 +101,23 @@ CREATE TABLE IF NOT EXISTS password_reset_otps (
 );
 CREATE INDEX IF NOT EXISTS idx_password_reset_otps_expiry
   ON password_reset_otps(expires_at);
+
+CREATE TABLE IF NOT EXISTS site_settings (
+  id                   SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+  maintenance_enabled  BOOLEAN NOT NULL DEFAULT FALSE,
+  maintenance_message TEXT NOT NULL DEFAULT '',
+  terms_text           TEXT NOT NULL DEFAULT '',
+  terms_version        INTEGER NOT NULL DEFAULT 1 CHECK (terms_version > 0),
+  updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+INSERT INTO site_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS cloudinary_accounts (
+  account_key          VARCHAR(20) PRIMARY KEY CHECK (account_key IN ('videos', 'media')),
+  cloud_name           VARCHAR(100) NOT NULL,
+  api_key              VARCHAR(128) NOT NULL DEFAULT '',
+  api_secret_encrypted TEXT,
+  upload_preset        VARCHAR(100) NOT NULL DEFAULT '',
+  enabled              BOOLEAN NOT NULL DEFAULT TRUE,
+  updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

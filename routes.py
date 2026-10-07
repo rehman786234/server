@@ -24,6 +24,7 @@ from fastapi import (APIRouter, BackgroundTasks, HTTPException, status, Header, 
                      WebSocket, WebSocketDisconnect)
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import HTMLResponse
+from cryptography.fernet import Fernet, InvalidToken
 from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2 import id_token
 from pydantic import BaseModel, Field
@@ -59,6 +60,7 @@ CLD2_SECRET = os.getenv("CLOUDINARY2_API_SECRET", "")
 CLD1_CLOUD = os.getenv("CLOUDINARY_CLOUD_NAME", "vjhhf9fh")
 CLD1_KEY = os.getenv("CLOUDINARY_API_KEY", "")
 CLD1_SECRET = os.getenv("CLOUDINARY_API_SECRET", "")
+CLD1_PRESET = os.getenv("CLOUDINARY_UPLOAD_PRESET", "upload_videos")
 
 SHOW_LOCKED_PREMIUM = False
 
@@ -99,6 +101,91 @@ def _invalidate_video_caches():
     cache_del_prefix("chvideos:")
     cache_del_prefix("tagvideos:")
     cache_del_prefix("channels:list:")
+
+
+def get_site_settings() -> dict:
+    settings = cache_get("site:settings")
+    if settings is None:
+        settings = get_one("""
+            SELECT maintenance_enabled, maintenance_message, terms_text,
+                   terms_version, updated_at
+            FROM site_settings WHERE id = 1
+        """)
+        if settings is None:
+            raise RuntimeError("The site_settings row is missing; run database migrations")
+        cache_set("site:settings", settings, 5)
+    return dict(settings)
+
+
+def _cloudinary_fernet():
+    key = os.getenv("CLOUDINARY_CONFIG_ENCRYPTION_KEY", "").strip()
+    if not key:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Cloudinary credential encryption is not configured on the server.",
+        )
+    try:
+        return Fernet(key.encode("ascii"))
+    except (ValueError, UnicodeEncodeError) as error:
+        logger.error("CLOUDINARY_CONFIG_ENCRYPTION_KEY is invalid")
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Cloudinary credential encryption key is invalid.",
+        ) from error
+
+
+def _cloudinary_account(account_key: str) -> dict:
+    cache_key = f"cloudinary:account:{account_key}"
+    account = cache_get(cache_key)
+    if account is not None:
+        return dict(account)
+
+    if account_key == "videos":
+        legacy = {
+            "cloud_name": CLD1_CLOUD,
+            "api_key": CLD1_KEY,
+            "api_secret": CLD1_SECRET,
+            "upload_preset": CLD1_PRESET,
+        }
+    elif account_key == "media":
+        legacy = {
+            "cloud_name": CLD2_CLOUD,
+            "api_key": CLD2_KEY,
+            "api_secret": CLD2_SECRET,
+            "upload_preset": "",
+        }
+    else:
+        raise ValueError(f"Unknown Cloudinary account: {account_key}")
+
+    row = get_one("""
+        SELECT cloud_name, api_key, api_secret_encrypted, upload_preset, enabled
+        FROM cloudinary_accounts WHERE account_key = %s
+    """, (account_key,))
+    if row:
+        secret = legacy["api_secret"]
+        if row["api_secret_encrypted"]:
+            try:
+                secret = _cloudinary_fernet().decrypt(
+                    row["api_secret_encrypted"].encode("ascii")
+                ).decode("utf-8")
+            except InvalidToken as error:
+                logger.exception("Could not decrypt Cloudinary account %s", account_key)
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    f"Cloudinary credentials for '{account_key}' could not be decrypted.",
+                ) from error
+        account = {
+            "cloud_name": row["cloud_name"],
+            "api_key": row["api_key"],
+            "api_secret": secret,
+            "upload_preset": row["upload_preset"],
+            "enabled": bool(row["enabled"]),
+            "source": "database",
+        }
+    else:
+        account = {**legacy, "enabled": True, "source": "environment"}
+    cache_set(cache_key, account, 15)
+    return dict(account)
 
 
 # =====================================================================
@@ -401,8 +488,9 @@ def _check_url(u: Optional[str], what: str = "link"):
 
 
 def _check_short_cloudinary_url(url: Optional[str], resource_type: str, what: str):
-    prefix = f"https://res.cloudinary.com/{CLD2_CLOUD}/{resource_type}/upload/"
-    if not CLD2_CLOUD or not url or not url.startswith(prefix):
+    media_cloud = _cloudinary_account("media")["cloud_name"]
+    prefix = f"https://res.cloudinary.com/{media_cloud}/{resource_type}/upload/"
+    if not media_cloud or not url or not url.startswith(prefix):
         raise HTTPException(400, f"{what} must be uploaded to the Shorts Cloudinary account")
 
 
@@ -902,23 +990,26 @@ async def profile_password(p: PasswordChangeIn, request: Request, actor: dict = 
 #  CLOUDINARY (2nd account) — signed upload
 # =====================================================================
 UPLOAD_PURPOSES = {
-    "avatar":   {"folder": "profiles", "type": "image", "formats": "jpg,jpeg,png,webp", "admin": False},
-    "channel":  {"folder": "channels", "type": "image", "formats": "jpg,jpeg,png,webp", "admin": False},
-    "banner":   {"folder": "banners",  "type": "image", "formats": "jpg,jpeg,png,webp", "admin": False},
-    "video_thumbnail": {"folder": "thumbnails", "type": "image", "formats": "jpg,jpeg,png,webp", "admin": False},
-    "ad_image": {"folder": "ads",      "type": "image", "formats": "jpg,jpeg,png,webp,gif", "admin": True},
-    "ad_video": {"folder": "ads",      "type": "video", "formats": "mp4,webm,mov", "admin": True},
-    "ad_creative_image": {"folder": "ads/creatives", "type": "image", "formats": "jpg,jpeg,png,webp,gif", "admin": False},
-    "ad_creative_video": {"folder": "ads/creatives", "type": "video", "formats": "mp4,webm,mov", "admin": False},
-    "short_video": {"folder": "shorts", "type": "video", "formats": "mp4,webm,mov", "admin": False},
-    "short_thumbnail": {"folder": "shorts/thumbnails", "type": "image", "formats": "jpg,jpeg,png,webp", "admin": False},
+    "long_video": {"account": "videos", "folder": "videos", "type": "video", "formats": "mp4,mov,webm,mkv,avi", "admin": False},
+    "avatar":   {"account": "media", "folder": "profiles", "type": "image", "formats": "jpg,jpeg,png,webp", "admin": False},
+    "channel":  {"account": "media", "folder": "channels", "type": "image", "formats": "jpg,jpeg,png,webp", "admin": False},
+    "banner":   {"account": "media", "folder": "banners",  "type": "image", "formats": "jpg,jpeg,png,webp", "admin": False},
+    "video_thumbnail": {"account": "media", "folder": "thumbnails", "type": "image", "formats": "jpg,jpeg,png,webp", "admin": False},
+    "ad_image": {"account": "media", "folder": "ads",      "type": "image", "formats": "jpg,jpeg,png,webp,gif", "admin": True},
+    "ad_video": {"account": "media", "folder": "ads",      "type": "video", "formats": "mp4,webm,mov", "admin": True},
+    "ad_creative_image": {"account": "media", "folder": "ads/creatives", "type": "image", "formats": "jpg,jpeg,png,webp,gif", "admin": False},
+    "ad_creative_video": {"account": "media", "folder": "ads/creatives", "type": "video", "formats": "mp4,webm,mov", "admin": False},
+    "short_video": {"account": "media", "folder": "shorts", "type": "video", "formats": "mp4,webm,mov", "admin": False},
+    "short_thumbnail": {"account": "media", "folder": "shorts/thumbnails", "type": "image", "formats": "jpg,jpeg,png,webp", "admin": False},
     "support_attachment": {
+        "account": "media",
         "folder": "support/attachments",
         "type": "auto",
         "formats": "jpg,jpeg,png,gif,webp,pdf,txt,doc,docx,mp3,m4a,wav,ogg,webm,mp4,mov",
         "admin": False,
     },
     "support_voice": {
+        "account": "media",
         "folder": "support/voices",
         "type": "video",
         "formats": "mp3,m4a,wav,ogg,webm,mp4",
@@ -939,18 +1030,36 @@ async def sign_upload(body: SignIn, actor: dict = Depends(get_actor)):
         raise HTTPException(400, "Unknown upload purpose")
     if cfg["admin"] and actor["user_id"] not in ADMIN_USER_IDS:
         raise HTTPException(403, "Only admins can upload ads")
-    if not (CLD2_CLOUD and CLD2_KEY and CLD2_SECRET):
-        return {"success": False, "message": "Cloudinary is not configured on the server"}
+    account = _cloudinary_account(cfg["account"])
+    if not account["enabled"] or not account["cloud_name"]:
+        raise HTTPException(503, f"Cloudinary account '{cfg['account']}' is disabled or incomplete")
 
-    params = {"allowed_formats": cfg["formats"], "folder": cfg["folder"], "timestamp": int(time.time())}
-    to_sign = "&".join(f"{k}={params[k]}" for k in sorted(params)) + CLD2_SECRET
+    params = {
+        "allowed_formats": cfg["formats"],
+        "folder": cfg["folder"],
+        "timestamp": int(time.time()),
+    }
+    if account["upload_preset"]:
+        params["upload_preset"] = account["upload_preset"]
+    if not (account["api_key"] and account["api_secret"]):
+        if cfg["account"] == "videos" and account["upload_preset"]:
+            return {
+                "success": True,
+                "unsigned": True,
+                "cloud_name": account["cloud_name"],
+                "upload_url": f"https://api.cloudinary.com/v1_1/{account['cloud_name']}/{cfg['type']}/upload",
+                "upload_preset": account["upload_preset"],
+            }
+        raise HTTPException(503, f"Cloudinary account '{cfg['account']}' is missing API credentials")
+    to_sign = "&".join(f"{k}={params[k]}" for k in sorted(params)) + account["api_secret"]
     signature = hashlib.sha1(to_sign.encode()).hexdigest()
     return {
         "success": True,
-        "cloud_name": CLD2_CLOUD,
-        "api_key": CLD2_KEY,
+        "unsigned": False,
+        "cloud_name": account["cloud_name"],
+        "api_key": account["api_key"],
         "resource_type": cfg["type"],
-        "upload_url": f"https://api.cloudinary.com/v1_1/{CLD2_CLOUD}/{cfg['type']}/upload",
+        "upload_url": f"https://api.cloudinary.com/v1_1/{account['cloud_name']}/{cfg['type']}/upload",
         "signature": signature,
         **params,
     }
@@ -1951,7 +2060,10 @@ async def get_channel(handle: str, actor: dict = Depends(get_actor)):
 
 @router.get("/channels/{handle}/videos")
 async def get_channel_videos(handle: str, sort: str = "latest", limit: int = 20, offset: int = 0,
+                             video_type: Optional[str] = None,
                              actor: dict = Depends(get_actor)):
+    if video_type is not None and video_type not in ("short", "long"):
+        raise HTTPException(400, "Video type must be short or long")
     ch = get_one("""
         SELECT c.user_id
         FROM channels c JOIN mydata u ON u.id = c.user_id
@@ -1963,19 +2075,23 @@ async def get_channel_videos(handle: str, sort: str = "latest", limit: int = 20,
     can_premium = actor["is_premium"] or _is_owner(actor, ch["user_id"])
     limit = max(1, min(limit, 50))
     offset = max(0, offset)
-    ckey = f"chvideos:{handle.lower()}:{sort}:{limit}:{offset}:{int(bool(can_premium))}"
+    ckey = f"chvideos:{handle.lower()}:{sort}:{video_type or 'all'}:{limit}:{offset}:{int(bool(can_premium))}"
     cached = cache_get(ckey)
     if cached is not None:
         return cached
     where = "v.user_id = %s AND v.visibility = 'public'"
+    params = [ch["user_id"]]
     if not can_premium and not SHOW_LOCKED_PREMIUM:
         where += " AND v.is_premium = false"
+    if video_type is not None:
+        where += " AND v.video_type = %s"
+        params.append(video_type)
     order = "v.views DESC, v.uploaded_at DESC" if sort == "popular" else "v.uploaded_at DESC"
     rows = execute_query(f"""
         SELECT v.id, v.title, v.viewkey, v.thumbnail, v.category, v.description, v.video_type,
                v.is_premium, v.views, v.duration, v.uploaded_at
         FROM videos v WHERE {where} ORDER BY {order} LIMIT %s OFFSET %s
-    """, (ch["user_id"], limit + 1, offset), fetch=True) or []
+    """, (*params, limit + 1, offset), fetch=True) or []
     for r in rows:
         r["locked"] = bool(r["is_premium"] and not can_premium)
     payload = {"success": True, "has_more": len(rows) > limit, "videos": rows[:limit]}
@@ -2283,6 +2399,14 @@ async def delete_notification(notification_id: int, actor: dict = Depends(get_ac
 
 @router.websocket("/ws/notifications")
 async def ws_notifications(ws: WebSocket):
+    try:
+        if get_site_settings()["maintenance_enabled"]:
+            await ws.close(code=1013, reason="Site maintenance is in progress")
+            return
+    except Exception:
+        logger.exception("Could not check maintenance mode for notifications WebSocket")
+        await ws.close(code=1013, reason="Site status is temporarily unavailable")
+        return
     uid = read_token(ws.query_params.get("token"))
     if not uid or not get_one("SELECT id FROM mydata WHERE id=%s", (uid,)):
         await ws.close(code=4401)
@@ -2785,6 +2909,7 @@ def smart_search(
         )
         SELECT
             v.id, v.title, v.viewkey, v.thumbnail, v.category, v.is_premium,
+            v.video_type,
             v.views, v.duration, v.uploaded_at,
             COALESCE(c.channel_name, u.name) AS channel_name,
             c.handle AS channel_handle,
@@ -3453,10 +3578,12 @@ def _creator_cloudinary_asset(secure_url: str):
                 or path_parts[2] != "upload"):
             return None
         cloud = path_parts[0]
-        credentials = {
-            CLD1_CLOUD: (CLD1_KEY, CLD1_SECRET),
-            CLD2_CLOUD: (CLD2_KEY, CLD2_SECRET),
-        }.get(cloud)
+        credentials = None
+        for account_key in ("videos", "media"):
+            account = _cloudinary_account(account_key)
+            if account["cloud_name"] == cloud:
+                credentials = (account["api_key"], account["api_secret"])
+                break
         if not credentials:
             return None
         resource_type = path_parts[1]
@@ -3550,8 +3677,9 @@ def _delete_creator_cloudinary_assets(urls: list[Optional[str]]) -> int:
 def _support_cloudinary_asset(secure_url: str):
     parts = urlsplit(secure_url)
     path_parts = parts.path.strip("/").split("/")
+    media_cloud = _cloudinary_account("media")["cloud_name"]
     if (parts.scheme != "https" or parts.netloc != "res.cloudinary.com"
-            or len(path_parts) < 6 or path_parts[0] != CLD2_CLOUD
+            or len(path_parts) < 6 or path_parts[0] != media_cloud
             or path_parts[1] not in ("image", "video", "raw")
             or path_parts[2] != "upload"):
         return None
@@ -3572,12 +3700,15 @@ def _support_cloudinary_asset(secure_url: str):
 
 
 def _cloudinary_delete_support_assets(resource_type: str, public_ids: list[str]):
+    account = _cloudinary_account("media")
     body = urlencode([("public_ids[]", public_id) for public_id in public_ids]).encode("utf-8")
     url = (
-        f"https://api.cloudinary.com/v1_1/{CLD2_CLOUD}/resources/"
+        f"https://api.cloudinary.com/v1_1/{account['cloud_name']}/resources/"
         f"{resource_type}/upload"
     )
-    credentials = base64.b64encode(f"{CLD2_KEY}:{CLD2_SECRET}".encode()).decode("ascii")
+    credentials = base64.b64encode(
+        f"{account['api_key']}:{account['api_secret']}".encode()
+    ).decode("ascii")
     request = urllib.request.Request(
         url,
         data=body,
@@ -3595,7 +3726,8 @@ def _cloudinary_delete_support_assets(resource_type: str, public_ids: list[str])
 
 
 async def _delete_support_thread_attachments(thread_id: int):
-    if not (CLD2_CLOUD and CLD2_KEY and CLD2_SECRET):
+    media_account = _cloudinary_account("media")
+    if not all(media_account[key] for key in ("cloud_name", "api_key", "api_secret")):
         logger.error("Cannot delete support attachments: Cloudinary credentials are not configured")
         return {"deleted": 0, "cleanup_warning": "Cloudinary cleanup is not configured"}
 
@@ -3670,6 +3802,14 @@ def _schedule_support_notify_and_broadcast(thread_id: int, message: dict,
 
 @router.websocket("/ws/support")
 async def ws_support(ws: WebSocket):
+    try:
+        if get_site_settings()["maintenance_enabled"]:
+            await ws.close(code=1013, reason="Site maintenance is in progress")
+            return
+    except Exception:
+        logger.exception("Could not check maintenance mode for support WebSocket")
+        await ws.close(code=1013, reason="Site status is temporarily unavailable")
+        return
     uid = read_token(ws.query_params.get("token"))
     if not uid or not get_one("SELECT id FROM mydata WHERE id=%s", (uid,)):
         await ws.close(code=4401)
@@ -5109,7 +5249,8 @@ async def ad_creative_delete(creative_id: int, actor: dict = Depends(get_actor))
 # =====================================================================
 #  AD CENTER — SERVING  (NOT cached: har impression ka paisa katta hai)
 # =====================================================================
-def _ad_pick_for_video(video_id: int, video_category: str, video_tags: list):
+def _ad_pick_for_video(video_id: int, video_category: str, video_tags: list,
+                       viewer_ip: str, creative_type: Optional[str] = None):
     rows = execute_query("""
         SELECT c.id AS campaign_id, c.user_id, c.model, c.rate_pkr,
                c.budget_total, c.budget_daily, c.spend_total, c.spend_today,
@@ -5128,9 +5269,28 @@ def _ad_pick_for_video(video_id: int, video_category: str, video_tags: list):
           AND c.spend_total + CASE WHEN c.model = 'cpm' THEN c.rate_pkr / 1000 ELSE c.rate_pkr END <= c.budget_total
           AND (c.budget_daily = 0 OR c.spend_today_date IS DISTINCT FROM CURRENT_DATE OR
                c.spend_today + CASE WHEN c.model = 'cpm' THEN c.rate_pkr / 1000 ELSE c.rate_pkr END <= c.budget_daily)
+          AND (
+              COALESCE(cardinality(c.target_categories), 0) = 0
+              OR EXISTS (
+                  SELECT 1
+                  FROM unnest(c.target_categories) AS targets(category)
+                  WHERE lower(btrim(targets.category)) = lower(btrim(%s))
+              )
+          )
+          AND EXISTS (
+              SELECT 1 FROM ad_creatives cr
+              WHERE cr.campaign_id = c.id
+                AND (%s::text IS NULL OR cr.type = %s)
+                AND NOT EXISTS (
+                    SELECT 1 FROM ad_impressions i
+                    WHERE i.creative_id = cr.id
+                      AND i.viewer_ip = %s
+                      AND i.created_at >= now() - interval '30 minutes'
+                )
+          )
         ORDER BY random()
-        LIMIT 20
-    """, fetch=True) or []
+        LIMIT 100
+    """, (video_category or "", creative_type, creative_type, viewer_ip), fetch=True) or []
 
     cat = (video_category or "").strip().lower()
     tag_set = set(video_tags or [])
@@ -5161,11 +5321,20 @@ def _ad_pick_for_video(video_id: int, video_category: str, video_tags: list):
     return best
 
 
-def _ad_pick_creative(campaign_id: int) -> Optional[dict]:
+def _ad_pick_creative(campaign_id: int, viewer_ip: str,
+                      creative_type: Optional[str] = None) -> Optional[dict]:
     return get_one("""
-        SELECT * FROM ad_creatives WHERE campaign_id = %s
+        SELECT cr.* FROM ad_creatives cr
+        WHERE cr.campaign_id = %s
+          AND (%s::text IS NULL OR cr.type = %s)
+          AND NOT EXISTS (
+              SELECT 1 FROM ad_impressions i
+              WHERE i.creative_id = cr.id
+                AND i.viewer_ip = %s
+                AND i.created_at >= now() - interval '30 minutes'
+          )
         ORDER BY random() LIMIT 1
-    """, (campaign_id,))
+    """, (campaign_id, creative_type, creative_type, viewer_ip))
 
 
 def _ad_cost_for(model: str, rate_pkr: float) -> float:
@@ -5251,8 +5420,11 @@ def _ad_recent_served(creative_id: int, viewer_ip: str, minutes: int = 30) -> bo
 
 
 @router.get("/ads/serve")
-def ad_serve(viewkey: str, request: Request, actor: dict = Depends(get_actor)):
+def ad_serve(viewkey: str, request: Request, creative_type: Optional[str] = None,
+             actor: dict = Depends(get_actor)):
     """Video page ke liye ek ad pick karo."""
+    if creative_type is not None and creative_type not in ("image", "video"):
+        raise HTTPException(400, "Creative type must be image or video")
     v = get_one("""
         SELECT v.id, v.user_id, v.visibility, v.is_premium, v.category,
                COALESCE((SELECT array_agg(tag_id) FROM video_tags WHERE video_id = v.id), '{}') AS tags
@@ -5263,16 +5435,13 @@ def ad_serve(viewkey: str, request: Request, actor: dict = Depends(get_actor)):
     if actor["is_premium"] or _is_owner(actor, v["user_id"]) or not _can_view_video(v, actor):
         return {"success": True, "ad": None}
 
-    camp = _ad_pick_for_video(v["id"], v["category"], v["tags"] or [])
+    ip = _ip(request)
+    camp = _ad_pick_for_video(v["id"], v["category"], v["tags"] or [], ip, creative_type)
     if not camp:
         return {"success": True, "ad": None}
 
-    cr = _ad_pick_creative(camp["campaign_id"])
+    cr = _ad_pick_creative(camp["campaign_id"], ip, creative_type)
     if not cr:
-        return {"success": True, "ad": None}
-
-    ip = _ip(request)
-    if _ad_recent_served(cr["id"], ip, 30):
         return {"success": True, "ad": None}
 
     # CPM is charged per impression; CPC campaigns are charged only after a click.
@@ -5477,15 +5646,175 @@ async def admin_ad_wallets(limit: int = 30, offset: int = 0, actor: dict = Depen
 
 
 # =====================================================================
+#  SITE SETTINGS + CLOUDINARY ACCOUNT MANAGEMENT
+# =====================================================================
+class SiteConfigUpdate(BaseModel):
+    maintenance_enabled: bool
+    maintenance_message: str = Field(default="", max_length=1000)
+    terms_text: str = Field(default="", max_length=50000)
+
+
+class CloudinaryAccountUpdate(BaseModel):
+    cloud_name: str = Field(min_length=1, max_length=100)
+    api_key: str = Field(default="", max_length=128)
+    api_secret: str = Field(default="", max_length=512)
+    upload_preset: str = Field(default="", max_length=100)
+    enabled: bool = True
+
+
+@router.get("/site-status")
+async def public_site_status():
+    settings = get_site_settings()
+    return {
+        "maintenance_enabled": bool(settings["maintenance_enabled"]),
+        "maintenance_message": settings["maintenance_message"],
+        "terms_text": settings["terms_text"],
+        "terms_version": int(settings["terms_version"]),
+    }
+
+
+@router.get("/admin/site-config")
+async def admin_get_site_config(actor: dict = Depends(get_actor)):
+    _need_admin(actor)
+    settings = get_site_settings()
+    rows = execute_query("""
+        SELECT account_key, cloud_name, api_key, api_secret_encrypted,
+               upload_preset, enabled
+        FROM cloudinary_accounts
+    """, fetch=True) or []
+    stored = {row["account_key"]: row for row in rows}
+    fallback = {
+        "videos": {
+            "cloud_name": CLD1_CLOUD,
+            "api_key": CLD1_KEY,
+            "secret_configured": bool(CLD1_SECRET),
+            "upload_preset": CLD1_PRESET,
+        },
+        "media": {
+            "cloud_name": CLD2_CLOUD,
+            "api_key": CLD2_KEY,
+            "secret_configured": bool(CLD2_SECRET),
+            "upload_preset": "",
+        },
+    }
+    accounts = {}
+    for account_key in ("videos", "media"):
+        row = stored.get(account_key)
+        legacy = fallback[account_key]
+        accounts[account_key] = {
+            "cloud_name": row["cloud_name"] if row else legacy["cloud_name"],
+            "api_key": row["api_key"] if row else legacy["api_key"],
+            "api_secret_configured": bool(
+                (row and row["api_secret_encrypted"]) or legacy["secret_configured"]
+            ),
+            "upload_preset": row["upload_preset"] if row else legacy["upload_preset"],
+            "enabled": bool(row["enabled"]) if row else True,
+            "source": "database" if row else "environment",
+        }
+    return {
+        "success": True,
+        "site": {
+            "maintenance_enabled": bool(settings["maintenance_enabled"]),
+            "maintenance_message": settings["maintenance_message"],
+            "terms_text": settings["terms_text"],
+            "terms_version": int(settings["terms_version"]),
+        },
+        "cloudinary": accounts,
+    }
+
+
+@router.put("/admin/site-config")
+async def admin_update_site_config(
+    body: SiteConfigUpdate,
+    actor: dict = Depends(get_actor),
+):
+    _need_admin(actor)
+    get_one("""
+        UPDATE site_settings
+        SET maintenance_enabled = %s,
+            maintenance_message = %s,
+            terms_version = terms_version + CASE
+                WHEN terms_text IS DISTINCT FROM %s THEN 1 ELSE 0
+            END,
+            terms_text = %s,
+            updated_at = NOW()
+        WHERE id = 1
+        RETURNING id
+    """, (
+        body.maintenance_enabled,
+        body.maintenance_message.strip(),
+        body.terms_text,
+        body.terms_text,
+    ))
+    cache_del("site:settings")
+    return {"success": True, "site": get_site_settings()}
+
+
+@router.put("/admin/cloudinary/{account_key}")
+async def admin_update_cloudinary_account(
+    account_key: str,
+    body: CloudinaryAccountUpdate,
+    actor: dict = Depends(get_actor),
+):
+    _need_admin(actor)
+    if account_key not in ("videos", "media"):
+        raise HTTPException(404, "Unknown Cloudinary account")
+
+    cloud_name = body.cloud_name.strip()
+    api_key = body.api_key.strip()
+    upload_preset = body.upload_preset.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", cloud_name):
+        raise HTTPException(400, "Cloud name may contain only letters, numbers, underscores, and hyphens")
+    if upload_preset and not re.fullmatch(r"[A-Za-z0-9_-]+", upload_preset):
+        raise HTTPException(400, "Upload preset may contain only letters, numbers, underscores, and hyphens")
+
+    existing = get_one("""
+        SELECT api_secret_encrypted FROM cloudinary_accounts
+        WHERE account_key = %s
+    """, (account_key,))
+    env_secret = CLD1_SECRET if account_key == "videos" else CLD2_SECRET
+    secret = body.api_secret.strip()
+    if body.enabled:
+        has_secret = bool(secret or (existing and existing["api_secret_encrypted"]) or env_secret)
+        has_signing_credentials = bool(api_key and has_secret)
+        if account_key == "media" and not has_signing_credentials:
+            raise HTTPException(400, "The media account needs both an API key and API secret")
+        if account_key == "videos" and not has_signing_credentials and not upload_preset:
+            raise HTTPException(400, "The video account needs API credentials or an unsigned upload preset")
+
+    encrypted_secret = None
+    if secret:
+        encrypted_secret = _cloudinary_fernet().encrypt(secret.encode("utf-8")).decode("ascii")
+
+    get_one("""
+        INSERT INTO cloudinary_accounts
+            (account_key, cloud_name, api_key, api_secret_encrypted, upload_preset, enabled, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, NOW())
+        ON CONFLICT (account_key) DO UPDATE SET
+            cloud_name = EXCLUDED.cloud_name,
+            api_key = EXCLUDED.api_key,
+            api_secret_encrypted = COALESCE(
+                EXCLUDED.api_secret_encrypted, cloudinary_accounts.api_secret_encrypted
+            ),
+            upload_preset = EXCLUDED.upload_preset,
+            enabled = EXCLUDED.enabled,
+            updated_at = NOW()
+        RETURNING account_key
+    """, (account_key, cloud_name, api_key, encrypted_secret, upload_preset, body.enabled))
+    cache_del(f"cloudinary:account:{account_key}")
+    return {"success": True, "account_key": account_key}
+
+
+# =====================================================================
 #  ADMIN PANEL HTML
 # =====================================================================
 @router.get("/admin", response_class=HTMLResponse)
 async def admin_panel():
     """Serve admin panel HTML."""
     try:
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        with open(os.path.join(current_dir, "static", "admin.html"), "r", encoding="utf-8") as f:
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(project_root, "static", "index.html"), "r", encoding="utf-8") as f:
             return f.read()
     except Exception as e:
-        logger.error(f"Error reading admin.html: {e}")
-        return "<h1>Admin panel not found. Make sure static/admin.html exists.</h1>"
+        logger.exception("Could not read static/index.html")
+        return "<h1>Admin panel not found. Make sure static/index.html exists.</h1>"
