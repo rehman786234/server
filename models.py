@@ -1,5 +1,5 @@
-from pydantic import BaseModel
-from typing import Optional
+from pydantic import BaseModel, Field
+from typing import List, Optional
 from datetime import datetime
 
 
@@ -43,6 +43,11 @@ class APIKeyResponse(BaseModel):
     expiry_date: datetime
 
 
+class VideoQualitySource(BaseModel):
+    label: str = Field(min_length=1, max_length=40)
+    url: str = Field(min_length=1, max_length=2048)
+
+
 class Video(BaseModel):
     title: str
     stream_link: str
@@ -52,6 +57,8 @@ class Video(BaseModel):
     video_type: str = "long"
     duration: Optional[int] = 0
     file_size: Optional[int] = 0
+    video_quality: str = Field(default="Original", min_length=1, max_length=40)
+    qualities: List[VideoQualitySource] = Field(default_factory=list)
 
 
 class VideoResponse(BaseModel):
@@ -112,9 +119,6 @@ class VideoUploadResponse(BaseModel):
 # =====================================================
 #  PART 1 MODELS: Tags + Custom Playlists
 # =====================================================
-from typing import List  # agar pehle se nahi hai to
-
-
 class TagOut(BaseModel):
     id: int
     name: str
@@ -131,6 +135,7 @@ class PlaylistCreateIn(BaseModel):
     description: Optional[str] = ""
     thumbnail: Optional[str] = None
     visibility: Optional[str] = "public"  # public | unlisted | private
+    is_premium: bool = False
 
 
 class PlaylistUpdateIn(BaseModel):
@@ -138,6 +143,7 @@ class PlaylistUpdateIn(BaseModel):
     description: Optional[str] = None
     thumbnail: Optional[str] = None
     visibility: Optional[str] = None
+    is_premium: Optional[bool] = None
 
 
 class PlaylistAddVideoIn(BaseModel):

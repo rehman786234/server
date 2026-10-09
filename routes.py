@@ -35,7 +35,7 @@ from cache import cache_get, cache_set, cache_del, cache_del_prefix
 from models import (
     User, UserCreate, UserLogin, APIKeyRequest, Video,
     TagOut, TagsForVideoIn,
-    PlaylistCreateIn, PlaylistUpdateIn, PlaylistAddVideoIn, PlaylistReorderIn,
+    VideoQualitySource, PlaylistCreateIn, PlaylistUpdateIn, PlaylistAddVideoIn, PlaylistReorderIn,
     PaymentSubmitIn, PaymentReviewIn,
     SupportThreadCreateIn, SupportMessageIn, SupportStatusIn,
 )
@@ -485,6 +485,26 @@ def _can_view_video(v: dict, actor: dict) -> bool:
 def _check_url(u: Optional[str], what: str = "link"):
     if u and not re.match(r"^https?://\S+$", u.strip(), re.I):
         raise HTTPException(400, f"Invalid {what}")
+
+
+def _quality_sources_json(qualities: List[VideoQualitySource]) -> str:
+    if len(qualities) > 20:
+        raise HTTPException(400, "A video can have at most 20 quality sources")
+    normalized = []
+    labels = set()
+    for source in qualities:
+        label = source.label.strip()
+        url = source.url.strip()
+        if not label:
+            raise HTTPException(400, "Every quality source needs a label")
+        if not url:
+            raise HTTPException(400, "Every quality source needs a URL")
+        if label.casefold() in labels:
+            raise HTTPException(400, "Quality labels must be unique")
+        _check_url(url, "quality source URL")
+        labels.add(label.casefold())
+        normalized.append({"label": label, "url": url})
+    return json.dumps(normalized)
 
 
 def _check_short_cloudinary_url(url: Optional[str], resource_type: str, what: str):
@@ -1348,17 +1368,19 @@ async def upload_video(video: Video, api_key: str = Header(...)):
     if video.video_type == "short":
         _check_short_cloudinary_url(video.stream_link, "video", "Short video")
         _check_short_cloudinary_url(video.thumbnail, "image", "Short thumbnail")
+    qualities_json = _quality_sources_json(video.qualities)
     viewkey = secrets.token_hex(6)
     try:
         result = get_one("""
             INSERT INTO videos (title, stream_link, viewkey, thumbnail, category, is_premium,
-                                user_id, video_type, duration, file_size)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                user_id, video_type, duration, file_size, video_quality, qualities)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
             RETURNING id, title, stream_link, viewkey, thumbnail, category, is_premium,
-                      video_type, duration, file_size, uploaded_at
+                      video_type, duration, file_size, video_quality, qualities, uploaded_at
         """, (video.title, video.stream_link, viewkey, video.thumbnail,
               video.category, video.is_premium, user_data.get('user_id'),
-              video.video_type, video.duration or 0, video.file_size or 0))
+              video.video_type, video.duration or 0, video.file_size or 0,
+              video.video_quality.strip(), qualities_json))
         if result:
             _invalidate_video_caches()
             if user_data.get("user_id"):
@@ -1402,6 +1424,7 @@ def get_video_by_key(viewkey: str, actor: dict = Depends(get_actor)):
         if not _can_view_video(row, actor):
             row["stream_link"] = ""
             row.pop("stream_url", None)
+            row["qualities"] = []
             row["locked"] = True
         else:
             row["locked"] = False
@@ -1502,7 +1525,14 @@ async def get_public_playlists(actor: dict = Depends(get_actor)):
     if rows is None:
         rows = execute_query("""
             SELECT p.id AS playlist_id, p.title AS playlist_name,
-                   'free' AS playlist_type, p.thumbnail AS playlist_thumbnail,
+                   CASE WHEN p.is_premium THEN 'premium' ELSE 'free' END AS playlist_type,
+                   (SELECT v_first.thumbnail
+                    FROM playlist_items pi_first
+                    JOIN videos v_first ON v_first.id = pi_first.video_id
+                    WHERE pi_first.playlist_id = p.id
+                    ORDER BY pi_first.position ASC, pi_first.added_at ASC
+                    LIMIT 1) AS playlist_thumbnail,
+                   p.is_premium, p.user_id,
                    p.created_at,
                    COALESCE(
                        json_agg(json_build_object(
@@ -1525,7 +1555,8 @@ async def get_public_playlists(actor: dict = Depends(get_actor)):
             LEFT JOIN playlist_items pi ON pi.playlist_id = p.id
             LEFT JOIN videos v ON v.id = pi.video_id
             WHERE p.visibility = 'public'
-            GROUP BY p.id, p.title, p.thumbnail, p.created_at, p.updated_at
+            GROUP BY p.id, p.title, p.thumbnail, p.is_premium, p.user_id,
+                     p.created_at, p.updated_at
             ORDER BY p.updated_at DESC
             LIMIT 100
         """, fetch=True) or []
@@ -1536,17 +1567,23 @@ async def get_public_playlists(actor: dict = Depends(get_actor)):
         videos = playlist.get("videos") or []
         if isinstance(videos, str):
             videos = json.loads(videos)
+        owner = _is_owner(actor, playlist.get("user_id"))
+        playlist["locked"] = bool(
+            playlist.get("is_premium") and not (actor["is_premium"] or owner)
+        )
         visible_videos = []
         for video in videos:
             if video.get("visibility") == "private" and not _is_owner(actor, video.get("user_id")):
                 continue
-            can_view = _can_view_video(video, actor)
+            can_view = _can_view_video(video, actor) and not playlist["locked"]
             video["locked"] = not can_view
             video["stream_url"] = ""
             video.pop("user_id", None)
             visible_videos.append(video)
         playlist["videos"] = visible_videos
         playlist["total_videos"] = len(visible_videos)
+        playlist.pop("is_premium", None)
+        playlist.pop("user_id", None)
         playlist["playlist_source"] = "v2"
 
     return {"success": True, "total": len(rows), "playlists": rows}
@@ -1628,6 +1665,8 @@ class StudioVideoIn(BaseModel):
     video_type: str = "long"
     duration: Optional[int] = 0
     file_size: Optional[int] = 0
+    video_quality: str = Field(default="Original", min_length=1, max_length=40)
+    qualities: List[VideoQualitySource] = Field(default_factory=list)
 
 
 class StudioVideoEdit(BaseModel):
@@ -1638,6 +1677,8 @@ class StudioVideoEdit(BaseModel):
     visibility: Optional[str] = None
     is_premium: Optional[bool] = None
     video_type: Optional[str] = None
+    video_quality: Optional[str] = Field(default=None, min_length=1, max_length=40)
+    qualities: Optional[List[VideoQualitySource]] = None
 
 
 class ChannelIn(BaseModel):
@@ -1662,7 +1703,7 @@ def studio_my_videos(api_key: str = Header(...), limit: int = 50, offset: int = 
     offset = max(0, offset)
     rows = execute_query("""
         SELECT id, title, viewkey, thumbnail, category, is_premium, video_type, uploaded_at,
-               description, visibility, duration, file_size, views, updated_at,
+               description, visibility, duration, file_size, video_quality, views, updated_at, qualities,
                (SELECT COUNT(*) FROM videos WHERE user_id=%s) AS total_count
         FROM videos WHERE user_id=%s
         ORDER BY uploaded_at DESC, id DESC LIMIT %s OFFSET %s
@@ -1703,6 +1744,7 @@ def studio_create_video(
         raise HTTPException(400, "Short videos cannot exceed 100 MB")
     _check_url(v.stream_link, "video link")
     _check_url(v.thumbnail, "thumbnail link")
+    qualities_json = _quality_sources_json(v.qualities)
     if v.video_type == "short":
         _check_short_cloudinary_url(v.stream_link, "video", "Short video")
         _check_short_cloudinary_url(v.thumbnail, "image", "Short thumbnail")
@@ -1710,10 +1752,12 @@ def studio_create_video(
     try:
         row = get_one("""
             INSERT INTO videos (title, stream_link, viewkey, thumbnail, category, is_premium,
-                                user_id, description, visibility, video_type, duration, file_size)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
+                                user_id, description, visibility, video_type, duration, file_size,
+                                video_quality, qualities)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb) RETURNING *""",
             (v.title.strip(), v.stream_link.strip(), viewkey, v.thumbnail, v.category, v.is_premium,
-             u["user_id"], v.description, v.visibility, v.video_type, v.duration, v.file_size))
+             u["user_id"], v.description, v.visibility, v.video_type, v.duration, v.file_size,
+             v.video_quality.strip(), qualities_json))
     except Exception:
         logger.exception("studio_create_video")
         return {"success": False, "message": "Could not save video"}
@@ -1743,9 +1787,18 @@ def studio_edit_video(video_id: int, v: StudioVideoEdit, api_key: str = Header(.
             _check_short_cloudinary_url(existing.get("thumbnail"), "image", "Short thumbnail")
     _check_url(v.thumbnail, "thumbnail link")
     fields = {k: val for k, val in v.dict().items() if val is not None}
+    if "video_quality" in fields:
+        fields["video_quality"] = fields["video_quality"].strip()
+        if not fields["video_quality"]:
+            raise HTTPException(400, "Default video quality cannot be empty")
     if not fields:
         return {"success": False, "message": "Nothing to update"}
-    sets = ", ".join(f"{k}=%s" for k in fields) + ", updated_at=NOW()"
+    if "qualities" in fields:
+        fields["qualities"] = _quality_sources_json(fields["qualities"])
+    sets = ", ".join(
+        f"{k}=%s::jsonb" if k == "qualities" else f"{k}=%s"
+        for k in fields
+    ) + ", updated_at=NOW()"
     row = get_one(f"UPDATE videos SET {sets} WHERE id=%s AND user_id=%s RETURNING *",
                   (*fields.values(), video_id, u["user_id"]))
     if not row:
@@ -1991,7 +2044,7 @@ def studio_init(api_key: str = Header(...)):
         FROM videos WHERE user_id=%s""", (uid, uid, uid, uid))
     videos = execute_query("""
         SELECT id, title, viewkey, thumbnail, category, description, visibility, is_premium, video_type,
-               views, duration, uploaded_at
+               views, duration, uploaded_at, video_quality, qualities
         FROM videos WHERE user_id=%s ORDER BY uploaded_at DESC LIMIT 100""", (uid,), fetch=True) or []
     analytics = _analytics_for(uid) if channel else None
     payload = {"success": True, "channel": channel, "stats": stats,
@@ -3098,14 +3151,32 @@ async def related_videos(viewkey: str, limit: int = 12,
 # =====================================================================
 #  CUSTOM PLAYLISTS v2 (user playlists)
 # =====================================================================
-_PL2_COLS = ("id, user_id, title, description, thumbnail, visibility, "
+_PL2_COLS = ("id, user_id, title, description, thumbnail, visibility, is_premium, "
              "is_system, created_at, updated_at")
 
 
 def _pl2_can_view(pl: dict, actor: dict) -> bool:
-    if pl["visibility"] == "private":
-        return bool(actor["user_id"] and actor["user_id"] == pl["user_id"])
+    owner = _is_owner(actor, pl["user_id"])
+    if pl["visibility"] == "private" and not owner:
+        return False
+    if pl.get("is_premium") and not (actor["is_premium"] or owner):
+        return False
     return True
+
+
+def _sync_playlist_thumbnail(pl_id: int):
+    get_one("""
+        UPDATE playlists_v2 p
+        SET thumbnail = (
+            SELECT v.thumbnail
+            FROM playlist_items pi
+            JOIN videos v ON v.id = pi.video_id
+            WHERE pi.playlist_id = p.id
+            ORDER BY pi.position ASC, pi.added_at ASC
+            LIMIT 1
+        ), updated_at = now()
+        WHERE p.id = %s RETURNING id
+    """, (pl_id,))
 
 
 def _pl2_own(pl_id: int, uid: int) -> Optional[dict]:
@@ -3124,18 +3195,14 @@ async def playlist_create(body: PlaylistCreateIn, actor: dict = Depends(get_acto
     if body.visibility not in ("public", "unlisted", "private"):
         return {"success": False, "message": "Invalid visibility"}
     desc = (body.description or "").strip()[:1000]
-    thumb = (body.thumbnail or "").strip()
-    if thumb and not thumb.startswith("https://res.cloudinary.com/"):
-        return {"success": False, "message": "Thumbnail must be a Cloudinary URL"}
-
     count = get_one("SELECT COUNT(*) AS n FROM playlists_v2 WHERE user_id = %s", (actor["user_id"],))
     if count and count["n"] >= 100:
         return {"success": False, "message": "Maximum 100 playlists per user"}
 
     row = get_one(f"""
-        INSERT INTO playlists_v2 (user_id, title, description, thumbnail, visibility)
+        INSERT INTO playlists_v2 (user_id, title, description, visibility, is_premium)
         VALUES (%s, %s, %s, %s, %s) RETURNING {_PL2_COLS}
-    """, (actor["user_id"], title, desc, thumb or None, body.visibility))
+    """, (actor["user_id"], title, desc, body.visibility, body.is_premium))
     cache_del("playlists:v2:public:raw")
     return {"success": True, "playlist": row}
 
@@ -3146,7 +3213,14 @@ async def playlist_my(limit: int = 50, offset: int = 0,
     need_verified(actor)
     limit = max(1, min(limit, 100))
     rows = execute_query(f"""
-        SELECT p.{_PL2_COLS.replace(', ', ', p.').replace('p.id', 'id')},
+        SELECT p.id, p.user_id, p.title, p.description,
+               (SELECT v.thumbnail
+                FROM playlist_items pi
+                JOIN videos v ON v.id = pi.video_id
+                WHERE pi.playlist_id = p.id
+                ORDER BY pi.position ASC, pi.added_at ASC
+                LIMIT 1) AS thumbnail,
+               p.visibility, p.is_premium, p.is_system, p.created_at, p.updated_at,
                (SELECT COUNT(*) FROM playlist_items pi WHERE pi.playlist_id = p.id) AS item_count
         FROM playlists_v2 p
         WHERE p.user_id = %s
@@ -3159,7 +3233,14 @@ async def playlist_my(limit: int = 50, offset: int = 0,
 @router.get("/me/playlists/user/{user_id}")
 async def playlist_by_user(user_id: int, actor: dict = Depends(get_actor)):
     rows = execute_query(f"""
-        SELECT p.{_PL2_COLS.replace(', ', ', p.').replace('p.id', 'id')},
+        SELECT p.id, p.user_id, p.title, p.description,
+               (SELECT v.thumbnail
+                FROM playlist_items pi
+                JOIN videos v ON v.id = pi.video_id
+                WHERE pi.playlist_id = p.id
+                ORDER BY pi.position ASC, pi.added_at ASC
+                LIMIT 1) AS thumbnail,
+               p.visibility, p.is_premium, p.is_system, p.created_at, p.updated_at,
                (SELECT COUNT(*) FROM playlist_items pi WHERE pi.playlist_id = p.id) AS item_count
         FROM playlists_v2 p
         WHERE p.user_id = %s AND p.visibility = 'public'
@@ -3174,7 +3255,9 @@ async def playlist_detail(pl_id: int, actor: dict = Depends(get_actor)):
     if not pl:
         raise HTTPException(404, "Playlist not found")
     if not _pl2_can_view(pl, actor):
-        raise HTTPException(403, "This playlist is private")
+        detail = ("This playlist requires an active premium subscription"
+                  if pl.get("is_premium") else "This playlist is private")
+        raise HTTPException(403, detail)
     items = execute_query("""
         SELECT pi.id AS item_id, pi.position,
                v.id AS video_id, v.title, v.viewkey, v.thumbnail, v.category,
@@ -3190,6 +3273,7 @@ async def playlist_detail(pl_id: int, actor: dict = Depends(get_actor)):
         WHERE pi.playlist_id = %s
         ORDER BY pi.position ASC, pi.added_at ASC
     """, (pl_id,), fetch=True) or []
+    pl["thumbnail"] = items[0].get("thumbnail") if items else None
 
     for it in items:
         can_view = _can_view_video(it, actor)
@@ -3218,17 +3302,16 @@ async def playlist_update(pl_id: int, body: PlaylistUpdateIn,
         fields["title"] = t
     if body.description is not None:
         fields["description"] = body.description.strip()[:1000]
-    if body.thumbnail is not None:
-        th = body.thumbnail.strip()
-        if th and not th.startswith("https://res.cloudinary.com/"):
-            return {"success": False, "message": "Thumbnail must be a Cloudinary URL"}
-        fields["thumbnail"] = th or None
     if body.visibility is not None:
         if body.visibility not in ("public", "unlisted", "private"):
             return {"success": False, "message": "Invalid visibility"}
         if pl["is_system"] and body.visibility != "private":
             return {"success": False, "message": "System playlist must stay private"}
         fields["visibility"] = body.visibility
+    if body.is_premium is not None:
+        if pl["is_system"] and body.is_premium:
+            return {"success": False, "message": "System playlists cannot be premium"}
+        fields["is_premium"] = body.is_premium
 
     if not fields:
         return {"success": False, "message": "Nothing to update"}
@@ -3238,6 +3321,8 @@ async def playlist_update(pl_id: int, body: PlaylistUpdateIn,
         UPDATE playlists_v2 SET {sets}, updated_at = now()
         WHERE id = %s RETURNING {_PL2_COLS}
     """, (*fields.values(), pl_id))
+    _sync_playlist_thumbnail(pl_id)
+    row = get_one(f"SELECT {_PL2_COLS} FROM playlists_v2 WHERE id = %s", (pl_id,))
     cache_del("playlists:v2:public:raw")
     return {"success": True, "playlist": row}
 
@@ -3295,11 +3380,7 @@ async def playlist_add_video(pl_id: int, body: PlaylistAddVideoIn,
             return {"success": False, "message": "Video not found or is private"}
         return {"success": False, "message": "Video already in this playlist"}
 
-    try:
-        get_one("UPDATE playlists_v2 SET updated_at = now() WHERE id = %s RETURNING id", (pl_id,))
-    except Exception:
-        pass
-
+    _sync_playlist_thumbnail(pl_id)
     cache_del("playlists:v2:public:raw")
     return {"success": True, "item_id": ins["id"], "position": ins["position"]}
 
@@ -3317,7 +3398,7 @@ async def playlist_remove_video(pl_id: int, video_id: int,
     """, (pl_id, video_id))
     if not row:
         raise HTTPException(404, "Video not in playlist")
-    get_one("UPDATE playlists_v2 SET updated_at = now() WHERE id = %s RETURNING id", (pl_id,))
+    _sync_playlist_thumbnail(pl_id)
     cache_del("playlists:v2:public:raw")
     return {"success": True}
 
@@ -3335,13 +3416,14 @@ async def playlist_reorder(pl_id: int, body: PlaylistReorderIn,
     existing = execute_query("SELECT video_id FROM playlist_items WHERE playlist_id = %s",
                              (pl_id,), fetch=True) or []
     existing_ids = {r["video_id"] for r in existing}
-    if set(body.video_ids) - existing_ids:
-        return {"success": False, "message": "Some videos are not in this playlist"}
+    requested_ids = set(body.video_ids)
+    if len(requested_ids) != len(body.video_ids) or requested_ids != existing_ids:
+        return {"success": False, "message": "Order must include every playlist video exactly once"}
 
     for idx, vid in enumerate(body.video_ids):
         get_one("UPDATE playlist_items SET position = %s WHERE playlist_id = %s AND video_id = %s RETURNING id",
                 (idx, pl_id, vid))
-    get_one("UPDATE playlists_v2 SET updated_at = now() WHERE id = %s RETURNING id", (pl_id,))
+    _sync_playlist_thumbnail(pl_id)
     cache_del("playlists:v2:public:raw")
     return {"success": True, "count": len(body.video_ids)}
 

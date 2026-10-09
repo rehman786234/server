@@ -7,6 +7,8 @@ ALTER TABLE videos
   ADD COLUMN IF NOT EXISTS duration    INT DEFAULT 0,                          -- seconds
   ADD COLUMN IF NOT EXISTS file_size   BIGINT DEFAULT 0,
   ADD COLUMN IF NOT EXISTS views       INT NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS video_quality VARCHAR(40) NOT NULL DEFAULT 'Original',
+  ADD COLUMN IF NOT EXISTS qualities   JSONB NOT NULL DEFAULT '[]'::jsonb,
   ADD COLUMN IF NOT EXISTS updated_at  TIMESTAMP DEFAULT NOW();
 ALTER TABLE mydata
   ADD COLUMN IF NOT EXISTS account_status VARCHAR(12) NOT NULL DEFAULT 'active';
@@ -121,3 +123,32 @@ CREATE TABLE IF NOT EXISTS cloudinary_accounts (
   enabled              BOOLEAN NOT NULL DEFAULT TRUE,
   updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS playlists_v2 (
+  id          SERIAL PRIMARY KEY,
+  user_id     INT NOT NULL REFERENCES mydata(id) ON DELETE CASCADE,
+  title       VARCHAR(150) NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  thumbnail   TEXT,
+  visibility  VARCHAR(10) NOT NULL DEFAULT 'private'
+              CHECK (visibility IN ('public', 'unlisted', 'private')),
+  is_premium  BOOLEAN NOT NULL DEFAULT FALSE,
+  is_system   BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+ALTER TABLE playlists_v2
+  ADD COLUMN IF NOT EXISTS is_premium BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE INDEX IF NOT EXISTS idx_playlists_v2_user_updated
+  ON playlists_v2(user_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS playlist_items (
+  id          BIGSERIAL PRIMARY KEY,
+  playlist_id INT NOT NULL REFERENCES playlists_v2(id) ON DELETE CASCADE,
+  video_id    INT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+  position    INT NOT NULL DEFAULT 0,
+  added_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (playlist_id, video_id)
+);
+CREATE INDEX IF NOT EXISTS idx_playlist_items_order
+  ON playlist_items(playlist_id, position, added_at);
