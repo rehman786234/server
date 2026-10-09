@@ -1786,7 +1786,9 @@ def studio_edit_video(video_id: int, v: StudioVideoEdit, api_key: str = Header(.
             _check_short_cloudinary_url(existing.get("stream_link"), "video", "Short video")
             _check_short_cloudinary_url(existing.get("thumbnail"), "image", "Short thumbnail")
     _check_url(v.thumbnail, "thumbnail link")
-    fields = {k: val for k, val in v.dict().items() if val is not None}
+    fields = v.model_dump(exclude_none=True, exclude={"qualities"})
+    if v.qualities is not None:
+        fields["qualities"] = v.qualities
     if "video_quality" in fields:
         fields["video_quality"] = fields["video_quality"].strip()
         if not fields["video_quality"]:
