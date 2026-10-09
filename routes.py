@@ -93,7 +93,8 @@ def _invalidate_studio_cache(user_id: int):
 def _invalidate_video_caches():
     """Video / channel / profile change hone par saare video-related caches saaf."""
     cache_del("videos:free", "videos:premium")
-    cache_del("playlists:v2:public:raw")
+    cache_del("playlists:v2:public:raw", "playlists:legacy")
+    cache_del_prefix("playlists:legacy:")
     cache_del_prefix("videos:free:")
     cache_del_prefix("videos:premium:")
     cache_del_prefix("search:")
@@ -1282,6 +1283,12 @@ def get_videos(limit: int = 50, offset: int = 0, video_type: Optional[str] = Non
             LEFT JOIN channels c ON c.user_id = v.user_id
             LEFT JOIN mydata u   ON u.id = v.user_id
             WHERE v.is_premium = false AND v.visibility = 'public'
+              AND NOT EXISTS (
+                  SELECT 1 FROM playlist_items pi WHERE pi.video_id = v.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM videos_of_playlist vp WHERE vp.viewkey = v.viewkey
+              )
               AND COALESCE(u.account_status, 'active') = 'active'
               AND COALESCE(c.moderation_status, 'active') = 'active'
               AND (%s::text IS NULL OR v.video_type = %s)
@@ -1323,6 +1330,12 @@ def get_premium_videos(api_key: str = Header(...), limit: int = 50, offset: int 
                 LEFT JOIN channels c ON c.user_id = v.user_id
                 LEFT JOIN mydata u   ON u.id = v.user_id
                 WHERE v.is_premium = true AND v.visibility = 'public'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM playlist_items pi WHERE pi.video_id = v.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM videos_of_playlist vp WHERE vp.viewkey = v.viewkey
+                  )
                   AND COALESCE(u.account_status, 'active') = 'active'
                   AND COALESCE(c.moderation_status, 'active') = 'active'
                   AND (%s::text IS NULL OR v.video_type = %s)
@@ -1421,7 +1434,26 @@ def get_video_by_key(viewkey: str, actor: dict = Depends(get_actor)):
         if not row or (row["visibility"] == "private" and not _is_owner(actor, row.get("user_id"))):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Video not found")
 
-        if not _can_view_video(row, actor):
+        premium_playlist_membership = get_one("""
+            SELECT EXISTS (
+                SELECT 1
+                FROM playlist_items pi
+                JOIN playlists_v2 p ON p.id = pi.playlist_id
+                WHERE pi.video_id = %s AND p.is_premium = true
+            ) OR EXISTS (
+                SELECT 1
+                FROM videos_of_playlist vp
+                JOIN playlist p ON p.playlist_id = vp.playlist_id
+                WHERE vp.viewkey = %s AND p.playlist_type = 'premium'
+            ) AS is_locked
+        """, (row["id"], viewkey))
+        has_playlist_access = not (
+            premium_playlist_membership
+            and premium_playlist_membership["is_locked"]
+            and not (actor["is_premium"] or _is_owner(actor, row.get("user_id")))
+        )
+
+        if not _can_view_video(row, actor) or not has_playlist_access:
             row["stream_link"] = ""
             row.pop("stream_url", None)
             row["qualities"] = []
@@ -1479,13 +1511,19 @@ PLAYLIST_SELECT = """
                    json_build_object(
                        'video_id', v.video_id, 'viewkey', v.viewkey, 'stream_url', v.stream_url,
                        'video_title', v.video_title, 'video_thumbnail', v.video_thumbnail,
-                       'video_duration', v.video_duration, 'video_quality', v.video_quality
+                       'video_duration', v.video_duration,
+                       'video_quality', COALESCE(actual.video_quality, v.video_quality),
+                       'qualities', COALESCE(actual.qualities, '[]'::jsonb),
+                       'is_premium', COALESCE(actual.is_premium, false),
+                       'visibility', COALESCE(actual.visibility, 'public'),
+                       'user_id', actual.user_id
                    ) ORDER BY v.video_id ASC
                ) FILTER (WHERE v.video_id IS NOT NULL),
                '[]'::json
            ) AS videos
     FROM playlist AS p
     LEFT JOIN videos_of_playlist AS v ON v.playlist_id = p.playlist_id
+    LEFT JOIN videos AS actual ON actual.viewkey = v.viewkey
 """
 PLAYLIST_GROUP = """
     GROUP BY p.playlist_id, p.playlist_name, p.playlist_type, p.total_videos,
@@ -1494,11 +1532,18 @@ PLAYLIST_GROUP = """
 
 
 def _lock_playlist(p: dict, actor: dict) -> dict:
-    if p.get("playlist_type") == "premium" and not actor["is_premium"]:
-        p["videos"] = [{**v, "stream_url": ""} for v in (p.get("videos") or [])]
-        p["locked"] = True
-    else:
-        p["locked"] = False
+    playlist_locked = p.get("playlist_type") == "premium" and not actor["is_premium"]
+    videos = []
+    for video in p.get("videos") or []:
+        can_view = _can_view_video(video, actor) and not playlist_locked
+        video["locked"] = not can_view
+        if not can_view:
+            video["stream_url"] = ""
+            video["qualities"] = []
+        video.pop("user_id", None)
+        videos.append(video)
+    p["videos"] = videos
+    p["locked"] = playlist_locked
     return p
 
 
@@ -2076,6 +2121,8 @@ async def list_channels(q: str = "", sort: str = "popular", limit: int = 24, off
                c.is_verified,
                (SELECT COUNT(*) FROM subscriptions s WHERE s.channel_user_id = c.user_id) AS subscriber_count,
                (SELECT COUNT(*) FROM videos v WHERE v.user_id = c.user_id AND v.visibility = 'public'
+                       AND NOT EXISTS (SELECT 1 FROM playlist_items pi WHERE pi.video_id = v.id)
+                       AND NOT EXISTS (SELECT 1 FROM videos_of_playlist vp WHERE vp.viewkey = v.viewkey)
                        AND (%s::boolean OR v.is_premium = false)) AS video_count,
                EXISTS(SELECT 1 FROM subscriptions s2
                       WHERE s2.channel_user_id = c.user_id AND s2.subscriber_id = %s::int) AS is_subscribed
@@ -2097,6 +2144,8 @@ async def get_channel(handle: str, actor: dict = Depends(get_actor)):
         SELECT c.*,
                (SELECT COUNT(*) FROM subscriptions s WHERE s.channel_user_id = c.user_id) AS subscriber_count,
                (SELECT COUNT(*) FROM videos v WHERE v.user_id = c.user_id AND v.visibility = 'public'
+                       AND NOT EXISTS (SELECT 1 FROM playlist_items pi WHERE pi.video_id = v.id)
+                       AND NOT EXISTS (SELECT 1 FROM videos_of_playlist vp WHERE vp.viewkey = v.viewkey)
                        AND (%s::boolean OR v.is_premium = false)) AS video_count,
                COALESCE((SELECT SUM(v.views) FROM videos v
                          WHERE v.user_id = c.user_id AND v.visibility = 'public'), 0) AS total_views,
@@ -2134,7 +2183,9 @@ async def get_channel_videos(handle: str, sort: str = "latest", limit: int = 20,
     cached = cache_get(ckey)
     if cached is not None:
         return cached
-    where = "v.user_id = %s AND v.visibility = 'public'"
+    where = """v.user_id = %s AND v.visibility = 'public'
+        AND NOT EXISTS (SELECT 1 FROM playlist_items pi WHERE pi.video_id = v.id)
+        AND NOT EXISTS (SELECT 1 FROM videos_of_playlist vp WHERE vp.viewkey = v.viewkey)"""
     params = [ch["user_id"]]
     if not can_premium and not SHOW_LOCKED_PREMIUM:
         where += " AND v.is_premium = false"
@@ -2238,7 +2289,10 @@ async def my_subscription_feed(limit: int = 20, offset: int = 0, actor: dict = D
         FROM subscriptions s
         JOIN videos v   ON v.user_id = s.channel_user_id
         JOIN channels c ON c.user_id = s.channel_user_id
-        WHERE s.subscriber_id = %s AND v.visibility = 'public' AND (%s::boolean OR v.is_premium = false)
+        WHERE s.subscriber_id = %s AND v.visibility = 'public'
+          AND NOT EXISTS (SELECT 1 FROM playlist_items pi WHERE pi.video_id = v.id)
+          AND NOT EXISTS (SELECT 1 FROM videos_of_playlist vp WHERE vp.viewkey = v.viewkey)
+          AND (%s::boolean OR v.is_premium = false)
         ORDER BY v.uploaded_at DESC LIMIT %s OFFSET %s
     """, (actor["user_id"], actor["is_premium"] or False, limit + 1, max(0, offset)), fetch=True) or []
     return {"success": True, "has_more": len(rows) > limit, "videos": rows[:limit]}
@@ -2815,6 +2869,8 @@ async def videos_by_tag(slug: str, limit: int = 20, offset: int = 0,
         LEFT JOIN channels c ON c.user_id = v.user_id
         LEFT JOIN mydata u   ON u.id = v.user_id
         WHERE vt.tag_id = %s AND v.visibility = 'public'
+          AND NOT EXISTS (SELECT 1 FROM playlist_items pi WHERE pi.video_id = v.id)
+          AND NOT EXISTS (SELECT 1 FROM videos_of_playlist vp WHERE vp.viewkey = v.viewkey)
           AND COALESCE(u.account_status, 'active') = 'active'
           AND COALESCE(c.moderation_status, 'active') = 'active'
           AND (%s::boolean OR v.is_premium = false)
@@ -2971,6 +3027,14 @@ def smart_search(
             COALESCE(c.avatar_url, u.avatar_url) AS channel_avatar,
             COALESCE(c.is_verified, false) AS channel_verified,
             m.rank_score,
+            CASE WHEN playlist_match.playlist_id IS NULL THEN NULL ELSE
+                json_build_object(
+                    'playlist_id', playlist_match.playlist_id,
+                    'playlist_name', playlist_match.playlist_name,
+                    'playlist_source', playlist_match.playlist_source,
+                    'playlist_index', playlist_match.playlist_index
+                )
+            END AS playlist_match,
             COALESCE((
                 SELECT json_agg(json_build_object('name', top_tag.name, 'slug', top_tag.slug))
                 FROM (
@@ -2986,6 +3050,47 @@ def smart_search(
         JOIN videos v        ON v.id = m.id
         LEFT JOIN channels c ON c.user_id = v.user_id
         LEFT JOIN mydata u   ON u.id = v.user_id
+        LEFT JOIN LATERAL (
+            SELECT candidates.playlist_id, candidates.playlist_name,
+                   candidates.playlist_source, candidates.playlist_index
+            FROM (
+                SELECT p.id::text AS playlist_id, p.title AS playlist_name,
+                       'v2'::text AS playlist_source,
+                       (
+                           SELECT COUNT(*)::int + 1
+                           FROM playlist_items earlier
+                           WHERE earlier.playlist_id = pi.playlist_id
+                             AND (
+                                 earlier.position < pi.position
+                                 OR (earlier.position = pi.position AND earlier.added_at < pi.added_at)
+                                 OR (earlier.position = pi.position AND earlier.added_at = pi.added_at
+                                     AND earlier.id < pi.id)
+                             )
+                       ) AS playlist_index,
+                       p.updated_at AS playlist_updated_at
+                FROM playlist_items pi
+                JOIN playlists_v2 p ON p.id = pi.playlist_id
+                WHERE pi.video_id = v.id AND p.visibility = 'public'
+
+                UNION ALL
+
+                SELECT p.playlist_id::text AS playlist_id, p.playlist_name,
+                       'legacy'::text AS playlist_source,
+                       (
+                           SELECT COUNT(*)::int + 1
+                           FROM videos_of_playlist earlier
+                           WHERE earlier.playlist_id = vp.playlist_id
+                             AND earlier.video_id < vp.video_id
+                       ) AS playlist_index,
+                       p.created_at AS playlist_updated_at
+                FROM videos_of_playlist vp
+                JOIN playlist p ON p.playlist_id = vp.playlist_id
+                WHERE vp.viewkey = v.viewkey
+            ) candidates
+            ORDER BY candidates.playlist_updated_at DESC,
+                     candidates.playlist_source, candidates.playlist_id
+            LIMIT 1
+        ) playlist_match ON true
         ORDER BY {order_sql}
         LIMIT %s OFFSET %s
     """, (
@@ -3125,6 +3230,8 @@ async def related_videos(viewkey: str, limit: int = 12,
                    + LEAST(COALESCE(v.views,0) / 200.0, 5) AS score
             FROM videos v
             WHERE v.id <> %s AND v.visibility = 'public'
+              AND NOT EXISTS (SELECT 1 FROM playlist_items pi WHERE pi.video_id = v.id)
+              AND NOT EXISTS (SELECT 1 FROM videos_of_playlist vp WHERE vp.viewkey = v.viewkey)
               AND COALESCE((SELECT u.account_status FROM mydata u WHERE u.id = v.user_id), 'active') = 'active'
               AND COALESCE((SELECT c.moderation_status FROM channels c WHERE c.user_id = v.user_id), 'active') = 'active'
               AND (%s::boolean OR v.is_premium = false)
@@ -3155,15 +3262,6 @@ async def related_videos(viewkey: str, limit: int = 12,
 # =====================================================================
 _PL2_COLS = ("id, user_id, title, description, thumbnail, visibility, is_premium, "
              "is_system, created_at, updated_at")
-
-
-def _pl2_can_view(pl: dict, actor: dict) -> bool:
-    owner = _is_owner(actor, pl["user_id"])
-    if pl["visibility"] == "private" and not owner:
-        return False
-    if pl.get("is_premium") and not (actor["is_premium"] or owner):
-        return False
-    return True
 
 
 def _sync_playlist_thumbnail(pl_id: int):
@@ -3205,7 +3303,7 @@ async def playlist_create(body: PlaylistCreateIn, actor: dict = Depends(get_acto
         INSERT INTO playlists_v2 (user_id, title, description, visibility, is_premium)
         VALUES (%s, %s, %s, %s, %s) RETURNING {_PL2_COLS}
     """, (actor["user_id"], title, desc, body.visibility, body.is_premium))
-    cache_del("playlists:v2:public:raw")
+    _invalidate_video_caches()
     return {"success": True, "playlist": row}
 
 
@@ -3256,15 +3354,15 @@ async def playlist_detail(pl_id: int, actor: dict = Depends(get_actor)):
     pl = get_one(f"SELECT {_PL2_COLS} FROM playlists_v2 WHERE id = %s", (pl_id,))
     if not pl:
         raise HTTPException(404, "Playlist not found")
-    if not _pl2_can_view(pl, actor):
-        detail = ("This playlist requires an active premium subscription"
-                  if pl.get("is_premium") else "This playlist is private")
-        raise HTTPException(403, detail)
+    owner = _is_owner(actor, pl["user_id"])
+    if pl["visibility"] == "private" and not owner:
+        raise HTTPException(403, "This playlist is private")
+    playlist_locked = bool(pl.get("is_premium") and not (actor["is_premium"] or owner))
     items = execute_query("""
         SELECT pi.id AS item_id, pi.position,
                v.id AS video_id, v.title, v.viewkey, v.thumbnail, v.category,
-             v.is_premium, v.views, v.duration, v.uploaded_at, v.visibility,
-             v.user_id, v.stream_link,
+               v.is_premium, v.views, v.duration, v.uploaded_at, v.visibility,
+               v.user_id, v.stream_link, v.video_quality, v.qualities,
                COALESCE(c.channel_name, u.name) AS channel_name,
                c.handle AS channel_handle,
                COALESCE(c.avatar_url, u.avatar_url) AS channel_avatar
@@ -3278,13 +3376,15 @@ async def playlist_detail(pl_id: int, actor: dict = Depends(get_actor)):
     pl["thumbnail"] = items[0].get("thumbnail") if items else None
 
     for it in items:
-        can_view = _can_view_video(it, actor)
+        can_view = _can_view_video(it, actor) and not playlist_locked
         it["locked"] = not can_view
         if it["locked"]:
             it["stream_link"] = ""
+            it["qualities"] = []
         it.pop("user_id", None)
 
-    pl["is_owner"] = bool(actor["user_id"] and actor["user_id"] == pl["user_id"])
+    pl["is_owner"] = bool(owner)
+    pl["locked"] = playlist_locked
     return {"success": True, "playlist": pl, "items": items}
 
 
@@ -3325,7 +3425,7 @@ async def playlist_update(pl_id: int, body: PlaylistUpdateIn,
     """, (*fields.values(), pl_id))
     _sync_playlist_thumbnail(pl_id)
     row = get_one(f"SELECT {_PL2_COLS} FROM playlists_v2 WHERE id = %s", (pl_id,))
-    cache_del("playlists:v2:public:raw")
+    _invalidate_video_caches()
     return {"success": True, "playlist": row}
 
 
@@ -3338,7 +3438,7 @@ async def playlist_delete(pl_id: int, actor: dict = Depends(get_actor)):
     if pl["is_system"]:
         return {"success": False, "message": "System playlist cannot be deleted"}
     get_one("DELETE FROM playlists_v2 WHERE id = %s RETURNING id", (pl_id,))
-    cache_del("playlists:v2:public:raw")
+    _invalidate_video_caches()
     return {"success": True}
 
 
@@ -3383,7 +3483,7 @@ async def playlist_add_video(pl_id: int, body: PlaylistAddVideoIn,
         return {"success": False, "message": "Video already in this playlist"}
 
     _sync_playlist_thumbnail(pl_id)
-    cache_del("playlists:v2:public:raw")
+    _invalidate_video_caches()
     return {"success": True, "item_id": ins["id"], "position": ins["position"]}
 
 
@@ -3401,7 +3501,7 @@ async def playlist_remove_video(pl_id: int, video_id: int,
     if not row:
         raise HTTPException(404, "Video not in playlist")
     _sync_playlist_thumbnail(pl_id)
-    cache_del("playlists:v2:public:raw")
+    _invalidate_video_caches()
     return {"success": True}
 
 
@@ -3426,7 +3526,7 @@ async def playlist_reorder(pl_id: int, body: PlaylistReorderIn,
         get_one("UPDATE playlist_items SET position = %s WHERE playlist_id = %s AND video_id = %s RETURNING id",
                 (idx, pl_id, vid))
     _sync_playlist_thumbnail(pl_id)
-    cache_del("playlists:v2:public:raw")
+    _invalidate_video_caches()
     return {"success": True, "count": len(body.video_ids)}
 
 
