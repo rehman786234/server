@@ -1313,7 +1313,7 @@ def get_videos(limit: int = 50, offset: int = 0, video_type: Optional[str] = Non
         def load_videos():
             return execute_query(f"""
                 SELECT v.*,
-                       COALESCE(v.qualities->0->>'url', '') AS stream_link,
+                       COALESCE(NULLIF(v.qualities->0->>'url', ''), NULLIF(v.stream_link, ''), '') AS stream_link,
                        COALESCE(v.qualities->0->>'label', 'Original') AS video_quality,
                        COALESCE(c.channel_name, u.name) AS channel_name,
                        c.handle AS channel_handle,
@@ -1360,7 +1360,7 @@ def get_premium_videos(api_key: str = Header(...), limit: int = 50, offset: int 
         def load_videos():
             return execute_query(f"""
                 SELECT v.*,
-                       COALESCE(v.qualities->0->>'url', '') AS stream_link,
+                       COALESCE(NULLIF(v.qualities->0->>'url', ''), NULLIF(v.stream_link, ''), '') AS stream_link,
                        COALESCE(v.qualities->0->>'label', 'Original') AS video_quality,
                        COALESCE(c.channel_name, u.name) AS channel_name,
                        c.handle AS channel_handle,
@@ -1450,7 +1450,7 @@ def get_video_by_key(viewkey: str, actor: dict = Depends(get_actor)):
     try:
         row = get_one("""
             SELECT v.*,
-                   COALESCE(v.qualities->0->>'url', '')      AS stream_link,
+                   COALESCE(NULLIF(v.qualities->0->>'url', ''), NULLIF(v.stream_link, ''), '') AS stream_link,
                    COALESCE(v.qualities->0->>'label', 'Original') AS video_quality,
                    COALESCE(c.channel_name, u.name) AS creator_name,
                    c.handle AS creator_handle,
@@ -3456,7 +3456,7 @@ def playlist_detail(pl_id: int, actor: dict = Depends(get_actor)):
                v.id AS video_id, v.title, v.viewkey, v.thumbnail, v.category,
                v.is_premium, v.views, v.duration, v.uploaded_at, v.visibility,
                v.user_id,
-               COALESCE(v.qualities->0->>'url', '')           AS stream_link,
+               COALESCE(NULLIF(v.qualities->0->>'url', ''), NULLIF(v.stream_link, ''), '') AS stream_link,
                COALESCE(v.qualities->0->>'label', 'Original') AS video_quality,
                v.qualities,
                COALESCE(c.channel_name, u.name) AS channel_name,
