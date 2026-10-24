@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field
 from config import Config
 
 from database import execute_query, get_one
-from cache import cache_get, cache_set, cache_del, cache_del_prefix
+from cache import cache_get, cache_get_or_set, cache_set, cache_del, cache_del_prefix
 from models import (
     User, UserCreate, UserLogin, APIKeyRequest, Video,
     TagOut, TagsForVideoIn,
@@ -93,7 +93,10 @@ def _invalidate_studio_cache(user_id: int):
 def _invalidate_video_caches():
     """Video / channel / profile change hone par saare video-related caches saaf."""
     cache_del("videos:free", "videos:premium")
-    cache_del("playlists:v2:public:raw", "playlists:legacy")
+    cache_del(
+        "playlists:v2:public:raw", "playlists:legacy",
+        "playlists:v2:public:summary", "playlists:legacy:summary",
+    )
     cache_del_prefix("playlists:legacy:")
     cache_del_prefix("videos:free:")
     cache_del_prefix("videos:premium:")
@@ -229,8 +232,16 @@ _NEW_INDEXES = [
     "ON videos (uploaded_at DESC) WHERE visibility = 'public' AND is_premium = false",
     "CREATE INDEX IF NOT EXISTS idx_videos_public_premium "
     "ON videos (uploaded_at DESC) WHERE visibility = 'public' AND is_premium = true",
+    "CREATE INDEX IF NOT EXISTS idx_videos_public_free_feed "
+    "ON videos (uploaded_at DESC, id DESC) WHERE visibility = 'public' AND is_premium = false",
+    "CREATE INDEX IF NOT EXISTS idx_videos_public_premium_feed "
+    "ON videos (uploaded_at DESC, id DESC) WHERE visibility = 'public' AND is_premium = true",
     "CREATE INDEX IF NOT EXISTS idx_videos_public_views "
     "ON videos (views DESC, uploaded_at DESC) WHERE visibility = 'public'",
+    "CREATE INDEX IF NOT EXISTS idx_playlist_items_video_id "
+    "ON playlist_items (video_id)",
+    "CREATE INDEX IF NOT EXISTS idx_videos_of_playlist_viewkey "
+    "ON videos_of_playlist (viewkey)",
 
     # --- notifications: notify() ka duplicate check ---
     "CREATE INDEX IF NOT EXISTS idx_notif_dedup "
@@ -488,7 +499,9 @@ def _check_url(u: Optional[str], what: str = "link"):
         raise HTTPException(400, f"Invalid {what}")
 
 
-def _quality_sources_json(qualities: List[VideoQualitySource]) -> str:
+def _quality_sources_json(qualities) -> str:
+    if not qualities:
+        raise HTTPException(400, "At least one quality source is required")
     if len(qualities) > 20:
         raise HTTPException(400, "A video can have at most 20 quality sources")
     normalized = []
@@ -506,6 +519,28 @@ def _quality_sources_json(qualities: List[VideoQualitySource]) -> str:
         labels.add(label.casefold())
         normalized.append({"label": label, "url": url})
     return json.dumps(normalized)
+
+
+def _with_default_source(row):
+    """Add stream_link / video_quality (from qualities[0]) for old clients."""
+    if not row:
+        return row
+    q = row.get("qualities") or []
+    if isinstance(q, str):
+        q = json.loads(q)
+    first = q[0] if q else {}
+    row["stream_link"] = first.get("url", "")
+    row["video_quality"] = first.get("label", "Original")
+    return row
+
+
+def _source_url(source) -> str:
+    return source["url"] if isinstance(source, dict) else source.url
+
+
+def _check_short_sources(sources):
+    for source in sources or []:
+        _check_short_cloudinary_url(_source_url(source), "video", "Short video")
 
 
 def _check_short_cloudinary_url(url: Optional[str], resource_type: str, what: str):
@@ -1268,35 +1303,34 @@ def get_videos(limit: int = 50, offset: int = 0, video_type: Optional[str] = Non
         raise HTTPException(400, "Video type must be short or long")
     limit = max(1, min(limit, 100))
     offset = max(0, offset)
-    ckey = f"videos:free:{video_type or 'all'}:{limit}:{offset}"
-    cached = cache_get(ckey)
-    if cached is not None:
-        return cached
+    ckey = f"videos:free:v2:{video_type or 'all'}:{limit}:{offset}"
     try:
-        results = execute_query("""
-            SELECT v.*,
-                   COALESCE(c.channel_name, u.name)     AS channel_name,
-                   c.handle                             AS channel_handle,
-                   COALESCE(c.avatar_url, u.avatar_url) AS channel_avatar,
-                   COALESCE(c.is_verified, false) AS channel_verified
-            FROM videos v
-            LEFT JOIN channels c ON c.user_id = v.user_id
-            LEFT JOIN mydata u   ON u.id = v.user_id
-            WHERE v.is_premium = false AND v.visibility = 'public'
-              AND NOT EXISTS (
-                  SELECT 1 FROM playlist_items pi WHERE pi.video_id = v.id
-              )
-              AND NOT EXISTS (
-                  SELECT 1 FROM videos_of_playlist vp WHERE vp.viewkey = v.viewkey
-              )
-              AND COALESCE(u.account_status, 'active') = 'active'
-              AND COALESCE(c.moderation_status, 'active') = 'active'
-              AND (%s::text IS NULL OR v.video_type = %s)
-            ORDER BY v.uploaded_at DESC, v.id DESC
-            LIMIT %s OFFSET %s
-        """, (video_type, video_type, limit, offset), fetch=True)
-        results = results if results else []
-        cache_set(ckey, results, TTL_VIDEOS)
+        video_type_clause = "AND v.video_type = %s" if video_type else ""
+        params = [limit, offset]
+        if video_type:
+            params.insert(0, video_type)
+
+        def load_videos():
+            return execute_query(f"""
+                SELECT v.*,
+                       COALESCE(v.qualities->0->>'url', '') AS stream_link,
+                       COALESCE(v.qualities->0->>'label', 'Original') AS video_quality,
+                       COALESCE(c.channel_name, u.name) AS channel_name,
+                       c.handle AS channel_handle,
+                       COALESCE(c.avatar_url, u.avatar_url) AS channel_avatar,
+                       COALESCE(c.is_verified, false) AS channel_verified
+                FROM videos v
+                LEFT JOIN channels c ON c.user_id = v.user_id
+                LEFT JOIN mydata u ON u.id = v.user_id
+                WHERE v.is_premium = false AND v.visibility = 'public'
+                  AND COALESCE(u.account_status, 'active') = 'active'
+                  AND COALESCE(c.moderation_status, 'active') = 'active'
+                  {video_type_clause}
+                ORDER BY v.uploaded_at DESC, v.id DESC
+                LIMIT %s OFFSET %s
+            """, tuple(params), fetch=True) or []
+
+        results = cache_get_or_set(ckey, load_videos, TTL_VIDEOS)
         return results
     except Exception as e:
         logger.error(f"Error in get_videos: {e}")
@@ -1317,32 +1351,33 @@ def get_premium_videos(api_key: str = Header(...), limit: int = 50, offset: int 
     try:
         limit = max(1, min(limit, 100))
         offset = max(0, offset)
-        ckey = f"videos:premium:{video_type or 'all'}:{limit}:{offset}"
-        results = cache_get(ckey)
-        if results is None:
-            results = execute_query("""
+        ckey = f"videos:premium:v2:{video_type or 'all'}:{limit}:{offset}"
+        video_type_clause = "AND v.video_type = %s" if video_type else ""
+        params = [limit + 1, offset]
+        if video_type:
+            params.insert(0, video_type)
+
+        def load_videos():
+            return execute_query(f"""
                 SELECT v.*,
-                       COALESCE(c.channel_name, u.name)     AS channel_name,
-                       c.handle                             AS channel_handle,
+                       COALESCE(v.qualities->0->>'url', '') AS stream_link,
+                       COALESCE(v.qualities->0->>'label', 'Original') AS video_quality,
+                       COALESCE(c.channel_name, u.name) AS channel_name,
+                       c.handle AS channel_handle,
                        COALESCE(c.avatar_url, u.avatar_url) AS channel_avatar,
                        COALESCE(c.is_verified, false) AS channel_verified
                 FROM videos v
                 LEFT JOIN channels c ON c.user_id = v.user_id
-                LEFT JOIN mydata u   ON u.id = v.user_id
+                LEFT JOIN mydata u ON u.id = v.user_id
                 WHERE v.is_premium = true AND v.visibility = 'public'
-                  AND NOT EXISTS (
-                      SELECT 1 FROM playlist_items pi WHERE pi.video_id = v.id
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM videos_of_playlist vp WHERE vp.viewkey = v.viewkey
-                  )
                   AND COALESCE(u.account_status, 'active') = 'active'
                   AND COALESCE(c.moderation_status, 'active') = 'active'
-                  AND (%s::text IS NULL OR v.video_type = %s)
+                  {video_type_clause}
                 ORDER BY v.uploaded_at DESC, v.id DESC
                 LIMIT %s OFFSET %s
-            """, (video_type, video_type, limit + 1, offset), fetch=True) or []
-            cache_set(ckey, results, TTL_VIDEOS)
+            """, tuple(params), fetch=True) or []
+
+        results = cache_get_or_set(ckey, load_videos, TTL_VIDEOS)
         has_more = len(results) > limit
         results = results[:limit]
         return {
@@ -1379,22 +1414,23 @@ async def upload_video(video: Video, api_key: str = Header(...)):
     if video.video_type == "short" and (video.file_size or 0) > 100 * 1024 * 1024:
         raise HTTPException(400, "Short videos cannot exceed 100 MB")
     if video.video_type == "short":
-        _check_short_cloudinary_url(video.stream_link, "video", "Short video")
+        _check_short_sources(video.qualities)
         _check_short_cloudinary_url(video.thumbnail, "image", "Short thumbnail")
     qualities_json = _quality_sources_json(video.qualities)
     viewkey = secrets.token_hex(6)
     try:
         result = get_one("""
-            INSERT INTO videos (title, stream_link, viewkey, thumbnail, category, is_premium,
-                                user_id, video_type, duration, file_size, video_quality, qualities)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
-            RETURNING id, title, stream_link, viewkey, thumbnail, category, is_premium,
-                      video_type, duration, file_size, video_quality, qualities, uploaded_at
-        """, (video.title, video.stream_link, viewkey, video.thumbnail,
+            INSERT INTO videos (title, viewkey, thumbnail, category, is_premium,
+                                user_id, video_type, duration, file_size, qualities)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            RETURNING id, title, viewkey, thumbnail, category, is_premium,
+                      video_type, duration, file_size, qualities, uploaded_at
+        """, (video.title, viewkey, video.thumbnail,
               video.category, video.is_premium, user_data.get('user_id'),
               video.video_type, video.duration or 0, video.file_size or 0,
-              video.video_quality.strip(), qualities_json))
+              qualities_json))
         if result:
+            _with_default_source(result)
             _invalidate_video_caches()
             if user_data.get("user_id"):
                 _invalidate_studio_cache(user_data["user_id"])
@@ -1414,6 +1450,8 @@ def get_video_by_key(viewkey: str, actor: dict = Depends(get_actor)):
     try:
         row = get_one("""
             SELECT v.*,
+                   COALESCE(v.qualities->0->>'url', '')      AS stream_link,
+                   COALESCE(v.qualities->0->>'label', 'Original') AS video_quality,
                    COALESCE(c.channel_name, u.name) AS creator_name,
                    c.handle AS creator_handle,
                    COALESCE(c.avatar_url, u.avatar_url) AS creator_avatar,
@@ -1512,7 +1550,7 @@ PLAYLIST_SELECT = """
                        'video_id', v.video_id, 'viewkey', v.viewkey, 'stream_url', v.stream_url,
                        'video_title', v.video_title, 'video_thumbnail', v.video_thumbnail,
                        'video_duration', v.video_duration,
-                       'video_quality', COALESCE(actual.video_quality, v.video_quality),
+                       'video_quality', COALESCE(actual.qualities->0->>'label', v.video_quality),
                        'qualities', COALESCE(actual.qualities, '[]'::jsonb),
                        'is_premium', COALESCE(actual.is_premium, false),
                        'visibility', COALESCE(actual.visibility, 'public'),
@@ -1548,13 +1586,38 @@ def _lock_playlist(p: dict, actor: dict) -> dict:
 
 
 @router.get("/playlists")
-async def get_playlists(actor: dict = Depends(get_actor)):
+def get_playlists(summary_only: bool = False, actor: dict = Depends(get_actor)):
     try:
+        if summary_only:
+            raw = cache_get_or_set("playlists:legacy:summary", lambda: execute_query("""
+                    SELECT p.playlist_id, p.playlist_name, p.playlist_type, p.total_videos,
+                           COALESCE(first_video.thumbnail, p.playlist_thumbnail) AS playlist_thumbnail,
+                           p.created_at, '[]'::json AS videos
+                    FROM playlist AS p
+                    LEFT JOIN LATERAL (
+                        SELECT COALESCE(actual.thumbnail, item.video_thumbnail) AS thumbnail
+                        FROM videos_of_playlist AS item
+                        LEFT JOIN videos AS actual ON actual.viewkey = item.viewkey
+                        WHERE item.playlist_id = p.playlist_id
+                        ORDER BY item.video_id ASC
+                        LIMIT 1
+                    ) AS first_video ON TRUE
+                    ORDER BY p.created_at DESC
+                """, fetch=True) or [], TTL_LEGACY_PLAYLIST)
+            results = [_lock_playlist(row, actor) for row in copy.deepcopy(raw)]
+            for playlist in results:
+                playlist["playlist_source"] = "legacy"
+            return {"success": True, "total": len(results), "playlists": results}
+
         # RAW rows cache hoti hain (stream_url ke saath); lock har request par copy par lagta hai
-        raw = cache_get("playlists:legacy")
-        if raw is None:
-            raw = execute_query(PLAYLIST_SELECT + PLAYLIST_GROUP + " ORDER BY p.created_at DESC", fetch=True) or []
-            cache_set("playlists:legacy", raw, TTL_LEGACY_PLAYLIST)
+        raw = cache_get_or_set(
+            "playlists:legacy",
+            lambda: execute_query(
+                PLAYLIST_SELECT + PLAYLIST_GROUP + " ORDER BY p.created_at DESC",
+                fetch=True,
+            ) or [],
+            TTL_LEGACY_PLAYLIST,
+        )
         results = [_lock_playlist(p, actor) for p in copy.deepcopy(raw)]
         for playlist in results:
             playlist["playlist_source"] = "legacy"
@@ -1565,10 +1628,45 @@ async def get_playlists(actor: dict = Depends(get_actor)):
 
 
 @router.get("/playlists/public")
-async def get_public_playlists(actor: dict = Depends(get_actor)):
-    rows = cache_get("playlists:v2:public:raw")
-    if rows is None:
-        rows = execute_query("""
+def get_public_playlists(summary_only: bool = False, actor: dict = Depends(get_actor)):
+    if summary_only:
+        rows = cache_get_or_set("playlists:v2:public:summary", lambda: execute_query("""
+                SELECT p.id AS playlist_id, p.title AS playlist_name,
+                       CASE WHEN p.is_premium THEN 'premium' ELSE 'free' END AS playlist_type,
+                       first_video.thumbnail AS playlist_thumbnail,
+                       p.is_premium, p.user_id, p.created_at,
+                       COALESCE(item_counts.total_videos, 0) AS total_videos,
+                       '[]'::json AS videos
+                FROM playlists_v2 p
+                LEFT JOIN LATERAL (
+                    SELECT v.thumbnail
+                    FROM playlist_items pi
+                    JOIN videos v ON v.id = pi.video_id
+                    WHERE pi.playlist_id = p.id
+                    ORDER BY pi.position ASC, pi.added_at ASC
+                    LIMIT 1
+                ) AS first_video ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT COUNT(*) AS total_videos
+                    FROM playlist_items pi
+                    WHERE pi.playlist_id = p.id
+                ) AS item_counts ON TRUE
+                WHERE p.visibility = 'public'
+                ORDER BY p.updated_at DESC
+                LIMIT 100
+            """, fetch=True) or [], TTL_LEGACY_PLAYLIST)
+        rows = copy.deepcopy(rows)
+        for playlist in rows:
+            owner = _is_owner(actor, playlist.get("user_id"))
+            playlist["locked"] = bool(
+                playlist.get("is_premium") and not (actor["is_premium"] or owner)
+            )
+            playlist.pop("is_premium", None)
+            playlist.pop("user_id", None)
+            playlist["playlist_source"] = "v2"
+        return {"success": True, "total": len(rows), "playlists": rows}
+
+    rows = cache_get_or_set("playlists:v2:public:raw", lambda: execute_query("""
             SELECT p.id AS playlist_id, p.title AS playlist_name,
                    CASE WHEN p.is_premium THEN 'premium' ELSE 'free' END AS playlist_type,
                    (SELECT v_first.thumbnail
@@ -1604,8 +1702,7 @@ async def get_public_playlists(actor: dict = Depends(get_actor)):
                      p.created_at, p.updated_at
             ORDER BY p.updated_at DESC
             LIMIT 100
-        """, fetch=True) or []
-        cache_set("playlists:v2:public:raw", rows, TTL_LEGACY_PLAYLIST)
+        """, fetch=True) or [], TTL_LEGACY_PLAYLIST)
     rows = copy.deepcopy(rows)
 
     for playlist in rows:
@@ -1639,7 +1736,7 @@ async def get_public_playlists(actor: dict = Depends(get_actor)):
 
 
 @router.get("/playlists/{playlist_id}")
-async def get_playlist(playlist_id: str, actor: dict = Depends(get_actor)):
+def get_playlist(playlist_id: str, actor: dict = Depends(get_actor)):
     # Safety: non-numeric IDs (jaise "my") ko gracefully handle karo
     if not playlist_id.isdigit():
         raise HTTPException(404, "Playlist not found")
@@ -1648,12 +1745,13 @@ async def get_playlist(playlist_id: str, actor: dict = Depends(get_actor)):
         raise HTTPException(400, "Invalid playlist ID")
     try:
         ckey = f"playlists:legacy:{playlist_id}"
-        raw = cache_get(ckey)
-        if raw is None:
+        def load_playlist():
             raw = get_one(PLAYLIST_SELECT + " WHERE p.playlist_id = %s " + PLAYLIST_GROUP, (playlist_id,))
             if not raw:
                 raise HTTPException(404, "Playlist not found")
-            cache_set(ckey, raw, TTL_LEGACY_PLAYLIST)
+            return raw
+
+        raw = cache_get_or_set(ckey, load_playlist, TTL_LEGACY_PLAYLIST)
         result = copy.deepcopy(raw)
         return {"success": True, "playlist": _lock_playlist(result, actor)}
     except HTTPException:
@@ -1664,7 +1762,7 @@ async def get_playlist(playlist_id: str, actor: dict = Depends(get_actor)):
 
 
 @router.get("/health")
-async def health_check():
+def health_check():
     from database import health_check
     is_healthy = health_check()
     return {"status": "healthy" if is_healthy else "unhealthy",
@@ -1701,7 +1799,6 @@ def get_ads():
 # =====================================================================
 class StudioVideoIn(BaseModel):
     title: str
-    stream_link: str
     thumbnail: Optional[str] = ""
     category: Optional[str] = "Uncategorized"
     description: Optional[str] = ""
@@ -1710,8 +1807,7 @@ class StudioVideoIn(BaseModel):
     video_type: str = "long"
     duration: Optional[int] = 0
     file_size: Optional[int] = 0
-    video_quality: str = Field(default="Original", min_length=1, max_length=40)
-    qualities: List[VideoQualitySource] = Field(default_factory=list)
+    qualities: List[VideoQualitySource] = Field(min_length=1, max_length=20)
 
 
 class StudioVideoEdit(BaseModel):
@@ -1722,8 +1818,7 @@ class StudioVideoEdit(BaseModel):
     visibility: Optional[str] = None
     is_premium: Optional[bool] = None
     video_type: Optional[str] = None
-    video_quality: Optional[str] = Field(default=None, min_length=1, max_length=40)
-    qualities: Optional[List[VideoQualitySource]] = None
+    qualities: Optional[List[VideoQualitySource]] = Field(default=None, min_length=1, max_length=20)
 
 
 class ChannelIn(BaseModel):
@@ -1748,7 +1843,7 @@ def studio_my_videos(api_key: str = Header(...), limit: int = 50, offset: int = 
     offset = max(0, offset)
     rows = execute_query("""
         SELECT id, title, viewkey, thumbnail, category, is_premium, video_type, uploaded_at,
-               description, visibility, duration, file_size, video_quality, views, updated_at, qualities,
+               description, visibility, duration, file_size, COALESCE(qualities->0->>'label', 'Original') AS video_quality, views, updated_at, qualities,
                (SELECT COUNT(*) FROM videos WHERE user_id=%s) AS total_count
         FROM videos WHERE user_id=%s
         ORDER BY uploaded_at DESC, id DESC LIMIT %s OFFSET %s
@@ -1787,25 +1882,25 @@ def studio_create_video(
         raise HTTPException(400, "Short videos must be between 1 and 180 seconds")
     if v.video_type == "short" and (v.file_size or 0) > 100 * 1024 * 1024:
         raise HTTPException(400, "Short videos cannot exceed 100 MB")
-    _check_url(v.stream_link, "video link")
     _check_url(v.thumbnail, "thumbnail link")
     qualities_json = _quality_sources_json(v.qualities)
     if v.video_type == "short":
-        _check_short_cloudinary_url(v.stream_link, "video", "Short video")
+        _check_short_sources(v.qualities)
         _check_short_cloudinary_url(v.thumbnail, "image", "Short thumbnail")
     viewkey = secrets.token_hex(6)
     try:
         row = get_one("""
-            INSERT INTO videos (title, stream_link, viewkey, thumbnail, category, is_premium,
+            INSERT INTO videos (title, viewkey, thumbnail, category, is_premium,
                                 user_id, description, visibility, video_type, duration, file_size,
-                                video_quality, qualities)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb) RETURNING *""",
-            (v.title.strip(), v.stream_link.strip(), viewkey, v.thumbnail, v.category, v.is_premium,
+                                qualities)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb) RETURNING *""",
+            (v.title.strip(), viewkey, v.thumbnail, v.category, v.is_premium,
              u["user_id"], v.description, v.visibility, v.video_type, v.duration, v.file_size,
-             v.video_quality.strip(), qualities_json))
+             qualities_json))
     except Exception:
         logger.exception("studio_create_video")
         return {"success": False, "message": "Could not save video"}
+    _with_default_source(row)
     _invalidate_video_caches()
     _invalidate_studio_cache(u["user_id"])
     if v.visibility == "public":
@@ -1822,22 +1917,19 @@ def studio_edit_video(video_id: int, v: StudioVideoEdit, api_key: str = Header(.
         raise HTTPException(400, "Video type must be short or long")
     if v.video_type == "short":
         existing = get_one(
-            "SELECT duration, stream_link, thumbnail FROM videos WHERE id=%s AND user_id=%s",
+            "SELECT duration, qualities, thumbnail FROM videos WHERE id=%s AND user_id=%s",
             (video_id, u["user_id"]),
         )
         if existing and int(existing.get("duration") or 0) > 180:
             raise HTTPException(400, "Videos longer than 180 seconds cannot be marked as Shorts")
         if existing:
-            _check_short_cloudinary_url(existing.get("stream_link"), "video", "Short video")
+            sources = v.qualities if v.qualities is not None else (existing.get("qualities") or [])
+            _check_short_sources(sources)
             _check_short_cloudinary_url(existing.get("thumbnail"), "image", "Short thumbnail")
     _check_url(v.thumbnail, "thumbnail link")
     fields = v.model_dump(exclude_none=True, exclude={"qualities"})
     if v.qualities is not None:
         fields["qualities"] = v.qualities
-    if "video_quality" in fields:
-        fields["video_quality"] = fields["video_quality"].strip()
-        if not fields["video_quality"]:
-            raise HTTPException(400, "Default video quality cannot be empty")
     if not fields:
         return {"success": False, "message": "Nothing to update"}
     if "qualities" in fields:
@@ -1850,6 +1942,7 @@ def studio_edit_video(video_id: int, v: StudioVideoEdit, api_key: str = Header(.
                   (*fields.values(), video_id, u["user_id"]))
     if not row:
         raise HTTPException(404, "Video not found")
+    _with_default_source(row)
     _invalidate_video_caches()
     _invalidate_studio_cache(u["user_id"])
     return {"success": True, "video": row}
@@ -1859,13 +1952,13 @@ def studio_edit_video(video_id: int, v: StudioVideoEdit, api_key: str = Header(.
 def studio_delete_video(video_id: int, api_key: str = Header(...)):
     u = current_user(api_key, "/studio/delete_video")
     row = get_one(
-        "SELECT id, stream_link, thumbnail FROM videos WHERE id=%s AND user_id=%s",
+        "SELECT id, qualities, thumbnail FROM videos WHERE id=%s AND user_id=%s",
         (video_id, u["user_id"]),
     )
     if not row:
         raise HTTPException(404, "Video not found")
     deleted_assets = _delete_creator_cloudinary_assets(
-        [row.get("stream_link"), row.get("thumbnail")]
+        [s.get("url") for s in (row.get("qualities") or [])] + [row.get("thumbnail")]
     )
     removed = get_one(
         "DELETE FROM videos WHERE id=%s AND user_id=%s RETURNING id",
@@ -2091,7 +2184,7 @@ def studio_init(api_key: str = Header(...)):
         FROM videos WHERE user_id=%s""", (uid, uid, uid, uid))
     videos = execute_query("""
         SELECT id, title, viewkey, thumbnail, category, description, visibility, is_premium, video_type,
-               views, duration, uploaded_at, video_quality, qualities
+               views, duration, uploaded_at, COALESCE(qualities->0->>'label', 'Original') AS video_quality, qualities
         FROM videos WHERE user_id=%s ORDER BY uploaded_at DESC LIMIT 100""", (uid,), fetch=True) or []
     analytics = _analytics_for(uid) if channel else None
     payload = {"success": True, "channel": channel, "stats": stats,
@@ -3206,8 +3299,8 @@ def search_suggestions(
 
 
 @router.get("/videos/{viewkey}/related")
-async def related_videos(viewkey: str, limit: int = 12,
-                         actor: dict = Depends(get_actor)):
+def related_videos(viewkey: str, limit: int = 12,
+                   actor: dict = Depends(get_actor)):
     limit = max(1, min(limit, 30))
     ckey = f"related:{viewkey}:{limit}:{int(bool(actor['is_premium']))}"
     cached = cache_get(ckey)
@@ -3285,7 +3378,7 @@ def _pl2_own(pl_id: int, uid: int) -> Optional[dict]:
 
 
 @router.post("/playlists/create")
-async def playlist_create(body: PlaylistCreateIn, actor: dict = Depends(get_actor)):
+def playlist_create(body: PlaylistCreateIn, actor: dict = Depends(get_actor)):
     need_verified(actor)
     if not rate_limit(f"plcreate:{actor['user_id']}", 10, 3600):
         return {"success": False, "message": "Too many playlists created. Try again later."}
@@ -3308,8 +3401,8 @@ async def playlist_create(body: PlaylistCreateIn, actor: dict = Depends(get_acto
 
 
 @router.get("/me/playlists")
-async def playlist_my(limit: int = 50, offset: int = 0,
-                      actor: dict = Depends(get_actor)):
+def playlist_my(limit: int = 50, offset: int = 0,
+                actor: dict = Depends(get_actor)):
     need_verified(actor)
     limit = max(1, min(limit, 100))
     rows = execute_query(f"""
@@ -3331,7 +3424,7 @@ async def playlist_my(limit: int = 50, offset: int = 0,
 
 
 @router.get("/me/playlists/user/{user_id}")
-async def playlist_by_user(user_id: int, actor: dict = Depends(get_actor)):
+def playlist_by_user(user_id: int, actor: dict = Depends(get_actor)):
     rows = execute_query(f"""
         SELECT p.id, p.user_id, p.title, p.description,
                (SELECT v.thumbnail
@@ -3350,7 +3443,7 @@ async def playlist_by_user(user_id: int, actor: dict = Depends(get_actor)):
 
 
 @router.get("/playlists/detail/{pl_id}")
-async def playlist_detail(pl_id: int, actor: dict = Depends(get_actor)):
+def playlist_detail(pl_id: int, actor: dict = Depends(get_actor)):
     pl = get_one(f"SELECT {_PL2_COLS} FROM playlists_v2 WHERE id = %s", (pl_id,))
     if not pl:
         raise HTTPException(404, "Playlist not found")
@@ -3362,7 +3455,10 @@ async def playlist_detail(pl_id: int, actor: dict = Depends(get_actor)):
         SELECT pi.id AS item_id, pi.position,
                v.id AS video_id, v.title, v.viewkey, v.thumbnail, v.category,
                v.is_premium, v.views, v.duration, v.uploaded_at, v.visibility,
-               v.user_id, v.stream_link, v.video_quality, v.qualities,
+               v.user_id,
+               COALESCE(v.qualities->0->>'url', '')           AS stream_link,
+               COALESCE(v.qualities->0->>'label', 'Original') AS video_quality,
+               v.qualities,
                COALESCE(c.channel_name, u.name) AS channel_name,
                c.handle AS channel_handle,
                COALESCE(c.avatar_url, u.avatar_url) AS channel_avatar
@@ -3389,8 +3485,8 @@ async def playlist_detail(pl_id: int, actor: dict = Depends(get_actor)):
 
 
 @router.put("/playlists/detail/{pl_id}")
-async def playlist_update(pl_id: int, body: PlaylistUpdateIn,
-                          actor: dict = Depends(get_actor)):
+def playlist_update(pl_id: int, body: PlaylistUpdateIn,
+                    actor: dict = Depends(get_actor)):
     need_verified(actor)
     pl = _pl2_own(pl_id, actor["user_id"])
     if not pl:
@@ -3430,7 +3526,7 @@ async def playlist_update(pl_id: int, body: PlaylistUpdateIn,
 
 
 @router.delete("/playlists/detail/{pl_id}")
-async def playlist_delete(pl_id: int, actor: dict = Depends(get_actor)):
+def playlist_delete(pl_id: int, actor: dict = Depends(get_actor)):
     need_verified(actor)
     pl = _pl2_own(pl_id, actor["user_id"])
     if not pl:
@@ -3443,8 +3539,8 @@ async def playlist_delete(pl_id: int, actor: dict = Depends(get_actor)):
 
 
 @router.post("/playlists/detail/{pl_id}/add")
-async def playlist_add_video(pl_id: int, body: PlaylistAddVideoIn,
-                             actor: dict = Depends(get_actor)):
+def playlist_add_video(pl_id: int, body: PlaylistAddVideoIn,
+                       actor: dict = Depends(get_actor)):
     """
     OPTIMIZED: 2 queries instead of 6.
     """
@@ -3488,8 +3584,8 @@ async def playlist_add_video(pl_id: int, body: PlaylistAddVideoIn,
 
 
 @router.delete("/playlists/detail/{pl_id}/remove/{video_id}")
-async def playlist_remove_video(pl_id: int, video_id: int,
-                                actor: dict = Depends(get_actor)):
+def playlist_remove_video(pl_id: int, video_id: int,
+                          actor: dict = Depends(get_actor)):
     need_verified(actor)
     pl = _pl2_own(pl_id, actor["user_id"])
     if not pl:
@@ -3506,8 +3602,8 @@ async def playlist_remove_video(pl_id: int, video_id: int,
 
 
 @router.put("/playlists/detail/{pl_id}/reorder")
-async def playlist_reorder(pl_id: int, body: PlaylistReorderIn,
-                           actor: dict = Depends(get_actor)):
+def playlist_reorder(pl_id: int, body: PlaylistReorderIn,
+                     actor: dict = Depends(get_actor)):
     need_verified(actor)
     pl = _pl2_own(pl_id, actor["user_id"])
     if not pl:
@@ -3531,7 +3627,7 @@ async def playlist_reorder(pl_id: int, body: PlaylistReorderIn,
 
 
 @router.post("/playlists/watch-later/ensure")
-async def ensure_watch_later(actor: dict = Depends(get_actor)):
+def ensure_watch_later(actor: dict = Depends(get_actor)):
     need_verified(actor)
     pl = get_one("""
         SELECT id, user_id, title, description, thumbnail, visibility, is_system,
@@ -4827,14 +4923,17 @@ async def admin_delete_channel(user_id: int, actor: dict = Depends(get_actor)):
     if not channel:
         raise HTTPException(404, "Channel not found")
     videos = execute_query(
-        "SELECT stream_link, thumbnail FROM videos WHERE user_id = %s",
+        "SELECT qualities, thumbnail FROM videos WHERE user_id = %s",
         (user_id,),
         fetch=True,
     ) or []
     media_urls = [
         url
         for video in videos
-        for url in (video.get("stream_link"), video.get("thumbnail"))
+        for url in (
+            *[s.get("url") for s in (video.get("qualities") or [])],
+            video.get("thumbnail"),
+        )
     ]
     media_urls.extend((channel.get("avatar_url"), channel.get("banner_url")))
     deleted_assets = _delete_creator_cloudinary_assets(media_urls)
