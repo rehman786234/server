@@ -60,7 +60,7 @@ CLD2_SECRET = os.getenv("CLOUDINARY2_API_SECRET", "")
 CLD1_CLOUD = os.getenv("CLOUDINARY_CLOUD_NAME", "vjhhf9fh")
 CLD1_KEY = os.getenv("CLOUDINARY_API_KEY", "")
 CLD1_SECRET = os.getenv("CLOUDINARY_API_SECRET", "")
-CLD1_PRESET = os.getenv("CLOUDINARY_UPLOAD_PRESET", "upload_videos")
+CLD1_PRESET = os.getenv("CLOUDINARY_UPLOAD_PRESET", "").strip()
 
 SHOW_LOCKED_PREMIUM = False
 
@@ -1095,17 +1095,20 @@ async def sign_upload(body: SignIn, actor: dict = Depends(get_actor)):
         "folder": cfg["folder"],
         "timestamp": int(time.time()),
     }
-    if account["upload_preset"]:
-        params["upload_preset"] = account["upload_preset"]
     if not (account["api_key"] and account["api_secret"]):
-        if cfg["account"] == "videos" and account["upload_preset"]:
-            return {
-                "success": True,
-                "unsigned": True,
-                "cloud_name": account["cloud_name"],
-                "upload_url": f"https://api.cloudinary.com/v1_1/{account['cloud_name']}/{cfg['type']}/upload",
-                "upload_preset": account["upload_preset"],
-            }
+        if cfg["account"] == "videos":
+            if account["upload_preset"]:
+                return {
+                    "success": True,
+                    "unsigned": True,
+                    "cloud_name": account["cloud_name"],
+                    "upload_url": f"https://api.cloudinary.com/v1_1/{account['cloud_name']}/{cfg['type']}/upload",
+                    "upload_preset": account["upload_preset"],
+                }
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Configure video API credentials for signed uploads or set an existing unsigned video upload preset.",
+            )
         raise HTTPException(503, f"Cloudinary account '{cfg['account']}' is missing API credentials")
     to_sign = "&".join(f"{k}={params[k]}" for k in sorted(params)) + account["api_secret"]
     signature = hashlib.sha1(to_sign.encode()).hexdigest()
@@ -1829,16 +1832,15 @@ class ChannelIn(BaseModel):
     description: Optional[str] = ""
 
 
-def current_user(api_key: str, endpoint: str = None, method: str = "GET"):
-    u = validate_api_key(api_key, endpoint, method)
-    if not u:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired API key")
-    return u
+def _studio_user(actor: dict):
+    need_verified(actor)
+    return actor
 
 
 @router.get("/studio/my_videos")
-def studio_my_videos(api_key: str = Header(...), limit: int = 50, offset: int = 0):
-    u = current_user(api_key, "/studio/my_videos")
+def studio_my_videos(limit: int = 50, offset: int = 0,
+                     actor: dict = Depends(get_actor)):
+    u = _studio_user(actor)
     limit = max(1, min(limit, 100))
     offset = max(0, offset)
     rows = execute_query("""
@@ -1863,9 +1865,9 @@ def studio_my_videos(api_key: str = Header(...), limit: int = 50, offset: int = 
 def studio_create_video(
     v: StudioVideoIn,
     background_tasks: BackgroundTasks,
-    api_key: str = Header(...),
+    actor: dict = Depends(get_actor),
 ):
-    u = current_user(api_key, "/studio/create_video")
+    u = _studio_user(actor)
     channel = get_one(
         "SELECT id, moderation_status FROM channels WHERE user_id=%s",
         (u["user_id"],),
@@ -1909,8 +1911,9 @@ def studio_create_video(
 
 
 @router.put("/studio/videos/{video_id}")
-def studio_edit_video(video_id: int, v: StudioVideoEdit, api_key: str = Header(...)):
-    u = current_user(api_key, "/studio/edit_video")
+def studio_edit_video(video_id: int, v: StudioVideoEdit,
+                      actor: dict = Depends(get_actor)):
+    u = _studio_user(actor)
     if v.visibility is not None and v.visibility not in ("public", "unlisted", "private"):
         raise HTTPException(400, "Invalid visibility")
     if v.video_type is not None and v.video_type not in ("short", "long"):
@@ -1949,8 +1952,8 @@ def studio_edit_video(video_id: int, v: StudioVideoEdit, api_key: str = Header(.
 
 
 @router.delete("/studio/videos/{video_id}")
-def studio_delete_video(video_id: int, api_key: str = Header(...)):
-    u = current_user(api_key, "/studio/delete_video")
+def studio_delete_video(video_id: int, actor: dict = Depends(get_actor)):
+    u = _studio_user(actor)
     row = get_one(
         "SELECT id, qualities, thumbnail FROM videos WHERE id=%s AND user_id=%s",
         (video_id, u["user_id"]),
@@ -1972,8 +1975,8 @@ def studio_delete_video(video_id: int, api_key: str = Header(...)):
 
 
 @router.get("/studio/stats")
-def studio_stats(api_key: str = Header(...)):
-    u = current_user(api_key, "/studio/stats")
+def studio_stats(actor: dict = Depends(get_actor)):
+    u = _studio_user(actor)
     uid = u["user_id"]
     s = get_one("""
         SELECT COUNT(*) AS videos,
@@ -1987,14 +1990,14 @@ def studio_stats(api_key: str = Header(...)):
 
 
 @router.get("/studio/channel")
-def studio_get_channel(api_key: str = Header(...)):
-    u = current_user(api_key, "/studio/get_channel")
+def studio_get_channel(actor: dict = Depends(get_actor)):
+    u = _studio_user(actor)
     return {"success": True, "channel": get_one("SELECT * FROM channels WHERE user_id=%s", (u["user_id"],))}
 
 
 @router.put("/studio/channel")
-def studio_save_channel(c: ChannelIn, api_key: str = Header(...)):
-    u = current_user(api_key, "/studio/save_channel")
+def studio_save_channel(c: ChannelIn, actor: dict = Depends(get_actor)):
+    u = _studio_user(actor)
     name = (c.channel_name or "").strip()
     handle = (c.handle or "").strip().lower()
     if len(name) < 2:
@@ -2157,8 +2160,8 @@ def _analytics_for(uid: int):
 
 
 @router.get("/studio/analytics")
-def studio_analytics(api_key: str = Header(...)):
-    u = current_user(api_key)
+def studio_analytics(actor: dict = Depends(get_actor)):
+    u = _studio_user(actor)
     a = _analytics_for(u["user_id"])
     if a:
         return {"success": True, "analytics": a}
@@ -2166,8 +2169,8 @@ def studio_analytics(api_key: str = Header(...)):
 
 
 @router.get("/studio/init")
-def studio_init(api_key: str = Header(...)):
-    u = current_user(api_key)
+def studio_init(actor: dict = Depends(get_actor)):
+    u = _studio_user(actor)
     uid = u["user_id"]
     ckey = f"studio:init:{uid}"
     cached = cache_get(ckey)
