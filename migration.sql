@@ -10,6 +10,20 @@ ALTER TABLE videos
   ADD COLUMN IF NOT EXISTS video_quality VARCHAR(40) NOT NULL DEFAULT 'Original',
   ADD COLUMN IF NOT EXISTS qualities   JSONB NOT NULL DEFAULT '[]'::jsonb,
   ADD COLUMN IF NOT EXISTS updated_at  TIMESTAMP DEFAULT NOW();
+UPDATE videos
+SET qualities = jsonb_build_array(jsonb_build_object(
+  'label', COALESCE(NULLIF(BTRIM(video_quality), ''), 'Original'),
+  'url', BTRIM(stream_link)
+)) || COALESCE(qualities, '[]'::jsonb)
+WHERE qualities IS NOT NULL
+  AND stream_link IS NOT NULL
+  AND BTRIM(stream_link) <> ''
+  AND NOT EXISTS (
+    SELECT 1
+    FROM jsonb_array_elements(COALESCE(qualities, '[]'::jsonb)) AS source
+    WHERE source->>'url' = BTRIM(stream_link)
+  );
+ALTER TABLE videos ALTER COLUMN stream_link DROP NOT NULL;
 ALTER TABLE mydata
   ADD COLUMN IF NOT EXISTS account_status VARCHAR(12) NOT NULL DEFAULT 'active';
 DO $$

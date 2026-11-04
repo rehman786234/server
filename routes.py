@@ -522,15 +522,32 @@ def _quality_sources_json(qualities) -> str:
 
 
 def _with_default_source(row):
-    """Add stream_link / video_quality (from qualities[0]) for old clients."""
+    """Keep the quality list authoritative while supporting legacy video fields."""
     if not row:
         return row
     q = row.get("qualities") or []
     if isinstance(q, str):
         q = json.loads(q)
+    if not isinstance(q, list):
+        q = []
+    q = [
+        source for source in q
+        if isinstance(source, dict)
+        and isinstance(source.get("label"), str)
+        and isinstance(source.get("url"), str)
+    ]
+    legacy_url = row.get("stream_link")
+    default_label = (row.get("video_quality") or "Original").strip() or "Original"
+    if legacy_url:
+        default_index = next((index for index, source in enumerate(q) if source["url"] == legacy_url), -1)
+        if default_index < 0:
+            q.insert(0, {"label": default_label, "url": legacy_url})
+        elif default_index > 0:
+            q.insert(0, q.pop(default_index))
+    row["qualities"] = q
     first = q[0] if q else {}
-    row["stream_link"] = first.get("url", "")
-    row["video_quality"] = first.get("label", "Original")
+    row["stream_link"] = first.get("url") or row.get("stream_link") or ""
+    row["video_quality"] = first.get("label") or row.get("video_quality") or "Original"
     return row
 
 
@@ -1314,10 +1331,8 @@ def get_videos(limit: int = 50, offset: int = 0, video_type: Optional[str] = Non
             params.insert(0, video_type)
 
         def load_videos():
-            return execute_query(f"""
+            rows = execute_query(f"""
                 SELECT v.*,
-                       COALESCE(NULLIF(v.qualities->0->>'url', ''), NULLIF(v.stream_link, ''), '') AS stream_link,
-                       COALESCE(v.qualities->0->>'label', 'Original') AS video_quality,
                        COALESCE(c.channel_name, u.name) AS channel_name,
                        c.handle AS channel_handle,
                        COALESCE(c.avatar_url, u.avatar_url) AS channel_avatar,
@@ -1332,6 +1347,9 @@ def get_videos(limit: int = 50, offset: int = 0, video_type: Optional[str] = Non
                 ORDER BY v.uploaded_at DESC, v.id DESC
                 LIMIT %s OFFSET %s
             """, tuple(params), fetch=True) or []
+            for row in rows:
+                _with_default_source(row)
+            return rows
 
         results = cache_get_or_set(ckey, load_videos, TTL_VIDEOS)
         return results
@@ -1361,10 +1379,8 @@ def get_premium_videos(api_key: str = Header(...), limit: int = 50, offset: int 
             params.insert(0, video_type)
 
         def load_videos():
-            return execute_query(f"""
+            rows = execute_query(f"""
                 SELECT v.*,
-                       COALESCE(NULLIF(v.qualities->0->>'url', ''), NULLIF(v.stream_link, ''), '') AS stream_link,
-                       COALESCE(v.qualities->0->>'label', 'Original') AS video_quality,
                        COALESCE(c.channel_name, u.name) AS channel_name,
                        c.handle AS channel_handle,
                        COALESCE(c.avatar_url, u.avatar_url) AS channel_avatar,
@@ -1379,6 +1395,9 @@ def get_premium_videos(api_key: str = Header(...), limit: int = 50, offset: int 
                 ORDER BY v.uploaded_at DESC, v.id DESC
                 LIMIT %s OFFSET %s
             """, tuple(params), fetch=True) or []
+            for row in rows:
+                _with_default_source(row)
+            return rows
 
         results = cache_get_or_set(ckey, load_videos, TTL_VIDEOS)
         has_more = len(results) > limit
@@ -1453,8 +1472,6 @@ def get_video_by_key(viewkey: str, actor: dict = Depends(get_actor)):
     try:
         row = get_one("""
             SELECT v.*,
-                   COALESCE(NULLIF(v.qualities->0->>'url', ''), NULLIF(v.stream_link, ''), '') AS stream_link,
-                   COALESCE(v.qualities->0->>'label', 'Original') AS video_quality,
                    COALESCE(c.channel_name, u.name) AS creator_name,
                    c.handle AS creator_handle,
                    COALESCE(c.avatar_url, u.avatar_url) AS creator_avatar,
@@ -1502,6 +1519,7 @@ def get_video_by_key(viewkey: str, actor: dict = Depends(get_actor)):
         else:
             row["locked"] = False
 
+        _with_default_source(row)
         row["is_own_channel"] = bool(actor["user_id"] and actor["user_id"] == row.get("user_id"))
 
         return {"success": True, "video": row}
@@ -1844,8 +1862,10 @@ def studio_my_videos(limit: int = 50, offset: int = 0,
     limit = max(1, min(limit, 100))
     offset = max(0, offset)
     rows = execute_query("""
-        SELECT id, title, viewkey, thumbnail, category, is_premium, video_type, uploaded_at,
-               description, visibility, duration, file_size, COALESCE(qualities->0->>'label', 'Original') AS video_quality, views, updated_at, qualities,
+        SELECT id, title, viewkey, stream_link, thumbnail, category, is_premium, video_type, uploaded_at,
+               description, visibility, duration, file_size,
+               COALESCE(NULLIF(qualities->0->>'label', ''), NULLIF(video_quality, ''), 'Original') AS video_quality,
+               views, updated_at, qualities,
                (SELECT COUNT(*) FROM videos WHERE user_id=%s) AS total_count
         FROM videos WHERE user_id=%s
         ORDER BY uploaded_at DESC, id DESC LIMIT %s OFFSET %s
@@ -1853,6 +1873,7 @@ def studio_my_videos(limit: int = 50, offset: int = 0,
     total = rows[0]["total_count"] if rows else 0
     for row in rows:
         row.pop("total_count", None)
+        _with_default_source(row)
     return {
         "success": True,
         "total": total,
@@ -1892,16 +1913,25 @@ def studio_create_video(
     viewkey = secrets.token_hex(6)
     try:
         row = get_one("""
-            INSERT INTO videos (title, viewkey, thumbnail, category, is_premium,
+            INSERT INTO videos (title, stream_link, viewkey, thumbnail, category, is_premium,
                                 user_id, description, visibility, video_type, duration, file_size,
                                 qualities)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb) RETURNING *""",
-            (v.title.strip(), viewkey, v.thumbnail, v.category, v.is_premium,
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb) RETURNING *""",
+            (v.title.strip(), v.qualities[0].url, viewkey, v.thumbnail, v.category, v.is_premium,
              u["user_id"], v.description, v.visibility, v.video_type, v.duration, v.file_size,
              qualities_json))
-    except Exception:
-        logger.exception("studio_create_video")
-        return {"success": False, "message": "Could not save video"}
+    except Exception as error:
+        logger.exception("studio_create_video failed for user_id=%s", u["user_id"])
+        sqlstate = getattr(error, "pgcode", None)
+        if sqlstate == "23502":
+            message = "The database rejected a missing required video field. Please check the video details and retry."
+        elif sqlstate == "42703":
+            message = "The video database schema is outdated. Please contact support so it can be updated."
+        else:
+            message = "The database could not save this video. Your uploaded source is still available; please retry."
+        if sqlstate:
+            message = f"{message} (database error {sqlstate})"
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, message) from error
     _with_default_source(row)
     _invalidate_video_caches()
     _invalidate_studio_cache(u["user_id"])
@@ -1936,13 +1966,23 @@ def studio_edit_video(video_id: int, v: StudioVideoEdit,
     if not fields:
         return {"success": False, "message": "Nothing to update"}
     if "qualities" in fields:
-        fields["qualities"] = _quality_sources_json(fields["qualities"])
+        quality_sources = fields["qualities"]
+        fields["stream_link"] = quality_sources[0].url
+        fields["qualities"] = _quality_sources_json(quality_sources)
     sets = ", ".join(
         f"{k}=%s::jsonb" if k == "qualities" else f"{k}=%s"
         for k in fields
     ) + ", updated_at=NOW()"
-    row = get_one(f"UPDATE videos SET {sets} WHERE id=%s AND user_id=%s RETURNING *",
-                  (*fields.values(), video_id, u["user_id"]))
+    try:
+        row = get_one(f"UPDATE videos SET {sets} WHERE id=%s AND user_id=%s RETURNING *",
+                      (*fields.values(), video_id, u["user_id"]))
+    except Exception as error:
+        logger.exception("studio_edit_video failed for user_id=%s video_id=%s", u["user_id"], video_id)
+        sqlstate = getattr(error, "pgcode", None)
+        message = "The database could not save these video changes. Please retry."
+        if sqlstate:
+            message = f"{message} (database error {sqlstate})"
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, message) from error
     if not row:
         raise HTTPException(404, "Video not found")
     _with_default_source(row)
@@ -2186,9 +2226,13 @@ def studio_init(actor: dict = Depends(get_actor)):
                (SELECT COUNT(*) FROM comments cm JOIN videos y ON y.id=cm.video_id WHERE y.user_id=%s) AS comments
         FROM videos WHERE user_id=%s""", (uid, uid, uid, uid))
     videos = execute_query("""
-        SELECT id, title, viewkey, thumbnail, category, description, visibility, is_premium, video_type,
-               views, duration, uploaded_at, COALESCE(qualities->0->>'label', 'Original') AS video_quality, qualities
+        SELECT id, title, viewkey, stream_link, thumbnail, category, description, visibility, is_premium, video_type,
+               views, duration, uploaded_at,
+               COALESCE(NULLIF(qualities->0->>'label', ''), NULLIF(video_quality, ''), 'Original') AS video_quality,
+               qualities
         FROM videos WHERE user_id=%s ORDER BY uploaded_at DESC LIMIT 100""", (uid,), fetch=True) or []
+    for video in videos:
+        _with_default_source(video)
     analytics = _analytics_for(uid) if channel else None
     payload = {"success": True, "channel": channel, "stats": stats,
                "videos": videos, "analytics": analytics}
