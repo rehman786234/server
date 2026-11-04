@@ -12,16 +12,34 @@ ALTER TABLE videos
   ADD COLUMN IF NOT EXISTS updated_at  TIMESTAMP DEFAULT NOW();
 UPDATE videos
 SET qualities = jsonb_build_array(jsonb_build_object(
-  'label', COALESCE(NULLIF(BTRIM(video_quality), ''), 'Original'),
+  'label', COALESCE(
+    NULLIF(BTRIM(video_quality), ''),
+    NULLIF((
+      SELECT matching_quality.source->>'label'
+      FROM jsonb_array_elements(COALESCE(qualities, '[]'::jsonb))
+           AS matching_quality(source)
+      WHERE matching_quality.source->>'url' = BTRIM(stream_link)
+      LIMIT 1
+    ), ''),
+    'Original'
+  ),
   'url', BTRIM(stream_link)
-)) || COALESCE(qualities, '[]'::jsonb)
+)) || COALESCE((
+  SELECT jsonb_agg(quality_sources.source ORDER BY quality_sources.position)
+  FROM jsonb_array_elements(COALESCE(qualities, '[]'::jsonb))
+       WITH ORDINALITY AS quality_sources(source, position)
+  WHERE quality_sources.source->>'url' IS DISTINCT FROM BTRIM(stream_link)
+), '[]'::jsonb)
 WHERE qualities IS NOT NULL
   AND stream_link IS NOT NULL
   AND BTRIM(stream_link) <> ''
-  AND NOT EXISTS (
-    SELECT 1
-    FROM jsonb_array_elements(COALESCE(qualities, '[]'::jsonb)) AS source
-    WHERE source->>'url' = BTRIM(stream_link)
+  AND (
+    qualities = '[]'::jsonb
+    OR qualities->0->>'url' IS DISTINCT FROM BTRIM(stream_link)
+    OR (
+      NULLIF(BTRIM(video_quality), '') IS NOT NULL
+      AND qualities->0->>'label' IS DISTINCT FROM BTRIM(video_quality)
+    )
   );
 ALTER TABLE videos ALTER COLUMN stream_link DROP NOT NULL;
 ALTER TABLE mydata

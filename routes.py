@@ -1571,7 +1571,7 @@ PLAYLIST_SELECT = """
                        'video_id', v.video_id, 'viewkey', v.viewkey, 'stream_url', v.stream_url,
                        'video_title', v.video_title, 'video_thumbnail', v.video_thumbnail,
                        'video_duration', v.video_duration,
-                       'video_quality', COALESCE(actual.qualities->0->>'label', v.video_quality),
+                       'video_quality', COALESCE(NULLIF(actual.qualities->0->>'label', ''), NULLIF(actual.video_quality, ''), v.video_quality, 'Original'),
                        'qualities', COALESCE(actual.qualities, '[]'::jsonb),
                        'is_premium', COALESCE(actual.is_premium, false),
                        'visibility', COALESCE(actual.visibility, 'public'),
@@ -1594,10 +1594,14 @@ def _lock_playlist(p: dict, actor: dict) -> dict:
     playlist_locked = p.get("playlist_type") == "premium" and not actor["is_premium"]
     videos = []
     for video in p.get("videos") or []:
+        video["stream_link"] = video.get("stream_link") or video.get("stream_url") or ""
+        _with_default_source(video)
+        video["stream_url"] = video["stream_link"]
         can_view = _can_view_video(video, actor) and not playlist_locked
         video["locked"] = not can_view
         if not can_view:
             video["stream_url"] = ""
+            video["stream_link"] = ""
             video["qualities"] = []
         video.pop("user_id", None)
         videos.append(video)
@@ -1913,11 +1917,11 @@ def studio_create_video(
     viewkey = secrets.token_hex(6)
     try:
         row = get_one("""
-            INSERT INTO videos (title, stream_link, viewkey, thumbnail, category, is_premium,
+            INSERT INTO videos (title, stream_link, video_quality, viewkey, thumbnail, category, is_premium,
                                 user_id, description, visibility, video_type, duration, file_size,
                                 qualities)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb) RETURNING *""",
-            (v.title.strip(), v.qualities[0].url, viewkey, v.thumbnail, v.category, v.is_premium,
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb) RETURNING *""",
+            (v.title.strip(), v.qualities[0].url, v.qualities[0].label.strip(), viewkey, v.thumbnail, v.category, v.is_premium,
              u["user_id"], v.description, v.visibility, v.video_type, v.duration, v.file_size,
              qualities_json))
     except Exception as error:
@@ -1968,6 +1972,7 @@ def studio_edit_video(video_id: int, v: StudioVideoEdit,
     if "qualities" in fields:
         quality_sources = fields["qualities"]
         fields["stream_link"] = quality_sources[0].url
+        fields["video_quality"] = quality_sources[0].label.strip()
         fields["qualities"] = _quality_sources_json(quality_sources)
     sets = ", ".join(
         f"{k}=%s::jsonb" if k == "qualities" else f"{k}=%s"
@@ -2334,11 +2339,13 @@ async def get_channel_videos(handle: str, sort: str = "latest", limit: int = 20,
         params.append(video_type)
     order = "v.views DESC, v.uploaded_at DESC" if sort == "popular" else "v.uploaded_at DESC"
     rows = execute_query(f"""
-        SELECT v.id, v.title, v.viewkey, v.thumbnail, v.category, v.description, v.video_type,
+        SELECT v.id, v.title, v.viewkey, v.stream_link, v.video_quality, v.qualities,
+               v.thumbnail, v.category, v.description, v.video_type,
                v.is_premium, v.views, v.duration, v.uploaded_at
         FROM videos v WHERE {where} ORDER BY {order} LIMIT %s OFFSET %s
     """, (*params, limit + 1, offset), fetch=True) or []
     for r in rows:
+        _with_default_source(r)
         r["locked"] = bool(r["is_premium"] and not can_premium)
     payload = {"success": True, "has_more": len(rows) > limit, "videos": rows[:limit]}
     cache_set(ckey, payload, TTL_CHANNEL_VIDEOS)
@@ -2424,7 +2431,8 @@ async def my_subscription_feed(limit: int = 20, offset: int = 0, actor: dict = D
     need_login(actor)
     limit = max(1, min(limit, 50))
     rows = execute_query("""
-        SELECT v.id, v.title, v.viewkey, v.thumbnail, v.category, v.video_type, v.is_premium, v.views, v.duration, v.uploaded_at,
+        SELECT v.id, v.title, v.viewkey, v.stream_link, v.video_quality, v.qualities,
+               v.thumbnail, v.category, v.video_type, v.is_premium, v.views, v.duration, v.uploaded_at,
                c.channel_name, c.handle, c.avatar_url
         FROM subscriptions s
         JOIN videos v   ON v.user_id = s.channel_user_id
@@ -2435,6 +2443,8 @@ async def my_subscription_feed(limit: int = 20, offset: int = 0, actor: dict = D
           AND (%s::boolean OR v.is_premium = false)
         ORDER BY v.uploaded_at DESC LIMIT %s OFFSET %s
     """, (actor["user_id"], actor["is_premium"] or False, limit + 1, max(0, offset)), fetch=True) or []
+    for row in rows:
+        _with_default_source(row)
     return {"success": True, "has_more": len(rows) > limit, "videos": rows[:limit]}
 
 
@@ -2999,7 +3009,8 @@ async def videos_by_tag(slug: str, limit: int = 20, offset: int = 0,
     if not tag:
         raise HTTPException(404, "Tag not found")
     rows = execute_query("""
-        SELECT v.id, v.title, v.viewkey, v.thumbnail, v.category, v.is_premium,
+        SELECT v.id, v.title, v.viewkey, v.stream_link, v.video_quality, v.qualities,
+               v.thumbnail, v.category, v.is_premium,
                v.views, v.duration, v.uploaded_at,
                COALESCE(c.channel_name, u.name) AS channel_name,
                c.handle AS channel_handle,
@@ -3017,6 +3028,8 @@ async def videos_by_tag(slug: str, limit: int = 20, offset: int = 0,
         ORDER BY v.views DESC, v.uploaded_at DESC
         LIMIT %s OFFSET %s
     """, (tag["id"], actor["is_premium"] or False, limit + 1, offset), fetch=True) or []
+    for row in rows:
+        _with_default_source(row)
     payload = {"success": True, "tag": tag,
                "has_more": len(rows) > limit, "videos": rows[:limit]}
     cache_set(ckey, payload, TTL_TAG_VIDEOS)
@@ -3159,7 +3172,8 @@ def smart_search(
               )
         )
         SELECT
-            v.id, v.title, v.viewkey, v.thumbnail, v.category, v.is_premium,
+            v.id, v.title, v.viewkey, v.stream_link, v.video_quality, v.qualities,
+            v.thumbnail, v.category, v.is_premium,
             v.video_type,
             v.views, v.duration, v.uploaded_at,
             COALESCE(c.channel_name, u.name) AS channel_name,
@@ -3252,6 +3266,8 @@ def smart_search(
         *patterns,
         limit + 1, offset,
     ), fetch=True) or []
+    for row in rows:
+        _with_default_source(row)
 
     payload = {
         "success": True,
@@ -3504,7 +3520,7 @@ def playlist_detail(pl_id: int, actor: dict = Depends(get_actor)):
                v.is_premium, v.views, v.duration, v.uploaded_at, v.visibility,
                v.user_id,
                COALESCE(NULLIF(v.qualities->0->>'url', ''), NULLIF(v.stream_link, ''), '') AS stream_link,
-               COALESCE(v.qualities->0->>'label', 'Original') AS video_quality,
+               COALESCE(NULLIF(v.qualities->0->>'label', ''), NULLIF(v.video_quality, ''), 'Original') AS video_quality,
                v.qualities,
                COALESCE(c.channel_name, u.name) AS channel_name,
                c.handle AS channel_handle,
@@ -3519,6 +3535,7 @@ def playlist_detail(pl_id: int, actor: dict = Depends(get_actor)):
     pl["thumbnail"] = items[0].get("thumbnail") if items else None
 
     for it in items:
+        _with_default_source(it)
         can_view = _can_view_video(it, actor) and not playlist_locked
         it["locked"] = not can_view
         if it["locked"]:
